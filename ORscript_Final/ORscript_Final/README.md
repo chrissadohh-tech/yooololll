@@ -152,6 +152,10 @@ byte count and SHA-256 before attaching anything:
 numbered lines, then checks the byte count and SHA-256 before attaching anything. A picture that
 was cut short or damaged is refused with the reason, never attached silently. Rebuilding the agent
 (`cd agent && cargo build --release`) is therefore an optimisation, not a requirement.
+A rebuilt `or-agent.exe` has one extra tool (`read_file_base64`) and forwards the image blocks an
+MCP returns — it does **not** take screenshots by itself. The Studio-window rescue and the
+whole-desktop grab still run `studio_shot.ps1`, so a scanner that blocks that script blocks those
+two routes no matter which agent build is running.
 
 ## Privacy
 
