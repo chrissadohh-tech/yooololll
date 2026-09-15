@@ -55,6 +55,9 @@ param(
   # -B64Only <path>: no capture at all - just turn an EXISTING file (e.g. the PNG the
   # Blender addon wrote) into the same <path>.b64 text twin, so an older agent can
   # hand it over too. Prints the same OR_STUDIO_SHOT line.
+  # -WholeScreen: capture the ENTIRE desktop (all monitors). Needs no Roblox
+  # Studio window at all - this is the "screenshot of my whole PC" route.
+  [switch]$WholeScreen,
   [string]$B64Only = ""
 )
 
@@ -321,6 +324,57 @@ if ($SelfTest) {
     exit 0
   } catch {
     Write-Output ("OR_STUDIO_SHOT " + (@{ ok = $false; selftest = $true; error = ("self-test failed: " + $_.Exception.Message); code = 3 } | ConvertTo-Json -Compress -Depth 3))
+    exit 3
+  }
+}
+
+# ── -WholeScreen: the entire desktop, all monitors, no Studio needed ────────
+# This runs BEFORE the Studio window lookup on purpose: "screenshot my whole PC"
+# must work with Studio closed, minimized or on another monitor.
+if ($WholeScreen) {
+  try {
+    Add-Type -AssemblyName System.Windows.Forms
+    $vs = [System.Windows.Forms.SystemInformation]::VirtualScreen
+    if ($vs.Width -lt 100 -or $vs.Height -lt 100) {
+      Write-Output ("OR_STUDIO_SHOT " + (@{ ok = $false; whole_screen = $true; error = ("the desktop size came back unusable (" + $vs.Width + "x" + $vs.Height + ") - is there an interactive session?"); code = 3 } | ConvertTo-Json -Compress -Depth 3))
+      exit 3
+    }
+    $full = Join-Path (Get-Location) $Out
+    if ([System.IO.Path]::IsPathRooted($Out)) { $full = $Out }
+    $full = [System.IO.Path]::ChangeExtension($full, $(if ($script:UseJpeg) { ".jpg" } else { ".png" }))
+    $bmp = New-Object System.Drawing.Bitmap($vs.Width, $vs.Height)
+    $gfx = [System.Drawing.Graphics]::FromImage($bmp)
+    try { $gfx.CopyFromScreen($vs.Left, $vs.Top, 0, 0, (New-Object System.Drawing.Size($vs.Width, $vs.Height))) }
+    finally { $gfx.Dispose() }
+    $final = Scale-Bitmap -Bmp $bmp -MaxW $MaxWidth
+    try { Save-Bitmap -Bmp $final -Path $full } finally { $final.Dispose(); $bmp.Dispose() }
+    $tunnel = @{ base64_file = ""; base64_chars = 0; base64_lines = 0; sha256 = ""; bytes = 0; mime = "" }
+    if (-not $NoB64) {
+      try { $tunnel = Write-B64File -Path ($full + ".b64") -Wrap $Wrap }
+      catch { $tunnel = @{ base64_file = ""; base64_chars = 0; base64_lines = 0; sha256 = ""; bytes = 0; mime = ""; tunnel_error = $_.Exception.Message } }
+    }
+    Write-Output ("OR_STUDIO_SHOT " + (@{
+      ok = $true
+      whole_screen = $true
+      file = $full
+      bytes = (Get-Item -LiteralPath $full).Length
+      method = "fullscreen"
+      focused = $false
+      width = $vs.Width
+      height = $vs.Height
+      window = @{ process = "desktop"; pid = 0; width = $vs.Width; height = $vs.Height }
+      base64_file = $tunnel.base64_file
+      base64_chars = $tunnel.base64_chars
+      base64_lines = $tunnel.base64_lines
+      sha256 = $tunnel.sha256
+      mime = $tunnel.mime
+      tunnel_error = $(if ($tunnel.tunnel_error) { $tunnel.tunnel_error } else { "" })
+      route = $(if ($script:Compiled) { "compiled" } else { "no-compile" })
+      compile_error = $(if ($script:CompileError) { $script:CompileError } else { "" })
+    } | ConvertTo-Json -Compress -Depth 4))
+    exit 0
+  } catch {
+    Write-Output ("OR_STUDIO_SHOT " + (@{ ok = $false; whole_screen = $true; error = ("whole-screen capture failed: " + $_.Exception.Message); code = 3 } | ConvertTo-Json -Compress -Depth 3))
     exit 3
   }
 }

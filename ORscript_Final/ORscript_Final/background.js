@@ -1543,17 +1543,27 @@ function parseShotMeta(raw) {
   return null;
 }
 
-async function studioWindowShot({ focus = false, focusOnly = false, maxWidth = 1600, out = "or_studio_window.png" } = {}) {
+// The whole-screen capture writes its own file name: a shot of the desktop must not be
+// saved as "or_studio_window.jpg", or the user (and attach_feedback {path}) would be told
+// the wrong thing about what the file is.
+function wholeScreenOut(name) {
+  const s = String(name || "or_studio_window.png");
+  return /studio/i.test(s) ? s.replace(/studio_window/i, "screen").replace(/studio/i, "screen") : s;
+}
+
+async function studioWindowShot({ focus = false, focusOnly = false, maxWidth = 1600, out = "or_studio_window.png", wholeScreen = false } = {}) {
   const ps1 = (cmd) => `powershell -NoProfile -ExecutionPolicy Bypass -File studio_shot.ps1 ${cmd}`;
   try {
     await ensureStudioShotScript();
   } catch (e) {
     return { ok: false, error: "could not write studio_shot.ps1 into the agent workspace: " + String((e && e.message) || e) + " (is or-agent.exe running?)" };
   }
+  // wholeScreen ignores -Focus/-FocusOnly: it photographs the desktop, so there is no
+  // Studio window to raise and nothing to focus.
   const flags = [
-    focusOnly ? "-FocusOnly" : `-Out ${out}`,
-    focus && !focusOnly ? "-Focus" : "",
-    focusOnly ? "" : `-MaxWidth ${Math.max(320, Math.min(3000, Number(maxWidth) || 1600))}`,
+    wholeScreen ? `-WholeScreen -Out ${wholeScreenOut(out)}` : (focusOnly ? "-FocusOnly" : `-Out ${out}`),
+    focus && !focusOnly && !wholeScreen ? "-Focus" : "",
+    focusOnly && !wholeScreen ? "" : `-MaxWidth ${Math.max(320, Math.min(3000, Number(maxWidth) || 1600))}`,
   ].filter(Boolean).join(" ");
   const cmd = ps1(flags);
   const r = await localRun(cmd, 45);
@@ -1600,7 +1610,7 @@ async function studioWindowShot({ focus = false, focusOnly = false, maxWidth = 1
       if ((e2 && e2.code === "too-large") || /too large to read whole|unexpectedly large|too big to hand over as text/i.test(why2)) {
         try {
           const smallW = Math.max(640, Math.min(1100, Math.round((Number(maxWidth) || 1600) * 0.65)));
-          const cmd2 = ps1(`-Out ${out} -MaxWidth ${smallW} -Quality 60`);
+          const cmd2 = ps1(`-Out ${out} -MaxWidth ${smallW} -Quality 60` + (wholeScreen ? " -WholeScreen" : ""));
           const r2 = await localRun(cmd2, 45);
           const meta2 = parseShotMeta(String((r2 && (r2.text || r2.error)) || ""));
           if (meta2 && meta2.ok) {
@@ -1616,20 +1626,23 @@ async function studioWindowShot({ focus = false, focusOnly = false, maxWidth = 1
         // delivered by the smaller re-capture - continue to the normal return
       } else {
         return { ok: false, meta, command: cmd,
-                 error: "the window WAS captured to " + file + ", but the picture could not be read back: " +
+                 error: (wholeScreen ? "the screen WAS captured to " : "the window WAS captured to ") + file + ", but the picture could not be read back: " +
                    why2 + " (direct file read: " + String((e1 && e1.message) || e1).slice(0, 160) + "). " +
                    (meta && meta.tunnel_error ? "The capture script could not write the tunnel file: " + String(meta.tunnel_error).slice(0, 160) + ". " : "") +
                    "The capture itself worked - only the hand-over failed." };
       }
     }
   }
-  const how = meta.method === "printwindow" ? "PrintWindow (Studio never had to come forward)"
+  const what = wholeScreen ? "your whole screen (all monitors)"
+    : "the Roblox Studio WINDOW";
+  const how = meta.method === "fullscreen" ? "a full-desktop grab (VirtualScreen)"
+    : meta.method === "printwindow" ? "PrintWindow (Studio never had to come forward)"
     : meta.method === "screen" ? "screen grab after raising the Studio window"
     : meta.method === "screen-nocompile" ? "screen grab after raising Studio (fallback route: the fast helper could not be compiled on this PC)"
     : String(meta.method || "capture");
   return {
     ok: true, images, meta, command: cmd,
-    text: `Captured the Roblox Studio WINDOW via ${how} — ${meta.window && meta.window.width}x${meta.window && meta.window.height} px, saved as ${file}` +
+    text: `Captured ${what} via ${how} — ${(meta.width || (meta.window && meta.window.width))}x${(meta.height || (meta.window && meta.window.height))} px, saved as ${file}` +
       (how2 ? ` (delivered through the ${how2}).` : ".") +
       (meta.method === "screen" && meta.focused ? " Studio is now the front window." : "") +
       (meta.method === "screen" && !meta.focused ? " (Windows would not give Studio keyboard focus; it was raised above other windows.)" : "") +
@@ -1677,7 +1690,7 @@ async function shotTest() {
     return { ok: true, steps, meta,
       text: "Everything a screenshot needs works on this machine: " + steps.join("; ") + ". " +
         (viaFast ? "Picture hand-over: one-call file readback." : "Picture hand-over: the BASE64 TEXT TUNNEL (your agent has no read_file_base64 - that is fine).") +
-        " So or_screenshot {target:\"window\"} will deliver as long as Roblox Studio is open - and the in-Studio route works too whenever the MCP hands the picture back as an image block, a saved file path, or base64 text." };
+        " So or_screenshot will deliver: {target:\"studio\"} needs only Studio open, {target:\"desktop\"} needs no Studio at all (whole PC), and {target:\"window\"} photographs the Studio window - none of them cares which window is in front." };
   } catch (e) {
     return fail("the capture machinery works, but the picture could not be read back: " + String((e && e.message) || e) +
       " - that is the hand-over (the tunnel), not the capture.");
@@ -1926,6 +1939,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           focusOnly: msg.focus_only === true,
           maxWidth: msg.max_width,
           out: msg.out,
+          wholeScreen: msg.whole_screen === true,
         });
         sendResponse(r);
         break;

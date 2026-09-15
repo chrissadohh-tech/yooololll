@@ -2032,7 +2032,11 @@
     // Studio itself, and it is the only route that still delivers a picture when the
     // MCP hands the image over as data blocks an older agent drops. The !shots.length
     // gate below keeps this a FALLBACK - it never runs on top of a good MCP shot.
-    const wantWindow = target === "auto" || target === "window" || target === "studio_window" || target === "os" || target === "desktop" ||
+    // Whole-screen: the desktop itself, all monitors. No Studio window involved (it can
+    // even be closed), so it is not part of the Studio-window fallback below.
+    const wantScreen = target === "desktop" || target === "screen" || target === "pc" ||
+      target === "monitor" || target === "fullscreen" || target === "whole" || target === "os";
+    const wantWindow = target === "auto" || target === "window" || target === "studio_window" ||
       target === "studio" || target === "roblox" || target === "viewport";
     const wantTab = target === "tab" || target === "chat" || target === "page" || target === "self";
     // Which servers does the bridge say are alive? Attempting a tool on a server
@@ -2075,6 +2079,22 @@
     const roster = Array.isArray(A.toolList) ? A.toolList : [];
     const hasTool = (t) => !roster.length || roster.some((x) => bareToolName(x && (x.name || x.id)) === t);
     const studioUp = serverUp("roblox") !== false && serverUp("studio") !== false;
+    if (wantScreen) {
+      // "Screenshot my whole PC": the entire desktop, every monitor, captured by
+      // studio_shot.ps1 -WholeScreen. Needs the agent (and PowerShell), but NOT Studio,
+      // not the MCP, and not any particular window in front.
+      try {
+        const r = await bg({ type: "studio_window_shot", whole_screen: true, max_width: o.maxWidth || 1600 });
+        if (r && r.ok && r.images && r.images.length) {
+          shots.push(...r.images);
+          notes.push("whole screen: " + (r.text || "captured"));
+        } else {
+          notes.push("whole screen: " + String((r && r.error) || "capture failed").slice(0, 320));
+        }
+      } catch (e) {
+        notes.push("whole screen: " + String((e && e.message) || e).slice(0, 200));
+      }
+    }
     if (wantStudio) {
       // BLENDER PARITY, and the fix for "why does the window route win?":
       // Blender is judged by the agent's OWN probe (A.bridge.blender) and then simply
@@ -2266,7 +2286,10 @@
       // Unknown target names fall back to "auto" instead of silently capturing
       // nothing (a typo used to read as "Studio MCP + tab capture both failed").
       const rawTarget = String(args.target || args.source || "auto").toLowerCase();
-      const target = /^(auto|studio|roblox|viewport|blender|blender_window|window|studio_window|os|desktop|tab|chat|page|self)$/.test(rawTarget) ? rawTarget : "auto";
+      // The three screenshots the user actually asks for: INSIDE Studio, INSIDE Blender,
+      // and the WHOLE PC. "desktop"/"screen"/"pc"/"os" mean the whole screen - not the
+      // Studio window - because that is plainly what those words say.
+      const target = /^(auto|studio|roblox|viewport|blender|blender_window|window|studio_window|desktop|screen|pc|monitor|fullscreen|whole|os|tab|chat|page|self)$/.test(rawTarget) ? rawTarget : "auto";
       const { shots, notes } = await captureShots(target, { focus: args.focus === true, maxWidth: args.max_width });
       if (!shots.length) {
         return "ERROR: or_screenshot captured nothing. " +
@@ -2331,7 +2354,7 @@
         }
       }
       if (!img || !img.data) {
-        return "ERROR: no image to attach yet. Take one first (or_screenshot {target:\"studio\"|\"tab\"|\"blender\"}), or pass a workspace file path.";
+        return "ERROR: no image to attach yet. Take one first (or_screenshot {target:\"studio\"|\"blender\"|\"desktop\"|\"tab\"}), or pass a workspace file path.";
       }
       const ageS = img.at ? Math.max(0, Math.round((Date.now() - img.at) / 1000)) : null;
       const sizeKb = kb(img.data);

@@ -58,7 +58,12 @@ if (RS) {
     /read_file_base64/.test(RS.buildSystemPrompt({ engine: "local" })) && /attach_feedback/.test(RS.buildSystemPrompt({ engine: "local" })));
   ok("the live roster appends TOOL_NOTES by bare name", /RS\.TOOL_NOTES\[bareToolName\(t\.name\)\]/.test(mainSrc));
   ok("prompt no longer claims web_search is DuckDuckGo-only", !/web_search\\?`? {query, limit\?} DuckDuckGo/.test(prompt));
-  ok("prompt lists every screenshot target", /\{target\?:"auto"\|"studio"\|"blender"\|"window"\|"tab"/.test(prompt) && prompt.includes("or_focus_studio"));
+  ok("prompt lists every screenshot target", /\{target\?:"auto"\|"studio"\|"blender"\|"desktop"\|"window"\|"tab"/.test(prompt) && prompt.includes("or_focus_studio"));
+  // The three the user actually asks for must be spelled out, including that the
+  // whole-PC one is the desktop itself and needs no window in front.
+  ok("...and names the three: inside Studio, inside Blender, the whole PC",
+    /"studio" = Studio takes its own picture/.test(prompt) && /"blender" = the Blender viewport/.test(prompt) &&
+    /"desktop" \(aliases screen, pc, os\) = the WHOLE PC/.test(prompt));
   ok("prompt explains the window target needs no page permission", /needs no page permission/i.test(prompt));
   ok("prompt points at the per-target reason on empty capture", /reports NOTHING/i.test(prompt) && /per-target reason/i.test(prompt));
   ok("tool notes survive into the roster text", typeof RS.compactTools === "function");
@@ -746,6 +751,36 @@ const WIKI_JSON = JSON.stringify({ query: { search: [{ title: "Roblox" }, { titl
     // The capture is written as a BARE filename, so it lands in the agent's own
     // working directory - the same place read_file resolves - and the text twin sits
     // next to it. An absolute temp path would break the readback.
+    // Whole-PC capture: the desktop itself, all monitors, and it must run BEFORE the
+    // Studio window lookup so it works with Studio closed.
+    // A param block that is missing a comma is a PARSE error: every capture fails, and
+    // the message looks like nothing to do with parameters. Parse the block instead of
+    // eyeballing it: each declaration except the last needs a comma, the last must not
+    // have one, and no name may repeat.
+    {
+      const pStart = ps1Src.indexOf("param(");
+      const pEnd = ps1Src.indexOf("\n)", pStart);
+      const decls = ps1Src.slice(pStart + 6, pEnd > 0 ? pEnd : pStart)
+        .split("\n").map((l) => l.trim()).filter((l) => l && !l.startsWith("#"));
+      const missing = decls.slice(0, -1).filter((l) => !l.endsWith(","));
+      const lastHasComma = decls.length > 0 && decls[decls.length - 1].endsWith(",");
+      const names = decls.map((l) => (l.match(/\$(\w+)/) || [])[1]).filter(Boolean);
+      const dupes = names.filter((n, i) => names.indexOf(n) !== i);
+      ok("the capture script's parameter block is well formed",
+         decls.length > 5 && missing.length === 0 && !lastHasComma && dupes.length === 0,
+         JSON.stringify({ decls: decls.length, missing, lastHasComma, dupes }).slice(0, 260));
+      ok("...and it declares the whole-screen switch", names.includes("WholeScreen"));
+    }
+    ok("the script can photograph the whole desktop", ps1Src.includes("[switch]$WholeScreen") &&
+       ps1Src.includes("SystemInformation]::VirtualScreen") && ps1Src.includes('method = "fullscreen"'));
+    ok("...and that branch runs before any Studio window is required",
+       ps1Src.indexOf("if ($WholeScreen)") < ps1Src.indexOf("$win = Get-StudioWindow"));
+    ok("...and the worker can ask for it", bgSrc.includes("wholeScreen") && bgSrc.includes("msg.whole_screen === true"));
+    ok("...and a desktop shot is saved under a screen name, not a Studio one",
+       bgSrc.includes("function wholeScreenOut") && bgSrc.includes("replace(/studio_window/i, \"screen\")"));
+    ok("...and desktop/screen/pc/os are the whole screen, not the Studio window",
+       /const wantScreen = target === "desktop"/.test(mainSrc) && /target === "os";/.test(mainSrc) &&
+       /const wantWindow = target === "auto" \|\| target === "window" \|\| target === "studio_window" \|\|/.test(mainSrc));
     ok("the capture lands where the agent can read it back",
        ps1Src.includes('[string]$Out = "or_studio_window.png"') && ps1Src.includes('$B64Only + ".b64"'));
     // Integrity: a short/partial/clipped readback must be an ERROR, never a silently

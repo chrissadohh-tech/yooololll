@@ -77,9 +77,21 @@ through the capture script, reads it back exactly the way a real screenshot is h
 verifies the checksum. It needs no Studio window. `agent_info {}` reports which `or-agent.exe`
 is running and which hand-over is in use.
 
+**The three screenshots, in one line each:**
+
+```
+or_screenshot {"target":"studio"}     a picture taken INSIDE Roblox Studio   - Studio just has to be open
+or_screenshot {"target":"blender"}    a picture taken INSIDE Blender        - Blender just has to be open
+or_screenshot {"target":"desktop"}    a picture of the WHOLE PC             - all monitors, Studio not needed
+```
+
+None of the three cares which window is in front or has focus. Only `{"target":"tab"}`
+photographs whatever is in front (that one is for showing OR the chat page itself).
+
 | route | needs | notes |
 | --- | --- | --- |
 | `or_screenshot {target:"studio"}` | Roblox Studio open + its MCP | **Studio takes its own picture.** No window, no focus, no PowerShell — the browser being in front or behind makes no difference. Blender parity: nothing but "Studio is open" |
+| `or_screenshot {target:"desktop"}` (aliases `screen`, `pc`, `os`) | or-agent.exe running | the entire desktop, every monitor, grabbed straight from the screen — no Studio window involved, and no window has to be in front |
 | `or_screenshot {target:"window"}` | or-agent.exe running, Studio open | photographs the Studio **window** directly (PrintWindow), so Studio never has to come forward. The fallback when the MCP cannot hand the picture over |
 | `or_screenshot {target:"auto"}` | best of the above | Studio MCP → Blender → Studio window → tab |
 | `or_screenshot {target:"tab"}` | an ordinary http/https page in front | `chrome://`, the New Tab page and PDFs can never be captured |

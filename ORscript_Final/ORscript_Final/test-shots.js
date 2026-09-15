@@ -146,6 +146,7 @@ function makeFakeAgent(opts) {
   state.selftestBadRoundtrip = false;      // the script cannot decode its own tunnel text
   state.maxReadBytes = 0;                 // 0 = no limit; set to model the agent's 2 MB cap
   state.smallPayload = false;             // true after a -MaxWidth <= 1100 re-capture
+  state.commands = [];                     // every shell command the worker asked for
   state.corruptOnRead = () => { damage.on = true; };
   state.hideB64OnRead = () => { damage.hide = true; };
   const base = (p) => String(p || "").split(/[\\/]/).pop();
@@ -164,6 +165,7 @@ function makeFakeAgent(opts) {
     if (type === "list_tools") { reply(sock, { type: "tools", id, ok: true, tools: toolList() }); return; }
     if (type !== "call_tool") return;
     state.calls.push(name);
+    if (name === "run_command") state.commands.push(String((a && a.command) || ""));
     const okText = (text) => reply(sock, { type: "tool_result", id, ok: true, text });
     const fail = (error) => reply(sock, { type: "tool_result", id, ok: false, error });
     if (name === "read_file_base64") { fail("unknown tool: read_file_base64"); return; }   // THE OLD EXE
@@ -200,6 +202,20 @@ function makeFakeAgent(opts) {
       okText("OR_STUDIO_SHOT " + JSON.stringify({ ok: true, b64_only: true, file: target, bytes: data.length, mime: /png$/.test(target) ? "image/png" : "image/jpeg",
         base64_file: target + ".b64", base64_chars: b64.length, base64_lines: b64.length / 400,
         sha256: crypto.createHash("sha256").update(data).digest("hex"), tunnel_error: "" }));
+      return;
+    }
+    if (name === "run_command" && /-WholeScreen/.test(String(a.command || ""))) {
+      // the whole-desktop capture: same script, same tunnel, no Studio window involved
+      const img = Buffer.alloc(2600);
+      for (let i = 0; i < img.length; i++) img[i] = (i * 31 + 5) & 0xff;
+      files["or_screen.jpg"] = img;
+      const b64 = img.toString("base64");
+      files["or_screen.jpg.b64"] = Buffer.from(b64.match(/.{1,400}/g).join("\n") + "\n", "utf8");
+      okText("OR_STUDIO_SHOT " + JSON.stringify({ ok: true, whole_screen: true, file: "or_screen.jpg", bytes: img.length,
+        method: "fullscreen", focused: false, width: 2560, height: 1440,
+        window: { process: "desktop", pid: 0, width: 2560, height: 1440 },
+        base64_file: "or_screen.jpg.b64", base64_chars: b64.length, base64_lines: b64.length / 400,
+        sha256: crypto.createHash("sha256").update(img).digest("hex"), mime: "image/jpeg", tunnel_error: "" }));
       return;
     }
     if (name === "run_command") {
@@ -739,6 +755,31 @@ const call = async (c, tool, args, ms = 9000) => {
         ok("a broken tunnel format is caught by the self-test", /SCREENSHOT PATH BROKEN/.test(b) && /tunnel format is broken/i.test(b), b.slice(0, 300));
       }
 
+      // ── THE THREE SCREENSHOTS THE USER ASKS FOR: inside Studio, inside Blender,
+      //    and the WHOLE PC. The whole-PC one must photograph the desktop (all
+      //    monitors) - not the Studio window - and must not need Studio at all. ──
+      {
+        const desk = makeFakeAgent({});
+        const cDesk = build({}, { fakeAgent: desk, engine: "local" }).ctx;
+        await waitConnected(cDesk);
+        const shotRuns = [];
+        for (const t of ["desktop", "screen", "pc", "os"]) {
+          const out = String(await call(cDesk, "or_screenshot", { target: t }, 40000));
+          shotRuns.push({ t, out, imgs: vm.runInContext("window.__rsRecentImages()", cDesk).length });
+        }
+        ok("a whole-PC screenshot really captures the desktop (desktop/screen/pc/os)",
+           shotRuns.every((r) => /attached to THIS message/i.test(r.out) && r.imgs >= 1),
+           JSON.stringify(shotRuns.map((r) => [r.t, r.imgs, r.out.slice(0, 40)])).slice(0, 400));
+        ok("...and it says it was the whole screen, not the Studio window",
+           shotRuns.every((r) => /whole screen/i.test(r.out)) && !/Roblox Studio WINDOW/i.test(shotRuns[0].out),
+           shotRuns[0].out.slice(0, 220));
+        ok("...and it asked the script for the whole desktop, with no focus stealing",
+           desk.commands.some((c) => /-WholeScreen/.test(c)) &&
+           !desk.commands.some((c) => /-WholeScreen/.test(c) && /-Focus/.test(c)),
+           desk.commands.slice(-1)[0] || "(no command)");
+        ok("...and the file it saved is named for the screen, not for Studio",
+           /saved as or_screen\.jpg/i.test(shotRuns[0].out), shotRuns[0].out.slice(0, 260));
+      }
       // ── THE ROUTE THE USER ASKED ABOUT: Studio's OWN screenshot, taken INSIDE
       //    Studio. No window, no PowerShell, no focus - only "Studio is open". This is
       //    the user's own topology: local engine, the agent proxying Studio's MCP. ──
