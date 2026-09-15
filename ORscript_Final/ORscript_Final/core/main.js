@@ -1963,16 +1963,64 @@
     const o = opts || {};
     const shots = [];
     const notes = [];
+    // Where can an MCP tool write a file? If its OWN schema advertises a path argument,
+    // asking it to save the picture turns an "image blocks only" server into a file we can
+    // read back as TEXT - which works even on an agent build that drops image blocks.
+    // Nothing is guessed: only a string property whose name says path/file/filename.
+    const pathPropFor = (tool) => {
+      try {
+        const list = Array.isArray(A.toolList) ? A.toolList : [];
+        const t = list.find((x) => bareToolName(x && (x.name || x.id)) === tool);
+        const props = (t && t.inputSchema && t.inputSchema.properties) || {};
+        for (const k of Object.keys(props)) {
+          const spec = props[k] || {};
+          if (String(spec.type || "") !== "string") continue;
+          if (/^(save_?path|file_?path|output_?path|out_?path|filename|file|path)$/i.test(k)) return k;
+        }
+      } catch {}
+      return "";
+    };
+    const workspaceDir = () => {
+      const r = A.bridge && (A.bridge.local_root || A.bridge.workspace_root || A.bridge.root);
+      return String(r || "").replace(/[\\/]+$/, "");
+    };
+    const takeMcpAnswer = (r, label) => {
+      if (r && r.ok && r.images && r.images.length) {
+        shots.push(...r.images);
+        // Say WHERE the picture came from: "image(s)" alone cannot tell the user whether it
+        // arrived as an MCP image block or was rescued from text.
+        notes.push(label + ": " + r.images.length + " image(s)" + (r.image_source ? " - " + r.image_source : ""));
+        return true;
+      }
+      if (r && !r.ok) notes.push(label + ": " + String(r.error || "failed").slice(0, 160));
+      else if (r && r.ok && r.image_error) notes.push(label + ": " + String(r.image_error).slice(0, 240));
+      return false;
+    };
     const tryMcp = async (toolName, label) => {
       try {
-        const r = await bg({ type: "call_tool", name: toolName, arguments: {}, timeout: 20000 });
-        if (r && r.ok && r.images && r.images.length) {
-          shots.push(...r.images);
-          notes.push(label + ": " + r.images.length + " image(s)");
-          return true;
+        // connectWait: a screenshot is not worth a 20s wait for a socket that is not
+        // there. Short wait, so trying is always cheap and we never skip a route that
+        // would have worked (the status frame can predate the connection).
+        const r = await bg({ type: "call_tool", name: toolName, arguments: {}, timeout: 20000, connectWait: 3000 });
+        if (takeMcpAnswer(r, label)) return true;
+        // ONE bounded retry, and only when the tool's own schema offers a place to write
+        // the picture. This is the last chance for a server whose only answer is an image
+        // block on an agent build that drops them.
+        // The schema is what makes this retry honest, so FETCH the tool list if it is not
+        // in hand yet - skipping here would silently lose the only chance a
+        // text-blind server has of delivering its picture.
+        if (!(A.toolList && A.toolList.length)) { try { await ensureTools(true); } catch {} }
+        if (!workspaceDir()) { try { const st = await bg({ type: "status" }); if (st) A.bridge = Object.assign({}, A.bridge || {}, st); } catch {} }
+        const key = pathPropFor(toolName);
+        const dir = workspaceDir();
+        if (key && dir) {
+          const file = dir + "/or_mcp_shot.png";
+          notes.push(label + ": asked the MCP to save the picture to " + file + " (its schema lists " + key + ")");
+          const r2 = await bg({ type: "call_tool", name: toolName, arguments: { [key]: file }, timeout: 20000, connectWait: 3000 });
+          if (takeMcpAnswer(r2, label + " (saved file)")) return true;
+        } else if (r && r.ok) {
+          notes.push(label + ": the tool answered with text that named no picture");
         }
-        if (r && !r.ok) notes.push(label + ": " + String(r.error || "failed").slice(0, 160));
-        else if (r && r.ok) notes.push(label + ": returned no image data");
       } catch (e) {
         notes.push(label + ": " + String((e && e.message) || e).slice(0, 160));
       }
@@ -2007,7 +2055,11 @@
     // bridge-connect wait first. Declared HERE, above every reader: a late declaration
     // is the temporal-dead-zone crash this file already suffered once.
     let definitelyDown = false;
-    if (!A.bridge) {
+    // Refresh when our view is missing OR says "nothing is connected". The panel learns
+    // this from the worker's broadcasts, and a broadcast that has not arrived yet (worker
+    // just woke up, panel opened a moment ago) must not be allowed to skip Studio's own
+    // capture and hand the job to the window route. One local round-trip settles it.
+    if (!bridgeUp) {
       try {
         const st = await bg({ type: "status" });
         if (st) { A.bridge = st; bridgeUp = !!(st.connected || st.local_connected || (Array.isArray(st.servers) && st.servers.length)); }
@@ -2024,10 +2076,18 @@
     const hasTool = (t) => !roster.length || roster.some((x) => bareToolName(x && (x.name || x.id)) === t);
     const studioUp = serverUp("roblox") !== false && serverUp("studio") !== false;
     if (wantStudio) {
-      if (definitelyDown) notes.push("studio: skipped - the bridge reports no live connection for the Roblox MCP to ride on");
-      else if (!studioUp) notes.push("studio: the Roblox MCP is NOT alive (bridge reports the server down) - skipped the call");
-      else if (!hasTool("screen_capture")) notes.push("studio: the MCP advertises no screen_capture tool right now (0 tools listed) - skipped the call; run list_commands / restart_mcp");
+      // BLENDER PARITY, and the fix for "why does the window route win?":
+      // Blender is judged by the agent's OWN probe (A.bridge.blender) and then simply
+      // ASKED. Studio used to be skipped on cached snapshots (server list / tool list),
+      // so a stale or empty cache silently handed the job to the window route - even
+      // when Studio's own MCP could have taken the shot. Now Studio is asked whenever
+      // anything is connected, and the call's own failure is the answer. That keeps the
+      // capture inside Studio, independent of which window is in front.
+      const before = shots.length;
+      if (!bridgeUp) notes.push(noConnNote || "studio: nothing is connected to reach the Roblox MCP with - skipped the call (start the agent, then retry)");
       else await tryMcp("screen_capture", "studio");
+      if (shots.length === before && !studioUp) notes.push("studio: the Roblox MCP is not alive right now (the bridge reports the roblox server down)");
+      else if (shots.length === before && !hasTool("screen_capture")) notes.push("studio: the MCP listed no screen_capture tool - if the picture still failed, run list_commands / restart_mcp");
     }
     if (wantBlend && !shots.length) {
       // A.bridge.blender is set from the agent's own probe, so it already implies the
@@ -2087,8 +2147,8 @@
         const info = await bg({ type: "agent_info" });
         if (info && info.has_base64 === false) {
           const tunnel = info.has_read_file !== false && info.has_run_command !== false;
-          notes.push("AGENT IS ONE TOOL OLD: or-agent.exe lists " + info.tools + " tools and has no read_file_base64, so the MCP's own image " +
-            "blocks cannot be handed over" +
+          notes.push("AGENT IS ONE TOOL OLD: or-agent.exe lists " + info.tools + " tools and has no read_file_base64, so an MCP that answers with " +
+            "IMAGE BLOCKS has them dropped (a saved file path or inline base64 in the answer still comes through as text)" +
             (tunnel
               ? '. The WINDOW route still works without a rebuild: it writes the capture next to the agent and reads it back as base64 TEXT with read_file - use {target:"window"} or {target:"auto"}. Rebuilding (cd agent && cargo build --release, copy target/release/or-agent.exe over the old one, restart it) only makes it faster and enables the MCP image path.'
               : ", and this agent is too old to read the file back as text either (read_file/run_command missing), so rebuild it to get any screenshot."));

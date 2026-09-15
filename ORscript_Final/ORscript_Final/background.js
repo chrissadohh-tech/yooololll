@@ -284,6 +284,10 @@ function connect() {
     } catch {
       return;
     }
+    // The agent names its workspace in its handshake. Remember it HERE as well as
+    // from the HTTP API: a capture must never have to guess where to write a file
+    // just because that one request was slow or blocked.
+    if (msg && msg.type === "connected" && typeof msg.workspace_root === "string" && msg.workspace_root) localRoot = msg.workspace_root;
     handleBridgeMessage(msg);
   };
 
@@ -396,12 +400,15 @@ function waitForConnection(timeout = 20000) {
 }
 
 // ── request/response over the socket ────────────────────────────────────
-async function send(obj, timeout = REQUEST_TIMEOUT_DEFAULT) {
+// opts.connectWait - how long to wait for the socket to OPEN (default 20s, right for
+// real work because an MV3 worker may have just woken up). A SCREENSHOT passes a
+// short budget: half a minute is not worth it when other routes can be tried instead.
+async function send(obj, timeout = REQUEST_TIMEOUT_DEFAULT, opts) {
   // The MV3 service worker can be suspended; the first message after a wake-up
   // arrives before the socket has re-opened. Wait for it instead of failing -
   // otherwise Kimi wrongly hears "bridge offline".
   if (!connected || !ws || ws.readyState !== WebSocket.OPEN) {
-    await waitForConnection(20000);
+    await waitForConnection((opts && opts.connectWait) || 20000);
   }
   const attempt = () => new Promise((resolve) => {
     if (!connected || !ws || ws.readyState !== WebSocket.OPEN) {
@@ -427,7 +434,8 @@ async function send(obj, timeout = REQUEST_TIMEOUT_DEFAULT) {
   });
   let r = await attempt();
   if (r && r.kind === "disconnected") {
-    await waitForConnection(15000);
+    await waitForConnection((opts && opts.connectWait) ? (opts.connectWait) : 15000);
+    if (!connected || !ws || ws.readyState !== WebSocket.OPEN) return r;   // asked to be quick: give up now
     r = await attempt();
   }
   return r;
@@ -1079,6 +1087,54 @@ async function b64ToVerifiedImage(b64, meta) {
 //      with read_file, verifying size + SHA-256 (old agent).
 // Throws with .code = "too-large" when the file cannot travel as text at all, so the
 // caller can retake it smaller instead of giving up.
+// ── a picture that arrives as TEXT ──────────────────────────────────────────
+// Not every MCP hands the picture over as image data. Studio's own capture and
+// Blender's addon both WRITE a file and answer with its path, and some servers inline
+// base64. Image blocks need an up-to-date or-agent.exe; a path or inline base64 does
+// NOT - it can be read back through the same text tunnel the window capture uses.
+// Without this, a text-only answer read as "captured nothing" even though the picture
+// was sitting on disk the whole time.
+const IMAGE_FILE_RE = /(?:[A-Za-z]:[\\/]|\\\\[^\s"']+[\\/]|\/)[^"'\r\n<>|?*]*?\.(?:png|jpe?g|webp|bmp|gif)\b/i;
+function imagePathInText(text) {
+  const m = String(text || "").match(IMAGE_FILE_RE);
+  return m ? m[0].trim() : "";
+}
+function imageDataInText(text) {
+  const t = String(text || "");
+  const uri = t.match(/data:(image\/[a-z0-9.+-]+);base64,([A-Za-z0-9+/=\s]{200,})/i);
+  if (uri) return { mimeType: uri[1], data: uri[2].replace(/\s+/g, "") };
+  const blob = t.match(/(?:^|[\s"'(=:\[])([A-Za-z0-9+/]{400,}={0,2})(?=$|[\s"')])/m);
+  if (blob) {
+    const b = blob[1].replace(/\s+/g, "");
+    // Only data whose type we can name from its own header - never a guess.
+    const mime = b.startsWith("iVBOR") ? "image/png"
+      : b.startsWith("/9j/") ? "image/jpeg"
+      : b.startsWith("R0lGOD") ? "image/gif" : "";
+    if (mime) return { mimeType: mime, data: b };
+  }
+  return null;
+}
+// Applies to capture-ish tools only: a tool that merely MENTIONS a .png (a file
+// listing, say) must not drag an unrelated picture into the model's context.
+const CAPTURE_TOOL_RE = /screenshot|screen_capture|capture|viewport/i;
+async function harvestToolImage(r, toolName) {
+  if (!r || !r.ok || (Array.isArray(r.images) && r.images.length)) return r;
+  if (toolName && !CAPTURE_TOOL_RE.test(String(toolName))) return r;
+  const text = String(r.text || "");
+  if (!text) return r;
+  const inline = imageDataInText(text);
+  if (inline) return Object.assign({}, r, { images: [inline], image_source: "base64 TEXT in the tool's own answer" });
+  const file = imagePathInText(text);
+  if (!file) return r;
+  try {
+    const t = await tunnelReadImage(file, null);
+    return Object.assign({}, r, { images: [{ mimeType: t.img.mimeType, data: t.img.data }], meta: t.meta,
+      image_source: "the file the tool named (" + file + "), read back as base64 TEXT in " + t.chunks + " chunk(s)" });
+  } catch (e) {
+    return Object.assign({}, r, { image_error: "the tool named " + file + " but its bytes could not be read back: " + String((e && e.message) || e).slice(0, 200) });
+  }
+}
+
 async function tunnelReadImage(file, knownMeta) {
   let meta = knownMeta && knownMeta.base64_file ? knownMeta : null;
   if (!meta) {
@@ -1621,7 +1677,7 @@ async function shotTest() {
     return { ok: true, steps, meta,
       text: "Everything a screenshot needs works on this machine: " + steps.join("; ") + ". " +
         (viaFast ? "Picture hand-over: one-call file readback." : "Picture hand-over: the BASE64 TEXT TUNNEL (your agent has no read_file_base64 - that is fine).") +
-        " So or_screenshot {target:\"window\"} will deliver as long as Roblox Studio is open." };
+        " So or_screenshot {target:\"window\"} will deliver as long as Roblox Studio is open - and the in-Studio route works too whenever the MCP hands the picture back as an image block, a saved file path, or base64 text." };
   } catch (e) {
     return fail("the capture machinery works, but the picture could not be read back: " + String((e && e.message) || e) +
       " - that is the hand-over (the tunnel), not the capture.");
@@ -1820,9 +1876,12 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         }
         const r = await send(
           { type: "call_tool", name: msg.name, arguments: msg.arguments, timeout: msg.timeout },
-          timeout
+          timeout,
+          { connectWait: msg.connectWait }   // a screenshot asks for a short budget
         );
-        sendResponse(r);
+        // A capture tool that answers with a path or inline base64 is turned into a
+        // real attachment HERE, so every caller benefits (and no rebuild is needed).
+        sendResponse(await harvestToolImage(r, msg.name));
         break;
       }
       case "restart_mcp": {

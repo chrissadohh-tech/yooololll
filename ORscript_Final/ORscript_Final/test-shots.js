@@ -136,6 +136,9 @@ function makeFakeAgent(opts) {
   // Damage the file AT READ TIME: a fresh capture rewrites the .b64 twin, so
   // corrupting it up front would be silently repaired by the capture itself.
   const damage = { on: false, hide: false };
+  state.mcpImages = false;                 // the agent proxies Studio's screen_capture AND forwards the picture
+  state.studioDead = false;                // the agent says Studio's MCP server is down right now
+  state.mcpSavePath = false;               // the MCP can WRITE the picture where its schema says
   state.noCompile = false;                 // the fast helper could not be compiled on this PC
   state.captureFails = false;              // the capture step itself threw
   state.trailingNoise = false;             // PowerShell printed something after the result line
@@ -148,10 +151,17 @@ function makeFakeAgent(opts) {
   const base = (p) => String(p || "").split(/[\\/]/).pop();
   const resolve = (p) => { const b = base(p); return files[b] ? b : (files[p] ? p : null); };
   const reply = (sock, obj) => { try { sock.__toClient(JSON.stringify(obj)); } catch {} };
+  // The tool list this agent advertises - schemas included, exactly as a real MCP's
+  // list_tools would pass them through. Some capture tools can WRITE the picture
+  // instead of returning it, and OR only retries that way when the schema says so.
+  const toolList = () => (state.mcpImages || state.mcpSavePath ? OLD_TOOLS.concat(["screen_capture", "get_studio_state"]) : OLD_TOOLS)
+    .map((n) => (n === "screen_capture" && state.mcpSavePath
+      ? { name: n, inputSchema: { type: "object", properties: { save_path: { type: "string", description: "where to write the PNG" } } } }
+      : { name: n }));
   const handle = (sock, msg) => {
     if (!msg || typeof msg !== "object") return;
     const { id, type, name, arguments: a } = msg;
-    if (type === "list_tools") { reply(sock, { type: "tools", id, ok: true, tools: OLD_TOOLS.map((n) => ({ name: n })) }); return; }
+    if (type === "list_tools") { reply(sock, { type: "tools", id, ok: true, tools: toolList() }); return; }
     if (type !== "call_tool") return;
     state.calls.push(name);
     const okText = (text) => reply(sock, { type: "tool_result", id, ok: true, text });
@@ -241,7 +251,41 @@ function makeFakeAgent(opts) {
       okText(body);
       return;
     }
-    if (name === "screen_capture") { okText("screen capture taken (this build drops image blocks)"); return; }
+    if (name === "screen_capture") {
+      if (state.mcpSavePath) {
+        // An "image blocks only" server that can WRITE the picture when its schema's
+        // save_path is used. Models the last-resort retry.
+        const want = String((a && (a.save_path || a.file_path || a.path)) || "");
+        if (!want) { okText("captured 1280x800"); return; }        // no path asked for: no picture
+        const img = Buffer.alloc(3300);
+        for (let i = 0; i < img.length; i++) img[i] = (i * 7 + 3) & 0xff;
+        const b = resolve(want) || base(want);
+        files[b] = img;
+        okText("saved " + want);
+        return;
+      }
+      if (state.mcpImages) { reply(sock, { type: "tool_result", id, ok: true, text: "", images: [{ mimeType: "image/png", data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8AAAwAB/AF+7E1mAAAAAElFTkSuQmCC" }] }); return; }
+      // what an agent WITHOUT image-block forwarding answers: the shot is taken, the
+      // picture is dropped, and only text comes back
+      if (state.mcpPathAnswer) {
+        // some Studio MCP servers SAVE the picture and answer with its path
+        const img = Buffer.alloc(2400);
+        for (let i = 0; i < img.length; i++) img[i] = (i * 29 + 11) & 0xff;
+        files["studio_mcp.png"] = img;
+        okText("Captured 1280x800. Saved to C:\\OR-workspace\\studio_mcp.png");
+        return;
+      }
+      if (state.mcpBase64Answer) {
+        const img = Buffer.alloc(2100);
+        for (let i = 0; i < img.length; i++) img[i] = (i * 13 + 7) & 0xff;
+        files["studio_inline.png"] = img;
+        const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8AAAwAB/AF+7E1mAAAAAElFTkSuQmCC";
+        okText("here is the picture\nbase64:" + png.repeat(14));   // ~1.2k chars, like a small real capture
+        return;
+      }
+      okText("studio screenshot taken");
+      return;
+    }
     if (name === "list_directory") { okText("(1 entry)\n" + Object.keys(files).join("\n")); return; }
     okText("ok: " + name);
   };
@@ -256,7 +300,56 @@ function makeFakeAgent(opts) {
       client.readyState = 1;
       try { client.onopen && client.onopen(); } catch {}
       state.connected++;
-      toClient(JSON.stringify({ type: "connected", workspace_root: "C:\\OR-workspace", tools: OLD_TOOLS.map((n) => ({ name: n })) }));
+      toClient(JSON.stringify({ type: "connected", workspace_root: "C:\\OR-workspace", mcp_alive: true, studio: true,
+        servers: [{ id: "roblox", label: "Roblox Studio", alive: !state.studioDead, tools: 4 }],
+        tools: toolList() }));
+    }, 1);
+    return client;
+  };
+  return state;
+}
+
+
+// ── a FAKE Roblox MCP (the Studio side) ────────────────────────────────────
+// This is the route the user is asking about: Studio's OWN screenshot, taken inside
+// Studio. It never touches a window, PowerShell, or focus. The fake bridge speaks the
+// real protocol on the bridge port, so the worker's call_tool path is exercised for
+// real - including the image blocks the extension has to attach.
+function makeFakeBridge(opts) {
+  const o = opts || {};
+  const state = { calls: [], sendImages: o.sendImages !== false };
+  const IMG = o.image || "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8AAAwAB/AF+7E1mAAAAAElFTkSuQmCC";
+  const reply = (sock, obj) => { try { sock.__toClient(JSON.stringify(obj)); } catch {} };
+  const handle = (sock, msg) => {
+    if (!msg || typeof msg !== "object") return;
+    const { id, type, name } = msg;
+    if (type === "list_tools") { reply(sock, { type: "tools", id, ok: true, tools: state.tools() }); return; }
+    if (type !== "call_tool") return;
+    state.calls.push(name);
+    if (name === "screen_capture") {
+      if (!state.sendImages) {
+        // What an agent WITHOUT image-block forwarding produced: the screenshot is
+        // taken, the picture is thrown away, and only text comes back.
+        reply(sock, { type: "tool_result", id, ok: true, text: "studio screenshot taken" });
+        return;
+      }
+      reply(sock, { type: "tool_result", id, ok: true, text: "", images: [{ mimeType: "image/png", data: IMG }] });
+      return;
+    }
+    reply(sock, { type: "tool_result", id, ok: true, text: "ok: " + name });
+  };
+  state.tools = () => [{ name: "screen_capture" }, { name: "execute_luau" }, { name: "get_studio_state" }, { name: "inspect_instance" }];
+  state.openSocket = () => {
+    const client = { readyState: 0, onopen: null, onmessage: null, onerror: null, onclose: null,
+      send(str) { let m = null; try { m = JSON.parse(str); } catch {} setTimeout(() => handle(this, m), 0); },
+      close() { this.readyState = 3; } };
+    const toClient = (str) => setTimeout(() => { try { client.onmessage && client.onmessage({ data: str }); } catch {} }, 0);
+    client.__toClient = toClient;
+    setTimeout(() => {
+      client.readyState = 1;
+      try { client.onopen && client.onopen(); } catch {}
+      toClient(JSON.stringify({ type: "connected", ok: true, mcp_alive: true, studio: true,
+        tools: state.tools(), servers: [{ id: "roblox", label: "Roblox Studio", alive: true, tools: state.tools().length }] }));
     }, 1);
     return client;
   };
@@ -346,6 +439,7 @@ const skipped = [];
 let ctx = null;
 function build(replies, opts) {
   const fakeAgent = (opts && opts.fakeAgent) || null;
+  const fakeBridge = (opts && opts.fakeBridge) || null;
   const doc = makeDoc();
   const win = makeWindow(doc);
   const { chromeStub } = makeBridge(opts && opts.engine);
@@ -379,7 +473,22 @@ function build(replies, opts) {
       // The fake agent lives on the LOCAL ENGINE port only. The bridge socket
       // (17613) is NOT answered - nothing is listening there in this sandbox - so a
       // stub that connects everything would fake a Roblox MCP that does not exist.
-      const isLocalEngine = fakeAgent && /:17615\b/.test(String(url || ""));   // PORT_LOCAL: the agent's own socket
+      const u = String(url || "");
+      const isLocalEngine = fakeAgent && /:17615\b/.test(u);   // PORT_LOCAL: the agent's own socket
+      const isBridge = fakeBridge && /:17613\b/.test(u);       // PORT_ROBLOX: the Roblox MCP bridge
+      if (isBridge) {
+        const sock = fakeBridge.openSocket();
+        this.readyState = 0;
+        Object.defineProperty(this, "onopen", { get: () => sock.onopen, set: (f) => { sock.onopen = f; } });
+        Object.defineProperty(this, "onmessage", { get: () => sock.onmessage, set: (f) => { sock.onmessage = f; } });
+        Object.defineProperty(this, "onerror", { get: () => sock.onerror, set: (f) => { sock.onerror = f; } });
+        Object.defineProperty(this, "onclose", { get: () => sock.onclose, set: (f) => { sock.onclose = f; } });
+        Object.defineProperty(this, "readyState", { get: () => sock.readyState, set: (v) => { sock.readyState = v; } });
+        this.send = (str) => sock.send(str);
+        this.close = () => sock.close();
+        this.addEventListener = () => {}; this.removeEventListener = () => {};
+        return;
+      }
       if (isLocalEngine) {                               // a live (fake) or-agent.exe
         const sock = fakeAgent.openSocket();
         this.readyState = 0;
@@ -398,6 +507,14 @@ function build(replies, opts) {
     }
     send() {} close() { this.readyState = 3; } addEventListener() {} removeEventListener() {}
   };
+  // A real browser's WebSocket carries these constants, and background.js compares
+  // against WebSocket.OPEN. Without them the value is undefined, so a perfectly good
+  // open socket looked closed and every cached-socket call answered "bridge not
+  // connected" - a harness lie that sent the in-Studio capture down the window route.
+  sandbox.WebSocket.CONNECTING = 0;
+  sandbox.WebSocket.OPEN = 1;
+  sandbox.WebSocket.CLOSING = 2;
+  sandbox.WebSocket.CLOSED = 3;
   sandbox.chrome = chromeStub;
   const c = vm.createContext(sandbox);
   // the real service worker runs in the same context, so chrome.runtime.sendMessage
@@ -415,8 +532,26 @@ function build(replies, opts) {
 }
 
 // ── drive the page seam ────────────────────────────────────────────────────
+
+const statusOf = (c) => vm.runInContext(
+  "new Promise((r) => { try { chrome.runtime.sendMessage({ type: 'status' }, r); } catch (e) { r({ error: String(e) }); } })", c);
+// A real extension has finished connecting long before the user asks for a picture;
+// make the harness wait the same way instead of racing the socket.
+const waitConnected = async (c, ms = 4000) => {
+  const t0 = Date.now();
+  let last = null;
+  for (;;) {
+    last = await statusOf(c);
+    if (last && last.connected) return last;
+    if (Date.now() - t0 > ms) return last;
+    await new Promise((r) => setTimeout(r, 25));
+  }
+};
 const seam = (c) => vm.runInContext("typeof window.__rsRunTool === 'function' ? window.__rsRunTool : null", c);
-const call = async (c, tool, args, ms = 4000) => {
+// 9s default: a capture may legitimately spend ~3s waiting for a socket to open
+// (captureShots asks for a short connectWait) before answering. Anything slower than
+// this is a hang, which is what the harness is here to catch.
+const call = async (c, tool, args, ms = 9000) => {
   const run = seam(c);
   if (typeof run !== "function") return "__no_seam__";
   try {
@@ -602,6 +737,120 @@ const call = async (c, tool, args, ms = 4000) => {
         const cB = build({}, { fakeAgent: badRt, engine: "local" }).ctx;
         const b = String(await call(cB, "shot_test", {}, 40000));
         ok("a broken tunnel format is caught by the self-test", /SCREENSHOT PATH BROKEN/.test(b) && /tunnel format is broken/i.test(b), b.slice(0, 300));
+      }
+
+      // ── THE ROUTE THE USER ASKED ABOUT: Studio's OWN screenshot, taken INSIDE
+      //    Studio. No window, no PowerShell, no focus - only "Studio is open". This is
+      //    the user's own topology: local engine, the agent proxying Studio's MCP. ──
+      {
+        const mcp = makeFakeAgent({}); mcp.mcpImages = true;
+        const cMcp = build({}, { fakeAgent: mcp, engine: "local" }).ctx;
+        const st = await waitConnected(cMcp);
+        ok("the worker reports a live agent connection before the capture", !!(st && st.connected), JSON.stringify(st).slice(0, 160));
+        const shot = String(await call(cMcp, "or_screenshot", { target: "studio" }, 40000));
+        const imgs = vm.runInContext("window.__rsRecentImages()", cMcp);
+        ok("or_screenshot {target:studio} delivers Studio's own screenshot (in-Studio route)",
+           /attached to THIS message/i.test(shot) && imgs.length === 1, shot.slice(0, 260));
+        ok("...the picture is the MCP image, mime respected", String(imgs[0] && imgs[0].mimeType) === "image/png" && String(imgs[0].data || "").length > 50,
+           JSON.stringify({ n: imgs.length, mime: (imgs[0] || {}).mimeType }));
+        ok("...the Studio capture tool is what ran", mcp.calls.includes("screen_capture"), mcp.calls.join(","));
+        ok("...and NO window/OS capture was involved", !/captured the Roblox Studio WINDOW/i.test(shot) && !mcp.calls.includes("run_command"), shot.slice(0, 200));
+        const auto = String(await call(cMcp, "or_screenshot", {}, 40000));
+        ok("or_screenshot {target:auto} uses Studio first, not the window",
+           /attached to THIS message/i.test(auto) && mcp.calls.filter((n) => n === "screen_capture").length >= 2 && !mcp.calls.includes("run_command"), auto.slice(0, 200));
+      }
+      {
+        // classic topology: engine = roblox, so the MCP rides the bridge socket
+        const br = makeFakeBridge({});
+        const cBr = build({}, { fakeBridge: br, engine: "roblox" }).ctx;
+        const stb = await waitConnected(cBr);
+        ok("the worker reports a live bridge connection (engine:roblox)", !!(stb && stb.connected), JSON.stringify(stb).slice(0, 160));
+        const shot = String(await call(cBr, "or_screenshot", { target: "studio" }, 40000));
+        const imgs = vm.runInContext("window.__rsRecentImages()", cBr);
+        ok("...and the same happens on the bridge engine (engine:roblox)", /attached to THIS message/i.test(shot) && imgs.length === 1 && br.calls.includes("screen_capture"), shot.slice(0, 240));
+      }
+      {
+        // ── THE NO-REBUILD CASE (the user's own exe) ──────────────────────────
+        // The agent drops image blocks, but the MCP SAVED the picture and answered
+        // with its path. The picture must still arrive - read back as base64 TEXT,
+        // with no window capture and no rebuild.
+        const mp = makeFakeAgent({}); mp.mcpImages = false; mp.mcpPathAnswer = true;
+        const cMp = build({}, { fakeAgent: mp, engine: "local" }).ctx;
+        await waitConnected(cMp);
+        const shotP = String(await call(cMp, "or_screenshot", { target: "studio" }, 40000));
+        const imgsP = vm.runInContext("window.__rsRecentImages()", cMp);
+        ok("a text-only Studio answer that names a saved picture still delivers it (no rebuild)",
+           /attached to THIS message/i.test(shotP) && imgsP.length === 1, shotP.slice(0, 240));
+        ok("...and the answer says the picture came back as base64 TEXT, not as image data",
+           /read back as base64 TEXT/i.test(shotP), shotP.slice(0, 240));
+        ok("...and no window/OS capture was involved in it", !/captured the Roblox Studio WINDOW/i.test(shotP), shotP.slice(0, 200));
+      }
+      {
+        // Same idea, but the MCP inlines the base64 in its answer.
+        const mb = makeFakeAgent({}); mb.mcpImages = false; mb.mcpBase64Answer = true;
+        const cMb = build({}, { fakeAgent: mb, engine: "local" }).ctx;
+        await waitConnected(cMb);
+        const shotB = String(await call(cMb, "or_screenshot", { target: "studio" }, 40000));
+        const imgsB = vm.runInContext("window.__rsRecentImages()", cMb);
+        ok("inline base64 in the MCP's own answer becomes a real attachment",
+           /attached to THIS message/i.test(shotB) && imgsB.length === 1 && imgsB[0].mimeType === "image/png",
+           shotB.slice(0, 240) + " :: " + JSON.stringify({ n: imgsB.length, mime: (imgsB[0] || {}).mimeType }));
+      }
+      {
+        // Studio's MCP server is DOWN. The route must still be ATTEMPTED (a cached
+        // snapshot is not proof), the answer must say WHY it could not take the picture,
+        // and the window route must still deliver one - so a screenshot command never
+        // ends in "captured nothing" when Studio is open.
+        const md = makeFakeAgent({}); md.studioDead = true;
+        const cMd = build({}, { fakeAgent: md, engine: "local" }).ctx;
+        await waitConnected(cMd);
+        const shotD = String(await call(cMd, "or_screenshot", { target: "studio" }, 40000));
+        const imgsD = vm.runInContext("window.__rsRecentImages()", cMd);
+        ok("a dead MCP is asked anyway, explained, and the picture still arrives",
+           /attached to THIS message/i.test(shotD) && imgsD.length === 1 && /Roblox MCP is not alive/i.test(shotD), shotD.slice(0, 300));
+        ok("...and the Studio call really was attempted (not skipped on the cached status)",
+           md.calls.includes("screen_capture"), md.calls.join(","));
+      }
+      {
+        // LAST RESORT, still without a rebuild: the MCP only ever returns an image block
+        // (which this agent drops) - but its own schema says it can write the file. OR
+        // must ask it to, then read that file back as text.
+        const ms = makeFakeAgent({}); ms.mcpImages = false; ms.mcpSavePath = true;
+        const cMs = build({}, { fakeAgent: ms, engine: "local" }).ctx;
+        await waitConnected(cMs);
+        const shotS = String(await call(cMs, "or_screenshot", { target: "studio" }, 40000));
+        const imgsS = vm.runInContext("window.__rsRecentImages()", cMs);
+        ok("an image-blocks-only MCP still delivers when its schema offers a save path",
+           /attached to THIS message/i.test(shotS) && imgsS.length === 1, shotS.slice(0, 300));
+        ok("...and it really asked for the file (schema-driven, not a guess)",
+           ms.calls.filter((n) => n === "screen_capture").length === 2 && /schema lists save_path/i.test(shotS), shotS.slice(0, 300));
+        ok("...and the picture came from that saved file, not from the window",
+           /read back as base64 TEXT/i.test(shotS) && !/captured the Roblox Studio WINDOW/i.test(shotS), shotS.slice(0, 260));
+      }
+      {
+        // The rescue must NOT misfire: a tool that merely MENTIONS a .png (a file
+        // listing, a script that writes a texture) must not drag an unrelated picture
+        // into the model's context.
+        const mt = makeFakeAgent({}); mt.mcpImages = false;
+        const cMt = build({}, { fakeAgent: mt, engine: "local" }).ctx;
+        await waitConnected(cMt);
+        const r = await vm.runInContext("new Promise(r=>chrome.runtime.sendMessage({type:'call_tool',name:'execute_luau',arguments:{code:'return \"C:\\\\OR-workspace\\\\icon.png\"'},timeout:20000,connectWait:3000},r))", cMt);
+        ok("a non-capture tool that happens to name a .png does NOT get tunneled into an image",
+           !!r && r.ok === true && !(r.images && r.images.length) && !mt.calls.includes("run_command"),
+           JSON.stringify({ ok: r && r.ok, images: r && r.images && r.images.length, calls: mt.calls.join(",") }).slice(0, 200));
+      }
+      {
+        // Same Studio, but an agent build that throws image blocks away (the user's
+        // current exe). The picture cannot come from Studio, so the answer must SAY
+        // that, and the window route must take over automatically.
+        const mcp2 = makeFakeAgent({}); mcp2.mcpImages = false;
+        const cM2 = build({}, { fakeAgent: mcp2, engine: "local" }).ctx;
+        await waitConnected(cM2);            // the worker is connected before a user asks
+        const shot = String(await call(cM2, "or_screenshot", { target: "studio" }, 40000));
+        ok("when the agent drops image blocks, the answer says so instead of 'captured nothing'",
+           /named no picture|returned no image data|image blocks/i.test(shot), shot.slice(0, 400));
+        ok("...and the window route still delivers the picture in that case (goodbye until a rebuild)",
+           /attached to THIS message/i.test(shot), shot.slice(0, 300));
       }
 
       // ── the PC where the fast helper cannot be compiled: the script must fall back to

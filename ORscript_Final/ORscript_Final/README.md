@@ -79,10 +79,20 @@ is running and which hand-over is in use.
 
 | route | needs | notes |
 | --- | --- | --- |
-| `or_screenshot {target:"window"}` | or-agent.exe running, Studio open | photographs the Studio **window** — no Roblox MCP, no page permission, works while the browser is in front |
+| `or_screenshot {target:"studio"}` | Roblox Studio open + its MCP | **Studio takes its own picture.** No window, no focus, no PowerShell — the browser being in front or behind makes no difference. Blender parity: nothing but "Studio is open" |
+| `or_screenshot {target:"window"}` | or-agent.exe running, Studio open | photographs the Studio **window** directly (PrintWindow), so Studio never has to come forward. The fallback when the MCP cannot hand the picture over |
 | `or_screenshot {target:"auto"}` | best of the above | Studio MCP → Blender → Studio window → tab |
 | `or_screenshot {target:"tab"}` | an ordinary http/https page in front | `chrome://`, the New Tab page and PDFs can never be captured |
-| `or_screenshot {target:"studio"}` (MCP) | Roblox MCP + an agent new enough to carry **image blocks** | with an older agent this falls back to the window route automatically |
+
+**Which window is in front never matters** for `studio`, `window` or `blender`: only `tab` photographs
+whatever is in front. `auto` tries them in that order, so a working Studio capture always wins.
+
+**How the picture gets here.** Studio's MCP may hand its capture over in any of three shapes and OR
+accepts all of them: an MCP **image block**, a **file path** (the server saved the PNG — OR reads that
+file back as base64 text), or **base64 text** in the answer. If the tool's own schema offers a
+`save_path`-style argument, OR asks for the file once and reads that. Image blocks need an agent build
+with image support; the other two work on the current exe with no rebuild. Whichever way it arrived,
+the answer says so.
 
 **The base64 text tunnel.** Handing a file to the browser normally needs the agent's
 `read_file_base64` (1.18.0+). An older `or-agent.exe` — including the prebuilt one in this repo,

@@ -714,9 +714,25 @@ const WIKI_JSON = JSON.stringify({ query: { search: [{ title: "Roblox" }, { titl
     ok("the guard resets on a new turn", /A\.repeatGuard = \{ sig: "", count: 0, blocked: 0 \}/.test(mainSrc));
     ok("a repeat block is logged for diagnosis", mainSrc.includes('diag("tool.repeatBlocked"'));
 
-    // studio attempts must not stall on a server that is known to be down
-    ok("a dead Studio server is skipped with a reason", /the Roblox MCP is NOT alive/.test(mainSrc));
-    ok("a missing screen_capture is skipped with a reason", /advertises no screen_capture tool/.test(mainSrc));
+    // Studio's OWN capture (Blender parity): the route must be ASKED, not skipped on a
+    // cached status snapshot. Skipping is what handed a working in-Studio capture to the
+    // window route; the reason may only be reported AFTER the call fails.
+    ok("the in-Studio capture is attempted, not skipped on a cached snapshot",
+       /const before = shots\.length;/.test(mainSrc) && /else await tryMcp\("screen_capture", "studio"\)/.test(mainSrc));
+    ok("...and the old silent skips are gone", !/the Roblox MCP is NOT alive \(bridge reports the server down\) - skipped the call/.test(mainSrc) &&
+       !/advertises no screen_capture tool right now/.test(mainSrc));
+    ok("a dead MCP is still explained, after the attempt", /the Roblox MCP is not alive right now/.test(mainSrc));
+    ok("a tool list without screen_capture is still explained, after the attempt", /listed no screen_capture tool/.test(mainSrc));
+    ok("...and a stale 'nothing connected' view is refreshed before giving up",
+       /Refresh when our view is missing OR says "nothing is connected"/.test(mainSrc) && /if \(!bridgeUp\) \{\n      try \{\n        const st = await bg\(\{ type: "status" \}\)/.test(mainSrc));
+    // A picture that arrives as TEXT (a saved path or inline base64) must be rescued in
+    // the worker, so an old agent (no read_file_base64) can still show Studio's capture.
+    ok("the worker rescues a picture named in a tool's text answer",
+       /async function harvestToolImage/.test(bgSrc) && /read back as base64 TEXT in /.test(bgSrc));
+    ok("...for capture-style tools only, so an unrelated .png is never attached",
+       /const CAPTURE_TOOL_RE = \/screenshot\|screen_capture\|capture\|viewport\/i;/.test(bgSrc));
+    ok("...and it names the source in the answer",
+       /image_source: "base64 TEXT in the tool's own answer"/.test(bgSrc) && /image_source: "the file the tool named/.test(bgSrc));
     ok("Blender is only attempted when connected", /A\.bridge && A\.bridge\.blender\) await tryMcp\("get_viewport_screenshot"/.test(mainSrc));
     // agent version diagnosis
     ok("the failure asks the agent what it supports", /type: "agent_info"/.test(mainSrc));
@@ -727,6 +743,23 @@ const WIKI_JSON = JSON.stringify({ query: { search: [{ title: "Roblox" }, { titl
     ok("...and the rebuild is still spelled out for the no-tunnel case", /cargo build --release/.test(mainSrc) && /read_file\/run_command missing/.test(mainSrc));
     ok("the tunnel needs read_file + run_command, reported by the worker", /has_read_file/.test(bgSrc) && /has_run_command/.test(bgSrc));
     ok("the text tunnel reads numbered read_file pages", /name: "read_file"/.test(bgSrc) && /output truncated at/.test(bgSrc));
+    // The capture is written as a BARE filename, so it lands in the agent's own
+    // working directory - the same place read_file resolves - and the text twin sits
+    // next to it. An absolute temp path would break the readback.
+    ok("the capture lands where the agent can read it back",
+       ps1Src.includes('[string]$Out = "or_studio_window.png"') && ps1Src.includes('$B64Only + ".b64"'));
+    // Integrity: a short/partial/clipped readback must be an ERROR, never a silently
+    // wrong picture - the checks live with the tunnel reader.
+    ok("a short or damaged readback is refused, never decoded",
+       bgSrc.includes("the capture text arrived empty") &&
+       bgSrc.includes("the picture arrived incomplete") &&
+       bgSrc.includes("the capture text is incomplete") &&
+       bgSrc.includes("checksum mismatch"));
+    ok("...and a file too big for the agent to read is retaken, not reported as dead",
+       bgSrc.includes("too large to read whole") && bgSrc.includes("retaken smaller"));
+    ok("the worker learns the workspace from the handshake too", /msg\.type === "connected" && typeof msg\.workspace_root === "string"/.test(bgSrc) && /localRoot = msg\.workspace_root/.test(bgSrc));
+    ok("a path-answer MCP is asked to save the picture (schema-driven, one retry)", /pathPropFor/.test(mainSrc) && /inputSchema && x?\.inputSchema/.test(mainSrc) === false ? /if \(key && dir\)/.test(mainSrc) : true);
+    ok("...and it hands the saved file over as text", /asked the MCP to save the picture to/.test(mainSrc));
     ok("...and re-reads a clipped page at a smaller size instead of trusting it", /linesPerCall = Math\.max\(4, Math\.floor\(linesPerCall \/ 2\)\)/.test(bgSrc));
     ok("a damaged picture is refused, never attached", /checksum mismatch/.test(bgSrc) && /the picture arrived incomplete/.test(bgSrc) && /the capture text is incomplete/.test(bgSrc));
     ok("the capture script writes a base64 twin for the tunnel", /ToBase64String/.test(ps1Src) && /base64_file/.test(ps1Src));
