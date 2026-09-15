@@ -1051,7 +1051,8 @@ const WIKI_JSON = JSON.stringify({ query: { search: [{ title: "Roblox" }, { titl
        /const AV_BLOCK_RE/.test(bgSrc) && /function noteAvBlock/.test(bgSrc) && /av_blocked: true/.test(bgSrc) &&
        /if \(!force && ps1BlockedNow\(\)\) return ps1BlockedReply\(\);/.test(bgSrc));
     ok("...and the block reaches the user as one plain line",
-       /blocked by this PC's antivirus/.test(bgSrc) && /Windows Security/.test(bgSrc) && /Win\+Shift\+S/.test(bgSrc));
+       /blocked by this PC's antivirus/.test(bgSrc) && /Windows Security/.test(bgSrc) &&
+       /Exclusions > Add a folder/.test(bgSrc) && /nothing to reinstall/.test(bgSrc));
     ok("a picture FILE is turned into text WITHOUT PowerShell (signed converter first)",
        /async function b64FileViaConverter/.test(bgSrc) && /certutil -encode/.test(bgSrc) &&
        bgSrc.indexOf("await b64FileViaConverter(file)") < bgSrc.indexOf("studio_shot.ps1 -B64Only"));

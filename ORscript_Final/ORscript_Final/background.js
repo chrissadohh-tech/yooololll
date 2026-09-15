@@ -1806,10 +1806,17 @@ function ps1BlockedNow() {
   return ps1Block.why;
 }
 function ps1BlockedReply() {
+  // The ONE action that brings the script routes back is a Windows Security exclusion, so
+  // the message names the exact folder and the exact clicks: a hint that only says "your
+  // antivirus" leaves the user with nothing to do about it. OR rewrites the script on every
+  // capture, so an allowed folder starts working at once - nothing to reinstall or restart.
+  const dir = String(localRoot || "").replace(/[\\/]+$/, "");
   return {
     ok: false, av_blocked: true,
     error: "the PowerShell capture script (studio_shot.ps1) is blocked by this PC's antivirus, so the window and whole-screen routes are off - this is the antivirus, not OR and not Studio.",
-    hint: "the Roblox picture does not need that script: ViewportScreenshotRoblox {} takes it inside Studio over the MCP, with nothing for the scanner to see. To keep the desktop route as well, allow studio_shot.ps1 in Windows Security (Virus & threat protection > Exclusions) or press Win+Shift+S to take the desktop shot by hand.",
+    hint: "the Roblox picture does not need that script: ViewportScreenshotRoblox {} takes it inside Studio over the MCP, with nothing for the scanner to see. For the window and whole-screen routes, allow the folder the script is written into" +
+      (dir ? " (" + dir + ")" : "") +
+      ": Windows Security > Virus & threat protection > Exclusions > Add a folder. OR writes studio_shot.ps1 again on every capture, so those routes work the moment the folder is allowed - nothing to reinstall and nothing to restart.",
   };
 }
 async function studioWindowShot({ focus = false, focusOnly = false, maxWidth = 1600, out = "or_studio_window.png", wholeScreen = false, force = false } = {}) {

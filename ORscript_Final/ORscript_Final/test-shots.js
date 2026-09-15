@@ -853,6 +853,8 @@ const call = async (c, tool, args, ms = 9000) => {
         const out = String(await call(cAvb, "ViewportScreenshotRoblox", { _route: "window" }, 40000));
         ok("an antivirus that blocks the script is named as the cause, in one line",
            /blocked by this PC's antivirus/i.test(out) && /studio_shot\.ps1/.test(out), out.slice(0, 420));
+        ok("...and it names the exact folder to allow, with the exact clicks",
+           /Windows Security/.test(out) && /Exclusions/.test(out) && /Add a folder/.test(out) && /OR-workspace/.test(out), out.slice(-420));
         ok("...and it points at the route that needs no script at all",
            /inside Studio over the MCP/i.test(out) && /nothing for the scanner to see/i.test(out), out.slice(0, 620));
         ok("...and it does NOT pretend the window route worked", !/attached to THIS message/i.test(out), out.slice(-200));
