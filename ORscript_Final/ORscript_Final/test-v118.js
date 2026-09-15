@@ -730,6 +730,16 @@ const WIKI_JSON = JSON.stringify({ query: { search: [{ title: "Roblox" }, { titl
     ok("...and re-reads a clipped page at a smaller size instead of trusting it", /linesPerCall = Math\.max\(4, Math\.floor\(linesPerCall \/ 2\)\)/.test(bgSrc));
     ok("a damaged picture is refused, never attached", /checksum mismatch/.test(bgSrc) && /the picture arrived incomplete/.test(bgSrc) && /the capture text is incomplete/.test(bgSrc));
     ok("the capture script writes a base64 twin for the tunnel", /ToBase64String/.test(ps1Src) && /base64_file/.test(ps1Src));
+    // The one step that cannot be tested from here is PowerShell itself, so the script
+    // must not depend on a runtime C# compile (the fragile part) and must always emit a
+    // result line - a silent crash is the least debuggable outcome.
+    ok("a blocked runtime compile is DETECTED, not swallowed", /\$script:Compiled = \[bool\]\(\"ORWin\" -as \[type\]\)/.test(ps1Src) && /\$script:CompileError/.test(ps1Src));
+    ok("...and the script falls back to a pure-.NET route", /AppActivate/.test(ps1Src) && /UIAutomationClient/.test(ps1Src) && /screen-nocompile/.test(ps1Src));
+    ok("the fallback is used for the window rect too", /function Get-WindowRect/.test(ps1Src) && /BoundingRectangle/.test(ps1Src) && /PrimaryScreen\.Bounds/.test(ps1Src));
+    ok("every failure still prints a machine-readable line", /the capture step failed: /.test(ps1Src) && /OR_STUDIO_SHOT emitters/.test(ps1Src) === false);
+    ok("the result line reports which route ran", /route = \$\(if \(\$script:Compiled\)/.test(ps1Src) && /compile_error/.test(ps1Src));
+    ok("the worker accepts the result line anywhere in the output", /matchAll\(\/OR_STUDIO_SHOT/.test(bgSrc) && /all\.length - 1/.test(bgSrc));
+    ok("...and passes a blocked-compile note on when a capture fails", /could not be compiled on this PC/.test(bgSrc));
     {
       const tunnelFn = ps1Src.split("function Write-B64File")[1] || "";
       ok("...with LF-only line endings (a stray CR would land inside the base64)",

@@ -1464,9 +1464,27 @@ async function ensureStudioShotScript() {
 // window" action (no capture). Returns { ok, text, images, meta }.
 // The script's last line is machine-readable: OR_STUDIO_SHOT {...}
 function parseShotMeta(raw) {
-  const m = String(raw || "").match(/OR_STUDIO_SHOT\s+(\{[\s\S]*?\})\s*$/m);
-  if (!m) return null;
-  try { return JSON.parse(m[1]); } catch { return null; }
+  const text = String(raw || "");
+  // Take the LAST result line: PowerShell can print warnings after the JSON, and a
+  // strict end-anchored match turned "the capture worked" into "no answer".
+  const all = [...text.matchAll(/OR_STUDIO_SHOT\s+(\{.*\})/g)];
+  for (let i = all.length - 1; i >= 0; i--) {
+    // Trim to the first balanced object: the line may carry trailing prose.
+    const body = all[i][1];
+    let depth = 0, end = -1, inStr = false, esc = false;
+    for (let j = 0; j < body.length; j++) {
+      const ch = body[j];
+      if (esc) { esc = false; continue; }
+      if (ch === "\\") { esc = true; continue; }
+      if (ch === '"') { inStr = !inStr; continue; }
+      if (inStr) continue;
+      if (ch === "{") depth++;
+      else if (ch === "}") { depth--; if (depth === 0) { end = j; break; } }
+    }
+    if (end < 0) continue;
+    try { return JSON.parse(body.slice(0, end + 1)); } catch { }
+  }
+  return null;
 }
 
 async function studioWindowShot({ focus = false, focusOnly = false, maxWidth = 1600, out = "or_studio_window.png" } = {}) {
@@ -1489,7 +1507,13 @@ async function studioWindowShot({ focus = false, focusOnly = false, maxWidth = 1
     return { ok: false, error: (raw.slice(-400) || "no answer from the agent (is or-agent.exe running?)"), command: cmd,
              hint: "the script prints one OR_STUDIO_SHOT {...} line; a PowerShell parse error or a missing Add-Type means this needs the rebuilt agent" };
   }
-  if (!meta.ok) return { ok: false, error: meta.error || "capture failed", meta, command: cmd };
+  if (!meta.ok) {
+    // Carry the script's own diagnosis through: if the fast helper could not be
+    // compiled, that is the first thing worth knowing when a capture fails.
+    return { ok: false, meta, command: cmd,
+             error: (meta.error || "capture failed") +
+               (meta.compile_error ? " [the fast PrintWindow helper could not be compiled on this PC: " + String(meta.compile_error).slice(0, 160) + "]" : "") };
+  }
   if (focusOnly) {
     return { ok: true, text: (meta.focused ? "Roblox Studio is now the FRONT window" : "Windows refused keyboard focus; Studio was raised above other windows instead"), meta, command: cmd };
   }
@@ -1544,13 +1568,16 @@ async function studioWindowShot({ focus = false, focusOnly = false, maxWidth = 1
     }
   }
   const how = meta.method === "printwindow" ? "PrintWindow (Studio never had to come forward)"
-    : meta.method === "screen" ? "screen grab after raising the Studio window" : String(meta.method || "capture");
+    : meta.method === "screen" ? "screen grab after raising the Studio window"
+    : meta.method === "screen-nocompile" ? "screen grab after raising Studio (fallback route: the fast helper could not be compiled on this PC)"
+    : String(meta.method || "capture");
   return {
     ok: true, images, meta, command: cmd,
     text: `Captured the Roblox Studio WINDOW via ${how} — ${meta.window && meta.window.width}x${meta.window && meta.window.height} px, saved as ${file}` +
       (how2 ? ` (delivered through the ${how2}).` : ".") +
       (meta.method === "screen" && meta.focused ? " Studio is now the front window." : "") +
-      (meta.method === "screen" && !meta.focused ? " (Windows would not give Studio keyboard focus; it was raised above other windows.)" : ""),
+      (meta.method === "screen" && !meta.focused ? " (Windows would not give Studio keyboard focus; it was raised above other windows.)" : "") +
+      (meta.compile_error ? " Note: the fast in-memory capture helper could not be compiled here (" + String(meta.compile_error).slice(0, 120) + "), so the script used its fallback route - the screenshot still works." : ""),
   };
 }
 

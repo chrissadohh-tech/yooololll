@@ -82,7 +82,15 @@ public class ORWin {
   public struct RECT { public int Left, Top, Right, Bottom; }
 }
 "@
-try { Add-Type -TypeDefinition $src -ErrorAction Stop } catch { }   # already loaded in this session
+# The compiled helper is the FAST path (PrintWindow = capture while Studio stays
+# behind). Compiling C# at runtime is the most fragile thing in this file: a locked-down
+# Windows, a missing csc, or an antivirus policy can block it. It used to be wrapped in
+# "catch { }", so a blocked compile showed up later as an unhelpful crash with no result
+# line. Now the failure is remembered and the script degrades to a pure-.NET route.
+if (-not ("ORWin" -as [type])) {
+  try { Add-Type -TypeDefinition $src -ErrorAction Stop } catch { $script:CompileError = $_.Exception.Message }
+}
+$script:Compiled = [bool]("ORWin" -as [type])
 
 # PW_RENDERFULLCONTENT (0x2) is what makes a GPU/DirectX window printable.
 $PW_RENDERFULLCONTENT = 0x2
@@ -97,8 +105,8 @@ function Get-StudioWindow {
       # Prefer a real top-level window; skip the tiny helper windows Studio opens.
       $h = $p.MainWindowHandle
       if ($h -eq [IntPtr]::Zero) { continue }
-      $r = New-Object ORWin+RECT
-      if (-not [ORWin]::GetWindowRect($h, [ref]$r)) { continue }
+      $r = Get-WindowRect -Handle $h
+      if ($null -eq $r) { continue }
       $w = $r.Right - $r.Left; $ht = $r.Bottom - $r.Top
       if ($w -lt 200 -or $ht -lt 150) { continue }
       return [pscustomobject]@{ Handle = $h; Proc = $p; Width = $w; Height = $ht; Rect = $r; Name = $p.ProcessName }
@@ -129,6 +137,54 @@ function Bring-ToFront {
     if ($attached) { [void][ORWin]::AttachThreadInput($fgThread, $myThread, $false) }
   }
   return ([ORWin]::GetForegroundWindow() -eq $Handle)
+}
+
+function Get-WindowRect {
+  param([IntPtr]$Handle)
+  # Preferred: the compiled P/Invoke helper. Returns @{Left;Top;Right;Bottom} or $null.
+  if ($script:Compiled) {
+    try {
+      $r = New-Object ORWin+RECT
+      if ([ORWin]::GetWindowRect($Handle, [ref]$r)) {
+        return @{ Left = $r.Left; Top = $r.Top; Right = $r.Right; Bottom = $r.Bottom }
+      }
+    } catch { }
+  }
+  # No compiler available: UI Automation reports a window's bounding box through a
+  # managed API (no code compilation, just an assembly load).
+  try {
+    Add-Type -AssemblyName UIAutomationClient -ErrorAction Stop
+    Add-Type -AssemblyName UIAutomationTypes -ErrorAction Stop
+    $el = [System.Windows.Automation.AutomationElement]::FromHandle($Handle)
+    if ($el -ne $null) {
+      $b = $el.Current.BoundingRectangle
+      if ($b.Width -gt 50 -and $b.Height -gt 50) {
+        return @{ Left = [int]$b.Left; Top = [int]$b.Top; Right = [int]$b.Right; Bottom = [int]$b.Bottom }
+      }
+    }
+  } catch { }
+  # Last resort: the whole primary screen. Studio is raised first, so it is what the
+  # picture shows - just with the desktop around it.
+  try {
+    Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+    $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+    return @{ Left = $b.X; Top = $b.Y; Right = ($b.X + $b.Width); Bottom = ($b.Y + $b.Height) }
+  } catch { }
+  return $null
+}
+
+function Bring-ToFront-NoCompile {
+  param($Proc)
+  # WScript.Shell.AppActivate is a COM call - it needs no C# compiler, which is the
+  # whole point of this fallback. Returns $true when Windows reports the window active.
+  try {
+    $ws = New-Object -ComObject WScript.Shell
+    $null = $ws.AppActivate($Proc.Id)
+    Start-Sleep -Milliseconds 400
+    return $true
+  } catch {
+    return $false
+  }
 }
 
 function Save-Bitmap {
@@ -258,6 +314,8 @@ if ($SelfTest) {
       base64_file = $t.base64_file; base64_chars = $t.base64_chars; base64_lines = $t.base64_lines
       sha256 = $t.sha256; roundtrip_ok = [bool]$roundtrip
       jpeg_ok = [bool]((Get-Item -LiteralPath $sf).Length -gt 500)
+      route = $(if ($script:Compiled) { "compiled" } else { "no-compile" })
+      compile_error = $(if ($script:CompileError) { $script:CompileError } else { "" })
       tunnel_error = ""
     } | ConvertTo-Json -Compress -Depth 4))
     exit 0
@@ -269,7 +327,9 @@ if ($SelfTest) {
 
 $win = Get-StudioWindow -Name $ProcessName
 if ($null -eq $win) {
-  Write-Output "OR_STUDIO_SHOT {""ok"":false,""error"":""no visible Roblox Studio window found - open Studio (and un-minimize it) first"",""code"":2}"
+  $why = "no visible Roblox Studio window found - open Studio (and un-minimize it) first"
+  if ($script:CompileError) { $why += " [note: the fast PrintWindow helper could not be compiled - " + $script:CompileError + "]" }
+  Write-Output ("OR_STUDIO_SHOT " + (@{ ok = $false; error = $why; route = $(if ($script:Compiled) { "compiled" } else { "no-compile" }); code = 2 } | ConvertTo-Json -Compress -Depth 3))
   exit 2
 }
 
@@ -287,13 +347,15 @@ $full = Join-Path (Get-Location) $Out
 if (-not [System.IO.Path]::IsPathRooted($Out)) { $full = Join-Path (Get-Location) $Out } else { $full = $Out }
 
 # ── path 1: PrintWindow (no focus change) ──────────────────────────────────
-$method = "printwindow"
-$bmp = New-Object System.Drawing.Bitmap($win.Width, $win.Height)
-try {
-  $gfx = [System.Drawing.Graphics]::FromImage($bmp)
-  $hdc = $gfx.GetHdc()
-  $ok = $false
-  try { $ok = [ORWin]::PrintWindow($win.Handle, $hdc, $PW_RENDERFULLCONTENT) } finally { $gfx.ReleaseHdc($hdc); $gfx.Dispose() }
+$method = $(if ($script:Compiled) { "printwindow" } else { "screen-nocompile" })
+$bmp = $null
+if ($script:Compiled) {
+  $bmp = New-Object System.Drawing.Bitmap($win.Width, $win.Height)
+  try {
+    $gfx = [System.Drawing.Graphics]::FromImage($bmp)
+    $hdc = $gfx.GetHdc()
+    $ok = $false
+    try { $ok = [ORWin]::PrintWindow($win.Handle, $hdc, $PW_RENDERFULLCONTENT) } finally { $gfx.ReleaseHdc($hdc); $gfx.Dispose() }
   if ($ok) {
     $stats = Get-FrameStats -Bmp $bmp
     if ($stats.Colours -le 2 -and $stats.DominantShare -gt 0.98) {
@@ -302,18 +364,20 @@ try {
     }
   }
 } catch { $ok = $false }
-if (-not $ok) {
-  if ($bmp) { $bmp.Dispose(); $bmp = $null }
+  if (-not $ok) {
+    if ($bmp) { $bmp.Dispose(); $bmp = $null }
+  }
 }
 
 # ── path 2: raise the window, then grab the screen over its rect ───────────
 $focused = $false
 if ($null -eq $bmp -or $Focus) {
   if ($null -ne $bmp) { $bmp.Dispose(); $bmp = $null }
-  $focused = Bring-ToFront -Handle $win.Handle
+  if ($script:Compiled) { $focused = Bring-ToFront -Handle $win.Handle }
+  else { $focused = Bring-ToFront-NoCompile -Proc $win.Proc }
   Start-Sleep -Milliseconds 350
-  $r = New-Object ORWin+RECT
-  [void][ORWin]::GetWindowRect($win.Handle, [ref]$r)
+  $r = Get-WindowRect -Handle $win.Handle
+  if ($null -eq $r) { $r = @{ Left = 0; Top = 0; Right = $win.Width; Bottom = $win.Height } }
   $w = $r.Right - $r.Left; $h = $r.Bottom - $r.Top
   if ($w -lt 50 -or $h -lt 50) {
     Write-Output "OR_STUDIO_SHOT {""ok"":false,""error"":""Studio window has no usable size ($w x $h) - un-minimize it and retry"",""code"":3}"
@@ -323,7 +387,7 @@ if ($null -eq $bmp -or $Focus) {
   $gfx = [System.Drawing.Graphics]::FromImage($bmp)
   try { $gfx.CopyFromScreen($r.Left, $r.Top, 0, 0, (New-Object System.Drawing.Size($w, $h))) }
   finally { $gfx.Dispose() }
-  $method = "screen"
+  $method = $(if ($script:Compiled) { "screen" } else { "screen-nocompile" })
 }
 
 # JPEG keeps the text tunnel to a few chunks; the PNG twin is optional because a
@@ -331,6 +395,7 @@ if ($null -eq $bmp -or $Focus) {
 # A .png name holding JPEG bytes would lie about the file, so the extension always
 # follows the encoder (the caller reads the real path from the JSON line anyway).
 $full = [System.IO.Path]::ChangeExtension($full, $(if ($script:UseJpeg) { ".jpg" } else { ".png" }))
+try {
 $final = Scale-Bitmap -Bmp $bmp -MaxW $MaxWidth
 try { Save-Bitmap -Bmp $final -Path $full } finally { $final.Dispose(); $bmp.Dispose() }
 
@@ -356,5 +421,20 @@ Write-Output ("OR_STUDIO_SHOT " + (@{
   tunnel_error = $(if ($tunnel.ContainsKey("tunnel_error")) { $tunnel.tunnel_error } else { "" })
   sha256 = $tunnel.sha256
   mime = $tunnel.mime
+  route = $(if ($script:Compiled) { "compiled" } else { "no-compile" })
+  compile_error = $(if ($script:CompileError) { $script:CompileError } else { "" })
 } | ConvertTo-Json -Compress -Depth 4))
 exit 0
+} catch {
+  # Anything unexpected (a blocked API, a locked file, a missing font) must still
+  # produce ONE machine-readable line - otherwise the caller can only say "no answer
+  # from the agent", which is the least useful sentence in this whole file.
+  Write-Output ("OR_STUDIO_SHOT " + (@{
+    ok = $false
+    error = ("the capture step failed: " + $_.Exception.Message)
+    route = $(if ($script:Compiled) { "compiled" } else { "no-compile" })
+    compile_error = $(if ($script:CompileError) { $script:CompileError } else { "" })
+    code = 3
+  } | ConvertTo-Json -Compress -Depth 3))
+  exit 3
+}

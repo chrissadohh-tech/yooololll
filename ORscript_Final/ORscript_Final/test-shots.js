@@ -136,6 +136,9 @@ function makeFakeAgent(opts) {
   // Damage the file AT READ TIME: a fresh capture rewrites the .b64 twin, so
   // corrupting it up front would be silently repaired by the capture itself.
   const damage = { on: false, hide: false };
+  state.noCompile = false;                 // the fast helper could not be compiled on this PC
+  state.captureFails = false;              // the capture step itself threw
+  state.trailingNoise = false;             // PowerShell printed something after the result line
   state.selftestBroken = false;            // PowerShell/GDI failure
   state.selftestBadRoundtrip = false;      // the script cannot decode its own tunnel text
   state.maxReadBytes = 0;                 // 0 = no limit; set to model the agent's 2 MB cap
@@ -201,11 +204,13 @@ function makeFakeAgent(opts) {
       const lines = [];
       for (let i = 0; i < b64.length; i += 400) lines.push(b64.slice(i, i + 400));
       files[out + ".b64"] = Buffer.from(lines.join("\n") + "\n", "utf8");
-      const meta = { ok: true, file: out, bytes: real.length, method: "printwindow", focused: false,
+      if (state.captureFails) { okText("OR_STUDIO_SHOT " + JSON.stringify({ ok: false, error: "the capture step failed: Exception calling CopyFromScreen with 5 argument(s)", route: "no-compile", compile_error: "Add-Type: could not load file or assembly System.CodeDom", code: 3 })); return; }
+      const meta = { ok: true, file: out, bytes: real.length, method: state.noCompile ? "screen-nocompile" : "printwindow", focused: false,
         window: { process: "RobloxStudioBeta", pid: 4242, width: 1280, height: 800 },
         base64_file: out + ".b64", base64_chars: b64.length, base64_lines: lines.length,
         sha256: crypto.createHash("sha256").update(real).digest("hex"), mime: "image/jpeg" };
-      okText("OR_STUDIO_SHOT " + JSON.stringify(meta));
+      if (state.noCompile) meta.compile_error = "Add-Type: could not load file or assembly System.CodeDom";
+      okText("OR_STUDIO_SHOT " + JSON.stringify(meta) + (state.trailingNoise ? "\nWARNING: something harmless printed after the result line" : ""));
       return;
     }
     if (name === "read_file") {
@@ -597,6 +602,26 @@ const call = async (c, tool, args, ms = 4000) => {
         const cB = build({}, { fakeAgent: badRt, engine: "local" }).ctx;
         const b = String(await call(cB, "shot_test", {}, 40000));
         ok("a broken tunnel format is caught by the self-test", /SCREENSHOT PATH BROKEN/.test(b) && /tunnel format is broken/i.test(b), b.slice(0, 300));
+      }
+
+      // ── the PC where the fast helper cannot be compiled: the script must fall back to
+      //    the pure-.NET route and STILL deliver a picture ──
+      {
+        const nc = makeFakeAgent({}); nc.noCompile = true; nc.trailingNoise = true;
+        const cNc = build({}, { fakeAgent: nc, engine: "local" }).ctx;
+        const nshot = String(await call(cNc, "or_screenshot", { target: "window" }, 40000));
+        const nimgs = vm.runInContext("window.__rsRecentImages()", cNc);
+        ok("a PC that cannot compile the fast helper still gets its screenshot", /attached to THIS message/i.test(nshot) && nimgs.length === 1, nshot.slice(0, 300));
+        ok("...and the result says the fallback route was used, not a silent downgrade", /fallback route/i.test(nshot), nshot.slice(0, 300));
+        ok("...and a warning printed AFTER the result line does not hide it", nimgs.length === 1, nshot.slice(0, 200));
+      }
+      {
+        const cf = makeFakeAgent({}); cf.captureFails = true;
+        const cCf = build({}, { fakeAgent: cf, engine: "local" }).ctx;
+        const fshot = String(await call(cCf, "or_screenshot", { target: "window" }, 40000));
+        const fimgs = vm.runInContext("window.__rsRecentImages()", cCf);
+        ok("a capture-step failure is reported with the script's own reason", fimgs.length === 0 && /capture step failed/i.test(fshot), fshot.slice(0, 320));
+        ok("...and the blocked-compile detail is passed on, not swallowed", /could not load file or assembly|CodeDom/i.test(fshot), fshot.slice(0, 320));
       }
 
       // ── a capture too big to read back as text must be RETAKEN smaller ──
