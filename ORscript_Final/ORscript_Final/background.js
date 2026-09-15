@@ -873,10 +873,20 @@ async function sendLocalEngine(obj, timeout = 25000) {
       try { msg = JSON.parse(ev.data); } catch { return; }
       if (msg.type === "connected") {
         if (typeof msg.workspace_root === "string" && msg.workspace_root) localRoot = msg.workspace_root;
+        if (Array.isArray(msg.tools)) localToolsCache = msg.tools;
+        return;
+      }
+      if (msg.type === "tools" && (msg.id == null || msg.id === id)) {
+        if (Array.isArray(msg.tools)) localToolsCache = msg.tools;
+        done({ ok: !!msg.ok, tools: msg.tools || [], text: "" });
         return;
       }
       if (msg.type === "tool_result" && (msg.id == null || msg.id === id)) {
-        done(msg.ok ? { ok: true, text: msg.text } : { ok: false, error: msg.error || "tool failed" });
+        // Images (and their mime types) ride along, so a Studio/Blender capture
+        // can be attached instead of being reported as an empty result.
+        done(msg.ok
+          ? { ok: true, text: msg.text, images: Array.isArray(msg.images) ? msg.images : [] }
+          : { ok: false, error: msg.error || "tool failed" });
         return;
       }
       if (msg.type === "error" && (msg.id == null || msg.id === id)) {
@@ -884,6 +894,31 @@ async function sendLocalEngine(obj, timeout = 25000) {
       }
     };
   });
+}
+
+// The local engine's advertised tool names, remembered from its `connected` /
+// `tools` frames. Used to answer "is this or-agent.exe new enough to hand the
+// browser a FILE (read_file_base64)?" - every screenshot path needs that, and an
+// outdated exe fails silently, which is what makes screenshots look broken.
+let localToolsCache = [];
+function localToolNames() {
+  return localToolsCache.map((t) => (t && (t.name || t.id)) || "").filter(Boolean);
+}
+async function agentInfo() {
+  let names = localToolNames();
+  if (!names.length) {
+    try {
+      const r = await sendLocalEngine({ type: "list_tools" }, 8000);
+      if (r && Array.isArray(r.tools)) { localToolsCache = r.tools; names = localToolNames(); }
+    } catch {}
+  }
+  return {
+    ok: names.length > 0,
+    workspace_root: localRoot || "",
+    tools: names.length,
+    has_base64: names.length ? names.some((n) => n === "read_file_base64" || n.endsWith("/read_file_base64")) : null,
+    reason: names.length ? "" : "or-agent.exe did not report a tool list (not running, or an old build)",
+  };
 }
 
 async function extText(name) {
@@ -1577,6 +1612,12 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           out: msg.out,
         });
         sendResponse(r);
+        break;
+      }
+      // Version/health of the agent: the extension uses this to explain WHY a
+      // screenshot could not be delivered instead of looping on the call.
+      case "agent_info": {
+        sendResponse(await agentInfo());
         break;
       }
       case "blender_connect": {

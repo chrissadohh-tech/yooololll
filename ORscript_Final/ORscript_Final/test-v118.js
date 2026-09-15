@@ -699,6 +699,41 @@ const WIKI_JSON = JSON.stringify({ query: { search: [{ title: "Roblox" }, { titl
     ok("TOOL_NOTES documents the window target", /or_focus_studio/.test(cfgSrc) && /needs NO page permission/.test(cfgSrc));
   }
 
+  // ── 17. No empty results, no retry loops, and the agent version is named ───
+  // Live report: "or_screenshot just loops" with "(tool returned an empty result)".
+  // An empty result is what an MCP IMAGE block looks like once an outdated agent
+  // drops it, and the loop is what a model does when the result explains nothing.
+  {
+    ok("an empty tool result is explained, not echoed", /EMPTY RESULT from '/.test(mainSrc) && !/textOut = r\.text && r\.text\.length \? r\.text : "\(tool returned an empty result\)"/.test(mainSrc));
+    ok("…and the explanation names the outdated agent for captures", /or-agent\.exe is outdated: it keeps text blocks only/.test(mainSrc));
+    ok("an unknown/quiet command is told not to be repeated", /Do NOT repeat it unchanged/.test(mainSrc));
+    ok("a thrown tool call is caught instead of losing the result", /tool\.throw/.test(mainSrc) && /threw inside OR/.test(mainSrc));
+    ok("the repeat guard refuses the third identical call", /A\.repeatGuard\.count >= 3/.test(mainSrc) && /IDENTICAL arguments and it failed every time/.test(mainSrc));
+    ok("the guard tells the model what to do instead", /repeating cannot change the outcome/.test(mainSrc) && /inspect_instance, get_studio_state, script_analysis, or_debug, list_commands/.test(mainSrc));
+    ok("the guard resets on a new turn", /A\.repeatGuard = \{ sig: "", count: 0, blocked: 0 \}/.test(mainSrc));
+    ok("a repeat block is logged for diagnosis", mainSrc.includes('diag("tool.repeatBlocked"'));
+
+    // studio attempts must not stall on a server that is known to be down
+    ok("a dead Studio server is skipped with a reason", /the Roblox MCP is NOT alive/.test(mainSrc));
+    ok("a missing screen_capture is skipped with a reason", /advertises no screen_capture tool/.test(mainSrc));
+    ok("Blender is only attempted when connected", /A\.bridge && A\.bridge\.blender\) await tryMcp\("get_viewport_screenshot"/.test(mainSrc));
+    // agent version diagnosis
+    ok("the failure asks the agent what it supports", /type: "agent_info"/.test(mainSrc));
+    ok("an outdated agent produces a REBUILD instruction", /AGENT OUTDATED/.test(mainSrc) && /cargo build --release/.test(mainSrc));
+    ok("an offline agent is named too", /AGENT OFFLINE/.test(mainSrc));
+    ok("the window target is described as the Blender-style route", /Blender-style route/.test(mainSrc));
+
+    // auto-debug noise
+    ok("benign Studio warnings are filtered from AUTO DEBUG", /BENIGN/.test(mainSrc) && /unable to load plugin icon/.test(mainSrc));
+
+    // background support
+    ok("bg answers agent_info", bgSrc.includes('case "agent_info"'));
+    ok("bg tracks the agent tool list", /let localToolsCache/.test(bgSrc) && /function agentInfo/.test(bgSrc));
+    ok("bg detects a missing read_file_base64", /has_base64/.test(bgSrc));
+    ok("the local bridge result carries images", /images: Array\.isArray\(msg\.images\) \? msg\.images : \[\]/.test(bgSrc));
+    ok("the local engine's tool list is remembered", /localToolsCache = msg\.tools/.test(bgSrc));
+  }
+
   // ── 10. No stale code paths left behind ────────────────────────────────────
   ok("old ddgSearch helper is gone", !bgSrc.includes("ddgSearch"));
   ok("the fetching User-Agent is a real browser UA", /const BROWSER_UA =[\s\S]{0,200}Chrome\/128/.test(bgSrc) && !/"User-Agent":\s*"OR/.test(bgSrc));

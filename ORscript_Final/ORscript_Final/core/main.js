@@ -1784,6 +1784,12 @@
       let lines = [];
       try { lines = JSON.parse(raw); } catch { lines = []; }
       if (!Array.isArray(lines) || !lines.length) return feedback;
+      // BENIGN lines are not "errors to fix". Studio emits these constantly (a
+      // missing plugin icon, an asset image that failed to load) and reporting
+      // them sent the model off fixing things that are not broken - the live
+      // "[AUTO DEBUG] Unable to load plugin icon: rbxassetid://153352536" case.
+      const BENIGN = /unable to load plugin icon|failed to load (image|asset|texture|decal)|rbxassetid:\/\/\d+.*(failed|unable)|http 403 \(forbidden\).*rbxasset|image failed to load|asset.*not (found|approved)|cannot load plugin/i;
+      lines = lines.filter((ln) => !BENIGN.test(String(ln)));
       A._debugSigs = A._debugSigs || new Set();
       const fresh = [];
       for (const ln of lines) {
@@ -1977,7 +1983,8 @@
         return "ERROR: or_screenshot captured nothing. " +
           (notes.join(" | ") || "both the Studio capture and the tab fallback failed.") +
           "\nRead the reasons above before retrying (do NOT retry blindly):" +
-          "\n- A STUDIO capture needs the MCP bridge AND an up-to-date or-agent.exe - the old one drops image blocks, so screen_capture comes back as text with no picture." +
+          "\n- A STUDIO capture needs the MCP bridge AND an up-to-date or-agent.exe - the old one drops image blocks, so screen_capture comes back as text with no picture (this is why a direct screen_capture call can return an EMPTY result)." +
+          "\n- target:\"window\" uses the Blender-style route (the capture is written to a PNG file, the agent hands over its bytes) and does not need the MCP at all - but it DOES need the rebuilt agent." +
           "\n- The TAB fallback photographs whichever tab is in FRONT and only works on an ordinary http/https page; chrome:// pages, the New Tab page and PDF viewers can never be captured." +
           "\nIf neither can work right now, use a text command instead (inspect_instance, get_studio_state, or_debug, script_analysis) rather than asking for another screenshot.";
       }
@@ -2323,8 +2330,29 @@
     const wantBlend = target === "auto" || target === "blender" || target === "blender_window";
     const wantWindow = target === "auto" || target === "window" || target === "studio_window" || target === "os" || target === "desktop";
     const wantTab = target === "tab" || target === "chat" || target === "page" || target === "self";
-    if (wantStudio) await tryMcp("screen_capture", "studio");
-    if (wantBlend && !shots.length) await tryMcp("get_viewport_screenshot", "blender");
+    // Which servers does the bridge say are alive? Attempting a tool on a server
+    // that is NOT there burns the whole timeout (the 11s stall the user saw) and
+    // then reports a generic failure - so check first and say what is missing.
+    const serverUp = (id) => {
+      try {
+        const list = (A.bridge && A.bridge.servers) || [];
+        if (!list.length) return null;              // unknown: try anyway
+        const srv = list.find((x) => x && x.id === id);
+        return srv ? srv.alive !== false : null;
+      } catch { return null; }
+    };
+    const roster = Array.isArray(A.toolList) ? A.toolList : [];
+    const hasTool = (t) => !roster.length || roster.some((x) => bareToolName(x && (x.name || x.id)) === t);
+    const studioUp = serverUp("roblox") !== false && serverUp("studio") !== false;
+    if (wantStudio) {
+      if (!studioUp) notes.push("studio: the Roblox MCP is NOT alive (bridge reports the server down) - skipped the call");
+      else if (!hasTool("screen_capture")) notes.push("studio: the MCP advertises no screen_capture tool right now (0 tools listed) - skipped the call; run list_commands / restart_mcp");
+      else await tryMcp("screen_capture", "studio");
+    }
+    if (wantBlend && !shots.length) {
+      if (A.bridge && A.bridge.blender) await tryMcp("get_viewport_screenshot", "blender");
+      else notes.push("blender: not connected - skipped");
+    }
     // OS-side fallback: photograph the Studio WINDOW itself (agent + PowerShell).
     // Works while Studio is behind the browser, so it is a better fallback than a
     // tab capture - and the only path that works when the picture must be of
@@ -2365,6 +2393,22 @@
       } catch (e) {
         notes.push("tab: " + String((e && e.message) || e).slice(0, 160));
       }
+    }
+    // Nothing worked: find out WHY in a way the model can act on. The single most
+    // common cause by far is an outdated or-agent.exe: it keeps only text blocks,
+    // so Studio's screenshot arrives as an empty string and every image path fails
+    // - including the file readback the Blender-style fallbacks depend on.
+    if (!shots.length) {
+      try {
+        const info = await bg({ type: "agent_info" });
+        if (info && info.has_base64 === false) {
+          notes.push("AGENT OUTDATED: or-agent.exe lists " + info.tools + " tools and cannot hand the browser a file " +
+            "(read_file_base64 is missing), so NO screenshot can reach you from any target. Rebuild it: cd agent && cargo build --release, " +
+            "copy target/release/or-agent.exe over the old one, restart it, then retry. Until then ask for text output instead.");
+        } else if (info && info.ok === false) {
+          notes.push("AGENT OFFLINE: or-agent.exe is not running (" + (info.reason || "no answer") + "), so the OS-side Studio window capture and file readback are unavailable.");
+        }
+      } catch {}
     }
     return { shots, notes };
   }
@@ -2454,7 +2498,16 @@
           const caption = r.text && r.text.trim() ? r.text.trim() : `${r.images.length} image(s) captured.`;
           return `Output of '${name}':\n${caption}\n(The image is attached to THIS message - you can see it directly. Analyse it and continue.)`;
         }
-        const textOut = r.text && r.text.length ? r.text : "(tool returned an empty result)";
+        // An EMPTY tool result is almost always the bridge dropping something the
+        // server did return - an MCP image block (Studio/Blender captures) is the
+        // classic case, because it carries no "text" field. Say exactly that,
+        // instead of "(tool returned an empty result)", which invites a retry loop.
+        const textOut = (r.text && r.text.length)
+          ? r.text
+          : ("EMPTY RESULT from '" + bareName + "': the server returned no text" +
+             (/capture|screenshot|image|shot|screenshot/i.test(bareName)
+               ? " - it looks like an image-only answer. If this is a Studio/Blender capture, the running or-agent.exe is outdated: it keeps text blocks only, so the picture is discarded (rebuild it: cd agent && cargo build --release). Prefer or_screenshot {\"target\":\"window\"} with the rebuilt agent, and until then use a text command."
+               : " - the command may not exist on the connected server (check list_commands) or it returned nothing by design. Do NOT repeat it unchanged; try a different command."));
         const autoStudio = bareName === "blender_export_fbx" || bareName === "export_blender_fbx";
         if (autoStudio) {
           const imported = await runAssetBridgeImport({ source: "blender", asset: r.filepath || args.filepath || args.path || "scene", objects: args.objects, dest: args.dest, scale: args.scale });
@@ -2710,6 +2763,11 @@
       return;
     }
     A.running = true;
+    // A NEW TURN resets the repeat guard: the user may have fixed whatever was
+    // wrong (rebuilt the agent, connected Blender, brought a tab forward), and
+    // blocking their retry would be wrong. The guard only stops the model from
+    // spinning inside ONE turn.
+    A.repeatGuard = { sig: "", count: 0, blocked: 0 };
     A.resumeArmed = false; // loop now owns the turn; drop the regenerate grace
     A.stop = false;
     A.stopping = false; // clean slate: never inherit a stale "Stopping…" from a
@@ -2903,7 +2961,42 @@
           rememberExecuted(res.item);
           diag("tool.start", { name: call.tool });
           try { ui.trackCard(call.tool, "run", "executing\u2026", category); } catch {}
-          let feedback = await runTool(call);
+          // ── Repeat guard ────────────────────────────────────────────────
+          // The model can get stuck re-issuing the same failing call (the live
+          // "or_screenshot just loops" report: identical args, an error every
+          // time, a fresh 10-40s wait each round). Two identical calls are
+          // allowed (a transient bridge hiccup is real); the THIRD is refused
+          // outright with what to do instead, so the turn moves on.
+          let feedback;
+          {
+            const sig = String(call.tool) + "|" + JSON.stringify(call.arguments || {});
+            A.repeatGuard = A.repeatGuard || { sig: "", count: 0, blocked: 0 };
+            if (A.repeatGuard.sig === sig) A.repeatGuard.count++;
+            else { A.repeatGuard.sig = sig; A.repeatGuard.count = 1; }
+            if (A.repeatGuard.count >= 3) {
+              diag("tool.repeatBlocked", { name: call.tool, count: A.repeatGuard.count });
+              feedback = "ERROR: '" + call.tool + "' has now been called " + A.repeatGuard.count +
+                " times with IDENTICAL arguments and it failed every time. OR is refusing to run it again - repeating cannot change the outcome.\n" +
+                "What to do instead:\n" +
+                "- Change the arguments if you were guessing (a different target/name/path).\n" +
+                "- Fix the cause the earlier error named (read it again; it lists the exact reason per target).\n" +
+                "- Or stop using this command and get the information another way: inspect_instance, get_studio_state, script_analysis, or_debug, list_commands.\n" +
+                "- If it genuinely needs the user to act (rebuild or-agent.exe, connect Blender, bring a tab to the front), SAY that in one sentence and finish the turn instead of retrying.";
+            } else {
+              try { feedback = await runTool(call); }
+              catch (e) {
+                // An exception used to escape into the loop and lose the result
+                // entirely ("empty result" with nothing to act on).
+                diag("tool.throw", { name: call.tool, msg: String((e && e.message) || e).slice(0, 200) });
+                feedback = "ERROR: '" + call.tool + "' threw inside OR: " + String((e && e.message) || e).slice(0, 300) +
+                  "\nThis is an OR bug, not a Studio problem. Do not retry the same call; use a different command.";
+              }
+              if (!String(feedback == null ? "" : feedback).trim()) {
+                feedback = "EMPTY RESULT from '" + call.tool + "' (no text, no image). Do not repeat it unchanged - " +
+                  "the bridge or the MCP server answered with nothing. Try a different command or check list_commands.";
+              }
+            }
+          }
           // Persistent environment header (see asStateTag) — appended, never
           // prefixed, so feedbackIsError()'s startsWith("ERROR") stays intact.
           { const _tag = asStateTag(); if (_tag && !feedback.includes("[SYSTEM_STATE:")) feedback += "\n" + _tag; }
