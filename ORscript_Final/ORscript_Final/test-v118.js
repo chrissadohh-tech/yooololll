@@ -475,6 +475,73 @@ const WIKI_JSON = JSON.stringify({ query: { search: [{ title: "Roblox" }, { titl
     ok("popup title matches the version", manifest.action.default_title.includes(manifest.version));
   }
 
+  // ── 13. DeepSeek vision detection on the 2026-09 UNIFIED model ─────────────
+  // DeepSeek merged Instant/Expert/Vision into one model and deleted the picker.
+  // OR's detector used to fall through to `false` with no radio and no badge, so
+  // every DeepSeek chat refused screenshots ("this assistant cannot see images").
+  // These cases execute the real provider with a fake DOM.
+  {
+    const dsSrc = fs.readFileSync(path.join(root, "providers/deepseek.js"), "utf8");
+    const loadProvider = (doc) => {
+      const sandbox = { window: {}, document: doc, console: { log: () => {}, warn: () => {}, error: () => {} },
+        location: { pathname: "/" }, navigator: { userAgent: "node" }, setTimeout, clearTimeout,
+        MouseEvent: class {}, Event: class {}, KeyboardEvent: class {}, ClipboardEvent: class {},
+        DataTransfer: class { constructor() { this.items = { add() {}, length: 0 }; this.files = []; } },
+        File: class {}, Blob: class {}, atob, btoa, getComputedStyle: () => ({ getPropertyValue: () => "" }),
+        Node: class {}, MutationObserver: class { observe() {} disconnect() {} } };
+      sandbox.globalThis = sandbox; sandbox.self = sandbox;
+      const ctx = vm.createContext(sandbox);
+      return vm.runInContext(dsSrc + "\n;RSProvider;", ctx, { filename: "providers/deepseek.js" });
+    };
+    const badge = (text) => ({ childElementCount: 0, textContent: text, getBoundingClientRect: () => ({ width: 40, top: 8, left: 0 }) });
+    const radio = (type, on, text) => ({
+      childElementCount: 0, textContent: text || type,
+      getAttribute: (n) => (n === "data-model-type" ? type : n === "aria-checked" ? String(on) : null),
+      getBoundingClientRect: () => ({ width: 60, top: 20, left: 0 }),
+    });
+    const docFor = ({ group, radios = [], badges = [] }) => ({
+      querySelector: (sel) => (sel === '[role="radiogroup"]' ? (group || null) : null),
+      querySelectorAll: (sel) => (sel === "div,span" ? badges : sel === '[role="radio"]' ? radios : []),
+      documentElement: { setAttribute() {} },
+      body: { appendChild() {} },
+      createElement: () => ({ style: {}, appendChild() {}, addEventListener() {} }),
+      getElementById: () => null,
+    });
+
+    {
+      // The unified composer: no radiogroup, no Instant/Expert/Vision badge.
+      const P = loadProvider(docFor({ badges: [] }));
+      ok("no picker + no badge ⇒ images allowed (unified model)", P.supportsVision === true);
+    }
+    {
+      // A conversation pinned to the OLD UI: badge says Expert → still text-only.
+      const P = loadProvider(docFor({ badges: [badge("Expert")] }));
+      ok("legacy Expert badge ⇒ images refused", P.supportsVision === false);
+      const P2 = loadProvider(docFor({ badges: [badge("Instant")] }));
+      ok("legacy Instant badge ⇒ images refused", P2.supportsVision === false);
+    }
+    {
+      // A conversation still marked Vision → images allowed.
+      const P = loadProvider(docFor({ badges: [badge("Vision")] }));
+      ok("legacy Vision badge ⇒ images allowed", P.supportsVision === true);
+    }
+    {
+      // Legacy picker still on screen: the radio is authoritative, both ways.
+      const on = loadProvider(docFor({ group: { querySelectorAll: () => [radio("vision", true)] } }));
+      ok("legacy Vision radio checked ⇒ images allowed", on.supportsVision === true);
+      const off = loadProvider(docFor({ group: { querySelectorAll: () => [radio("expert", true), radio("vision", false)] } }));
+      ok("legacy Vision radio unchecked ⇒ images refused", off.supportsVision === false);
+    }
+    {
+      // A badge scan must not be fooled by unrelated labels ("V4.1 Flash" with
+      // the word inside a longer string is not a model badge).
+      const P = loadProvider(docFor({ badges: [badge("V4.1 Flash")] }));
+      ok("a longer model label is not mistaken for a legacy badge", P.supportsVision === true);
+    }
+    ok("detector documents the unification", /unified model|2026-09/.test(dsSrc) && /return \(_visCache = true\)/.test(dsSrc));
+    ok("session start no longer waits for a deleted picker", /legacyPicker/.test(dsSrc) && /unified: !legacyPicker/.test(dsSrc));
+  }
+
   // ── 10. No stale code paths left behind ────────────────────────────────────
   ok("old ddgSearch helper is gone", !bgSrc.includes("ddgSearch"));
   ok("the fetching User-Agent is a real browser UA", /const BROWSER_UA =[\s\S]{0,200}Chrome\/128/.test(bgSrc) && !/"User-Agent":\s*"OR/.test(bgSrc));

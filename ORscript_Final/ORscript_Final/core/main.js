@@ -1966,7 +1966,7 @@
     // A DIFFERENT server's tools only show up if the model asks via {"server": "<id>"}.
     if (name === "or_screenshot" || name === "screenshot" || name === "take_screenshot" || name === "send_screenshot") {
       if (!P.supportsVision) {
-        return "ERROR: this assistant cannot see images, so or_screenshot cannot send a shot back to you. Open a vision-capable chat (DeepSeek, Gemini, GLM, Qwen, Meta AI, Freebuff, Ox Alpha, Use AI) and call or_screenshot again.";
+        return "ERROR: this chat is image-blind, so or_screenshot cannot send a shot back to you. DeepSeek's unified model CAN see images - this conversation is either pinned to the old text-only Instant/Expert UI (start a NEW chat there) or you are on an image-blind model (ChatGPT, Ollama). Otherwise use Gemini, GLM, Qwen, Meta AI, Freebuff, Ox Alpha or Use AI, then call or_screenshot again.";
       }
       // Unknown target names fall back to "auto" instead of silently capturing
       // nothing (a typo used to read as "Studio MCP + tab capture both failed").
@@ -1997,7 +1997,7 @@
         name === "attach_last_screenshot" || name === "attach_recent_image" || name === "or_attach" ||
         name === "attach_file" || name === "copy_screenshot" || name === "paste_screenshot") {
       if (!P.supportsVision) {
-        return "ERROR: this assistant cannot see images, so attaching one would be pointless. Open a vision-capable chat (DeepSeek Vision tab, Gemini, GLM, Qwen, Meta AI, Freebuff, Ox Alpha, Use AI).";
+        return "ERROR: this chat is image-blind, so attaching one would be pointless. DeepSeek's unified model CAN see images - this conversation is either pinned to the old text-only Instant/Expert UI (start a NEW chat there) or you are on an image-blind model (ChatGPT, Ollama). Otherwise use Gemini, GLM, Qwen, Meta AI, Freebuff, Ox Alpha or Use AI.";
       }
       const wantPath = String(args.path || args.file || "").trim();
       const idx = Math.max(0, Number(args.index) || 0);

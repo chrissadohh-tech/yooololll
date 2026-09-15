@@ -362,24 +362,34 @@ const RSProvider = (() => {
     els.sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
     return /vision/i.test(els[0].textContent || "");
   }
+  // ── VISION DETECTION (rewritten for the 2026-09 "unified model" UI) ────────
+  // DeepSeek merged its Instant / Expert / Vision models into ONE model (V4.1,
+  // rolled out ~10 Sep 2026) and DELETED the model picker from the composer.
+  // That silently broke this function: with no radio and no badge it fell through
+  // to `false`, so every DeepSeek chat refused screen_capture / attach_feedback
+  // with "this assistant cannot see images" - on a model that reads images fine.
+  //
+  // Precedence now:
+  //   1. a Vision radio (legacy picker still on screen) → its aria-checked;
+  //   2. the per-conversation model BADGE (a chat pinned to the OLD UI):
+  //      "Vision" sees images, "Instant"/"Expert" are text-only - so it still wins
+  //      over the latch, which may describe a DIFFERENT conversation after a switch;
+  //   3. neither → the UNIFIED composer, where every chat can send images.
+  // The asymmetry is deliberate: guessing "no vision" wrongly blocks the whole
+  // feature, while guessing "vision" wrongly costs one attach, which the provider
+  // now reports honestly instead of failing silently.
   function detectVision() {
     const now = Date.now();
     if (now - _visAt < 400) return _visCache;      // throttle the DOM work
     _visAt = now;
     const group = document.querySelector(S.modeRadioGroup);
-    if (group) {                                   // radios visible → authoritative
+    if (group) {                                   // legacy picker → authoritative
       const v = findVisionRadio();
       if (v) { _visLatch = radioOn(v); _visLatchSet = true; return (_visCache = _visLatch); }
     }
-    // Active conversation (radios gone): the per-conversation header BADGE is
-    // authoritative and must WIN over the latch. The latch holds the last composer
-    // selection, which belongs to a DIFFERENT chat after a switch - so trusting it
-    // first made a Vision conv read as non-Vision on revisit (screen_capture
-    // wrongly "unavailable", 25 tools). Badge → latch → false.
     const b = badgeVision();
     if (b != null) { _visLatch = b; _visLatchSet = true; return (_visCache = b); }
-    if (_visLatchSet) return (_visCache = _visLatch);
-    return (_visCache = false);
+    return (_visCache = true);                     // unified model: images allowed
   }
   const isVisionSelected = () => detectVision();
 
@@ -451,8 +461,14 @@ const RSProvider = (() => {
   // `.ready` (the core gates session start on it).
   async function ensureComposerReady(reason) {
     let state = composerModeState();
-    for (let i = 0; i < 12; i++) {
+    // UNIFIED UI (2026-09): the model picker is gone, so there is no tab to
+    // satisfy and nothing to force - waiting 12 rounds for an Expert radio that
+    // will never appear only delayed the session start. Readiness there is just
+    // "Search is off" (+ a composer, checked at the end).
+    const legacyPicker = !!document.querySelector(S.modeRadioGroup);
+    for (let i = 0; i < (legacyPicker ? 12 : 1); i++) {
       state = enforceComposer(reason);
+      if (!legacyPicker) break;
       // Ready as soon as the agent model is on (Expert, OR Vision if the user
       // chose it) and Search is off. DeepThink is only required if a legacy toggle
       // is actually present (V4 has none).
@@ -460,7 +476,7 @@ const RSProvider = (() => {
       await sleep(120);
     }
     state = composerModeState();
-    diag("mode_ready", { reason, ...state });
+    diag("mode_ready", { reason, unified: !legacyPicker, ...state });
     // Best-effort Expert click already ran. Never block Start on a tab name —
     // Instant / Expert / Vision / any future model all work with the agent.
     // (A missing composer is the only real "not ready".)
@@ -989,11 +1005,11 @@ const RSProvider = (() => {
   return {
     id: "deepseek",
     displayName: "DeepSeek",
-    // DYNAMIC: DeepSeek's Instant/Expert models are text-only, but the V4 UI has a
-    // dedicated "Vision" model tab. When the user selects Vision we honour it (see
-    // enforceComposer) and this getter flips true, so main.js stops blocking
-    // screen_capture and stops turning returned images into errors. Any other tab →
-    // false. A getter so a mid-session tab switch is reflected immediately.
+    // DYNAMIC. Since the 2026-09 unification there is ONE model and no picker, so
+    // images are allowed on every DeepSeek chat and this is true (see
+    // detectVision). It stays a getter so a conversation still pinned to the old
+    // UI - badge "Instant"/"Expert", genuinely text-only - is reflected live, and
+    // so the legacy Vision-tab picker keeps working if DeepSeek ever restores it.
     get supportsVision() { return isVisionSelected(); },
     timings,
     // Reasoning-area selector, exported so the CORE's raw-command-visible
@@ -1007,7 +1023,7 @@ const RSProvider = (() => {
       // Version beacon: stamp the loaded build onto <html> so a reload can be
       // confirmed from the page (read document.documentElement.dataset.rsDsVer).
       // BUMP DS_VER on meaningful deepseek.js changes worth verifying live.
-      try { document.documentElement.setAttribute("data-rs-ds-ver", "2026-09_new-ui"); } catch {}
+      try { document.documentElement.setAttribute("data-rs-ds-ver", "2026-09_unified-model"); } catch {}
     },
     // turns
     allItems, isUserItem, isAssistantItem, itemText, classifyText,
