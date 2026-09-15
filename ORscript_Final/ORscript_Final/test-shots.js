@@ -1050,6 +1050,8 @@ const call = async (c, tool, args, ms = 9000) => {
            shot.slice(0, 320));
         ok("...and the doomed zero-argument call is never made at all",
            (req.requiredArgErrors || 0) === 0, "required-argument errors: " + (req.requiredArgErrors || 0));
+        ok("a delivered screenshot is ALSO put on the clipboard (Ctrl+V always works)",
+           /also on your clipboard/.test(shot) && /Ctrl\+V/.test(shot), shot.slice(-240));
       }
       {
         // The same demand from an agent that does NOT forward MCP schemas: the only
