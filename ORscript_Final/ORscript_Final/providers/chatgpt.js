@@ -881,7 +881,9 @@ const RSProvider = (() => {
     // Exported for test-chatgpt.js (the Node smoke test drives it against a stub
     // DOM). The core reads replies through itemText/classifyText, not this.
     textWithout,
-    // Vision OFF, like DeepSeek's text-only Expert tab. ChatGPT's free tier caps
+    // Vision OFF, deliberately (NOT a leftover DeepSeek-style tab rule: DeepSeek
+    // unified its models in 2026-09 and its getter is capability-based now).
+    // ChatGPT's free tier caps
     // image/file input separately from messages ("les fichiers, les images et
     // l'analyse sont indisponibles jusqu'à la réinitialisation de votre quota"),
     // so screen_capture would work sometimes and fail the rest of the time - the

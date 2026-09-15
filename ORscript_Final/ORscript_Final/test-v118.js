@@ -542,6 +542,81 @@ const WIKI_JSON = JSON.stringify({ query: { search: [{ title: "Roblox" }, { titl
     ok("session start no longer waits for a deleted picker", /legacyPicker/.test(dsSrc) && /unified: !legacyPicker/.test(dsSrc));
   }
 
+  // ── 14. Qwen's per-model detector must not repeat the DeepSeek trap ───────
+  // Qwen really does have text-only models, so its detector is allowed to say no
+  // - but only from EVIDENCE (a known model). An unreadable selector (hashed
+  // class churn) or a brand-new model must never read as "no vision": that is
+  // exactly how DeepSeek's removed picker broke every chat.
+  {
+    const qwenSrc = fs.readFileSync(path.join(root, "providers/qwen.js"), "utf8");
+    const load = (doc) => {
+      const store = {};
+      const sandbox = {
+        window: {}, document: doc, console: { log: () => {}, warn: () => {}, error: () => {} },
+        location: { pathname: "/", href: "https://chat.qwen.ai/" }, navigator: { userAgent: "node" },
+        setTimeout, clearTimeout, setInterval: () => 1, clearInterval: () => {},
+        localStorage: { getItem: (k) => (k in store ? store[k] : null), setItem: (k, v) => { store[k] = String(v); }, removeItem: (k) => { delete store[k]; } },
+        MouseEvent: class {}, Event: class {}, KeyboardEvent: class {}, ClipboardEvent: class {},
+        MutationObserver: class { observe() {} disconnect() {} },
+        DataTransfer: class { constructor() { this.items = { add() {}, length: 0 }; this.files = []; } },
+        File: class {}, Blob: class {}, atob, btoa, getComputedStyle: () => ({ getPropertyValue: () => "" }),
+        Node: class {}, requestAnimationFrame: () => 1, fetch: async () => ({ ok: false }),
+      };
+      sandbox.globalThis = sandbox; sandbox.self = sandbox;
+      // qwen.js reaches into window.HTMLTextAreaElement.prototype for the native
+      // value setter - provide a minimal element surface on BOTH the global and
+      // the window object it actually reads.
+      sandbox.HTMLTextAreaElement = sandbox.window.HTMLTextAreaElement = class {};
+      sandbox.HTMLInputElement = sandbox.window.HTMLInputElement = class {};
+      const ctx = vm.createContext(sandbox);
+      return vm.runInContext(qwenSrc + "\n;RSProvider;", ctx, { filename: "providers/qwen.js" });
+    };
+    const doc = (modelName) => ({
+      querySelector: (sel) => (sel.includes("model-selector-text")
+        ? (modelName == null ? null : { textContent: modelName }) : null),
+      querySelectorAll: () => [],
+      documentElement: { setAttribute() {} },
+      body: { appendChild() {}, addEventListener() {} },
+      createElement: () => ({ style: {}, appendChild() {}, addEventListener() {}, classList: { add() {}, remove() {} } }),
+      getElementById: () => null, addEventListener() {},
+    });
+    ok("qwen: unreadable selector ⇒ images ALLOWED", load(doc(null)).supportsVision === true);
+    ok("qwen: brand-new model ⇒ images ALLOWED", load(doc("Qwen3.9-Ultra")).supportsVision === true);
+    ok("qwen: known multimodal model ⇒ allowed", load(doc("Qwen3.6-Plus")).supportsVision === true);
+    ok("qwen: known text-only model ⇒ refused", load(doc("Qwen3.7-Max")).supportsVision === false);
+    ok("qwen keeps the honest text-only path", /no vision|text-only/.test(qwenSrc) && qwenSrc.includes("visionFromDesc"));
+    ok("qwen logs an unreadable selector instead of hiding it", qwenSrc.includes("model.selector_unreadable"));
+  }
+
+  // ── 15. No shipped code may depend on a REMOVED model picker ──────────────
+  // Guard against re-introducing this whole bug class: user-facing copy must not
+  // tell anyone to open a model tab/switch models to get images (DeepSeek deleted
+  // them on 2026-09-10), and no shipped file may gate images on a picker being
+  // present. String literals are extracted so comments may still discuss history.
+  {
+    const shipped = fs.readdirSync(root).filter((f) => f.endsWith(".js") && !f.startsWith("test-"))
+      .map((f) => [f, fs.readFileSync(path.join(root, f), "utf8")]);
+    for (const d of ["core", "providers"]) {
+      for (const f of fs.readdirSync(path.join(root, d))) {
+        if (f.endsWith(".js")) shipped.push([d + "/" + f, fs.readFileSync(path.join(root, d, f), "utf8")]);
+      }
+    }
+    const literals = [];
+    for (const [file, src] of shipped) {
+      const re = /"((?:[^"\\\n]|\\.){0,240})"|'((?:[^'\\\n]|\\.){0,240})'|`((?:[^`\\\n]|\\.){0,240})`/g;
+      let m;
+      while ((m = re.exec(src)) !== null) literals.push([file, m[1] || m[2] || m[3]]);
+    }
+    const offenders = literals.filter(([, text]) =>
+      /(?:vision|expert|instant|flash)\s+(?:tab|model|mode)|(?:tab|model|mode)\s+(?:to\s+)?(?:vision|expert|flash)/i.test(text) &&
+      !/image-blind|unified|text-only|model_|supportsVision|modeRadio|enforceComposer|visionFromDesc/i.test(text));
+    ok("no user-facing copy tells the user to switch to a Vision/Expert/Flash tab",
+      offenders.length === 0, offenders.map(([f, t]) => f + ": " + t.slice(0, 60)).join(" | "));
+    const dsSrc2 = fs.readFileSync(path.join(root, "providers/deepseek.js"), "utf8");
+    ok("deepseek vision never falls back to false", !/_visLatchSet|_visLatch\b/.test(dsSrc2));
+    ok("deepseek readiness tolerates having no picker", /legacyPicker/.test(dsSrc2));
+  }
+
   // ── 10. No stale code paths left behind ────────────────────────────────────
   ok("old ddgSearch helper is gone", !bgSrc.includes("ddgSearch"));
   ok("the fetching User-Agent is a real browser UA", /const BROWSER_UA =[\s\S]{0,200}Chrome\/128/.test(bgSrc) && !/"User-Agent":\s*"OR/.test(bgSrc));

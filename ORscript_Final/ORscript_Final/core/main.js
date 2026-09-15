@@ -5159,7 +5159,10 @@
           // so the flow would silently build from nothing.
           const st = menuEl.querySelector("#rs-i2m-status");
           if (st) { st.textContent = "This site can't read images"; setTimeout(() => { st.textContent = ""; }, 2600); }
-          toast("This chat can't see images — open DeepSeek, Gemini, Kimi, GLM, Qwen, or Meta.");
+          // Names the REASON, not a removed UI: DeepSeek's unified model sees
+          // images everywhere, so a refusal there means this conversation is one
+          // of the old text-only ones (or the model genuinely has no vision).
+          toast("This chat is image-blind — on DeepSeek start a NEW chat; otherwise try Gemini, GLM, Qwen, Meta, Kimi or Freebuff.");
           return;
         }
         const tpl = RS.buildImageToModelPrompt("", activeEngine());

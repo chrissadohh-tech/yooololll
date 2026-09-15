@@ -337,9 +337,10 @@ const RSProvider = (() => {
   const findVisionRadio = () => findModeRadio("vision", RE.visionMode);
   const radioOn = (r) => !!r && r.getAttribute("aria-checked") === "true";
 
-  // The user can CHOOSE the Vision tab; when they do we respect it (never force
-  // Expert over it) and enable image tools - see supportsVision (getter) and
-  // enforceComposer's expert-force guard.
+  // LEGACY-UI ONLY (kept working in case DeepSeek restores the picker): when the
+  // old Instant / Expert / Vision tabs are on screen, the selected Vision tab
+  // enables image tools - see supportsVision and enforceComposer's expert-force
+  // guard. The current UI has NO picker at all; detectVision returns true there.
   //
   // CRITICAL detection wrinkle (validated live 2026-07): once a conversation is
   // active DeepSeek REMOVES the model radiogroup from the DOM entirely, so reading
@@ -350,7 +351,7 @@ const RSProvider = (() => {
   // fall back to DeepSeek's per-turn model BADGE (a small element whose exact text
   // is "Instant"/"Expert"/"Vision"). Throttled + latched so the badge scan stops
   // once a value is known.
-  let _visLatch = false, _visLatchSet = false, _visAt = 0, _visCache = false;
+  let _visAt = 0, _visCache = true;   // last answer + throttle stamp
   function badgeVision() {
     const els = [...document.querySelectorAll("div,span")].filter(
       (e) => e.childElementCount === 0 &&
@@ -385,10 +386,10 @@ const RSProvider = (() => {
     const group = document.querySelector(S.modeRadioGroup);
     if (group) {                                   // legacy picker → authoritative
       const v = findVisionRadio();
-      if (v) { _visLatch = radioOn(v); _visLatchSet = true; return (_visCache = _visLatch); }
+      if (v) return (_visCache = radioOn(v));
     }
     const b = badgeVision();
-    if (b != null) { _visLatch = b; _visLatchSet = true; return (_visCache = b); }
+    if (b != null) return (_visCache = b);
     return (_visCache = true);                     // unified model: images allowed
   }
   const isVisionSelected = () => detectVision();
@@ -422,12 +423,10 @@ const RSProvider = (() => {
     // off) without OR reverting their choice every frame.
     if (!reason) return composerModeState();
     try {
-      // Pick the most powerful model for the agent: Expert (deep reasoning). In
-      // the current DeepSeek V4 UI, Expert IS the thinking model; the three tabs
-      // are Instant / Expert / Vision and there is no separate DeepThink toggle.
-      // EXCEPTION: if the user deliberately chose the Vision tab, RESPECT it (don't
-      // force Expert back) - that's the only way to feed DeepSeek images, and
-      // supportsVision then flips true so screen_capture is allowed for that turn.
+      // LEGACY picker only (the unified 2026-09 UI has none, so findExpertRadio()
+      // returns null and everything below is skipped): click Expert for the
+      // reasoning pass, EXCEPT when the user deliberately chose Vision - forcing
+      // Expert over Vision would take images away from a chat that can use them.
       if (!isVisionSelected()) {
         const expert = findExpertRadio();
         if (expert && expert.getAttribute("aria-checked") !== "true") {
