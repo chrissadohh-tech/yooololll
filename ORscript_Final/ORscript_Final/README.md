@@ -64,9 +64,10 @@ cd agent && cargo test
 `test-bridges.js` is a live smoke test: start `or-agent` first.
 
 `test-shots.js` needs no browser and no Studio: it loads the real `core/main.js` with the real
-`background.js` behind a fake DOM and calls every screenshot/attach command (`or_screenshot` on
-all 14 targets, `screenshot` / `take_screenshot` / `send_screenshot`, `attach_feedback` plus its
-9 aliases, `or_focus_studio`) through the `window.__rsRunTool` seam. A scope bug like the one that
+`background.js` behind a fake DOM and drives the screenshot command's three targets
+(`or_screenshot` for `studio` / `blender` / `desktop`), the internal fallback routes
+(`_route:"window"|"tab"|"auto"`), `attach_feedback` with its aliases, and `shot_test`, through the
+`window.__rsRunTool` seam. A scope bug like the one that
 broke every screenshot with `Cannot access 'RECENT_IMAGES_MAX' before initialization` shows up here
 in under a second, where `node --check` cannot see it. It checks HTTP `:3000` and WS `17613` / `17615` (no Unreal port).
 
@@ -77,27 +78,38 @@ through the capture script, reads it back exactly the way a real screenshot is h
 verifies the checksum. It needs no Studio window. `agent_info {}` reports which `or-agent.exe`
 is running and which hand-over is in use.
 
-**The three screenshots, in one line each:**
+**The three screenshots — one command, three targets, no aliases:**
 
 ```
-or_screenshot {"target":"studio"}     a picture taken INSIDE Roblox Studio   - Studio just has to be open
-or_screenshot {"target":"blender"}    a picture taken INSIDE Blender        - Blender just has to be open
-or_screenshot {"target":"desktop"}    a picture of the WHOLE PC             - all monitors, Studio not needed
+or_screenshot {}  (or {"target":"studio"})   a picture taken INSIDE Roblox Studio  - Studio just has to be open
+or_screenshot {"target":"blender"}           a picture taken INSIDE Blender        - Blender just has to be open
+or_screenshot {"target":"desktop"}           a picture of the WHOLE PC             - every monitor, no Studio needed
 ```
 
-None of the three cares which window is in front or has focus. Only `{"target":"tab"}`
-photographs whatever is in front (that one is for showing OR the chat page itself).
+That is the entire screenshot surface. There is no `screenshot`, `take_screenshot`, `send_screenshot`,
+`capture_screenshot`, `screen_capture`, `window`, `tab` or `auto` command, and `or_screenshot` has no
+aliases: ask for anything else and OR answers with the three it has instead of quietly taking a
+different picture. `shot_test {}` is a diagnostic (it takes no picture of Studio); `attach_feedback`
+re-sends or copies a picture that already exists.
 
-| route | needs | notes |
+The removed names are not just undocumented, they are **refused by name**: calling
+`screenshot`, `take_screenshot`, `send_screenshot` or the old `or_focus_studio` family returns an
+instant error naming the three real targets. It never falls through to a capture, and it never
+hangs waiting for an answer that was never coming.
+
+| target | what it does | if it cannot |
 | --- | --- | --- |
-| `or_screenshot {target:"studio"}` | Roblox Studio open + its MCP | **Studio takes its own picture.** No window, no focus, no PowerShell — the browser being in front or behind makes no difference. Blender parity: nothing but "Studio is open" |
-| `or_screenshot {target:"desktop"}` (aliases `screen`, `pc`, `os`) | or-agent.exe running | the entire desktop, every monitor, grabbed straight from the screen — no Studio window involved, and no window has to be in front |
-| `or_screenshot {target:"window"}` | or-agent.exe running, Studio open | photographs the Studio **window** directly (PrintWindow), so Studio never has to come forward. The fallback when the MCP cannot hand the picture over |
-| `or_screenshot {target:"auto"}` | best of the above | Studio MCP → Blender → Studio window → tab |
-| `or_screenshot {target:"tab"}` | an ordinary http/https page in front | `chrome://`, the New Tab page and PDFs can never be captured |
+| `studio` (default) | **Studio takes its own picture** through its MCP (`screen_capture`) — no window, no focus, no PowerShell. The browser being in front or behind makes no difference; Blender parity is the goal | falls back to photographing the Studio **window** through the agent, which also never needs a window in front |
+| `blender` | the Blender viewport, captured inside Blender by the addon | falls back to the Blender window through the agent |
+| `desktop` | the whole desktop, every monitor, grabbed from the screen itself | nothing to fall back to — it either grabs the screen or says why |
 
-**Which window is in front never matters** for `studio`, `window` or `blender`: only `tab` photographs
-whatever is in front. `auto` tries them in that order, so a working Studio capture always wins.
+**Which window is in front never matters.** None of the three raises or focuses a window, and
+`or_screenshot {target:"desktop"}` photographs the desktop exactly as it looks, Studio open or not.
+
+**Fallbacks are automatic and internal.** The `window` / `tab` routes still exist behind these three
+(the `tab` route photographs whatever is in front, and `chrome://` pages, the New Tab page and PDFs
+can never be captured). They are reachable for tests as `_route:"window"|"tab"|"auto"` - they are not
+commands, and the model is told not to call them.
 
 **How the picture gets here.** Studio's MCP may hand its capture over in any of three shapes and OR
 accepts all of them: an MCP **image block**, a **file path** (the server saved the PNG — OR reads that

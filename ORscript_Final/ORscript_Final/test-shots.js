@@ -631,9 +631,13 @@ const call = async (c, tool, args, ms = 9000) => {
     const bad = /before initialization|is not defined|Cannot read prop|\bundefined\b.*undefined|__no_seam__|__timeout__/.test(s);
     ok(`or_screenshot target:"${t}" answers cleanly`, !bad && s.length > 20, s.slice(0, 160));
   }
-  for (const alias of ["screenshot", "take_screenshot", "send_screenshot"]) {
-    const s = String(await call(c, alias, { target: "studio" }));
-    ok(`alias ${alias} answers cleanly`, s.length > 20 && !/before initialization|is not defined/.test(s), s.slice(0, 120));
+  // The old spellings must not RUN anything - and must not hang either. Each one is
+  // refused by name and pointed at the real command; a dead name that falls through to
+  // the worker is the "it just loops" report.
+  for (const gone of ["screenshot", "take_screenshot", "send_screenshot"]) {
+    const s = String(await call(c, gone, { target: "studio" }));
+    ok(`the removed name ${gone} is refused, not run as a screenshot`,
+       /is not a command/.test(s) && /or_screenshot/.test(s) && !/Output of/.test(s), s.slice(0, 140));
   }
   for (const args of [{}, { source: "recent" }, { index: 0 }, { path: "nope.png" }, { copy: true, send: false }, { paste: true }, { send: false, paste: false }, { source: "studio" }]) {
     const s = String(await call(c, "attach_feedback", args));
@@ -643,9 +647,12 @@ const call = async (c, tool, args, ms = 9000) => {
     const s = String(await call(c, alias, {}));
     ok(`attach alias ${alias} answers cleanly`, s.length > 20 && !/before initialization|is not defined/.test(s), s.slice(0, 120));
   }
-  for (const name of ["or_focus_studio", "focus_studio", "bring_studio_to_front", "studio_focus", "studio_to_front"]) {
-    const s = String(await call(c, name, {}));
-    ok(`${name} answers cleanly`, s.length > 20 && !/before initialization|is not defined/.test(s), s.slice(0, 140));
+  // The focus command is gone: fronting Studio is not needed any more because the
+  // picture is taken INSIDE Studio, so a Studio that is merely OPEN is enough.
+  for (const gone of ["or_focus_studio", "focus_studio", "bring_studio_to_front", "studio_focus", "studio_to_front"]) {
+    const s = String(await call(c, gone, {}));
+    ok(`the removed focus command ${gone} is refused, not run`,
+       /is not a command/.test(s) && /Studio only has to be OPEN/.test(s) && !/Output of/.test(s), s.slice(0, 140));
   }
 
   // ── 3. the plumbing is reachable from the UI layer too (the popup buttons) ──
@@ -668,13 +675,31 @@ const call = async (c, tool, args, ms = 9000) => {
     // scope check by execution: the helpers must exist at closure scope, which we
     // prove by asking whether the seam's closure resolves them (it does, since the
     // screenshot path above used them without a ReferenceError).
-    const used = String(await call(c, "or_screenshot", { target: "tab" }));
+    {
+      // THE SURFACE, pinned: one screenshot command, exactly three targets, no aliases.
+      // Anything else must be REFUSED with the three named - never quietly turned into a
+      // different picture, and never accepted under a second name.
+      const cS = build({}, { engine: "local" }).ctx;
+      const noTarget = String(await call(cS, "or_screenshot", {}, 40000));
+      ok("or_screenshot with no target takes the Studio picture (the default)",
+         !/is not a screenshot target/.test(noTarget), noTarget.slice(0, 240));
+      for (const bad of ["window", "tab", "auto", "screen", "pc", "os", "viewport", "chat"]) {
+        const refused = String(await call(cS, "or_screenshot", { target: bad }, 40000));
+        ok('or_screenshot {target:"' + bad + '"} is refused, and the three real targets are named',
+           /is not a screenshot target/.test(refused) && /"studio"/.test(refused) &&
+           /"blender"/.test(refused) && /"desktop"/.test(refused), refused.slice(0, 220));
+      }
+      const aliasGone = String(await call(cS, "take_screenshot", {}, 40000));
+      ok("the old alias take_screenshot is not a command any more",
+         !/Output of 'or_screenshot'/.test(aliasGone), aliasGone.slice(0, 160));
+    }
+    const used = String(await call(c, "or_screenshot", { _route: "tab" }));
     ok("the shared capture path actually ran (helpers resolved)", /Output of 'or_screenshot'|ERROR: or_screenshot/.test(used), used.slice(0, 160));
   }
 
   // ── 4. no screenshot path may report success with zero images ──
   {
-    const s = String(await call(c, "or_screenshot", { target: "auto" }));
+    const s = String(await call(c, "or_screenshot", { _route: "auto" }));
     const claimsImage = /attached to THIS message/i.test(s);
     const hasError = /^ERROR/.test(s);
     ok("a capture claim always comes with an image or an error", hasError || claimsImage, s.slice(0, 200));
@@ -702,7 +727,7 @@ const call = async (c, tool, args, ms = 9000) => {
       ok("...and says screenshots DO work without a rebuild (text tunnel)", /TEXT TUNNEL/i.test(info) && /Screenshots DO work/i.test(info), info.slice(0, 300));
       ok("...and scopes the rebuild as optional, not required", /Rebuilding is optional/i.test(info), info.slice(0, 220));
 
-      const shot = String(await call(cAgent, "or_screenshot", { target: "window" }, 40000));
+      const shot = String(await call(cAgent, "or_screenshot", { _route: "window" }, 40000));
       ok("or_screenshot {target:window} answers on the OLD agent", !/THREW|__timeout__/.test(shot), shot.slice(0, 200));
       ok("...it claims the picture arrived", /attached to THIS message/i.test(shot), shot.slice(0, 300));
       ok("...and names the text tunnel as the delivery route", /text tunnel/i.test(shot), shot.slice(0, 300));
@@ -719,7 +744,7 @@ const call = async (c, tool, args, ms = 9000) => {
         const av = makeFakeAgent({}); av.noResultLine = true;
         const cAv = build({}, { fakeAgent: av, engine: "local" }).ctx;
         await waitConnected(cAv);
-        const out = String(await call(cAv, "or_screenshot", { target: "window" }, 40000));
+        const out = String(await call(cAv, "or_screenshot", { _route: "window" }, 40000));
         ok("a capture script that never ran names security software as a cause",
            /did not run to completion/.test(out) && /antivirus/i.test(out) && /ExecutionPolicy Bypass/.test(out), out.slice(0, 620));
         ok("...and it does NOT pretend the window route worked",
@@ -753,7 +778,7 @@ const call = async (c, tool, args, ms = 9000) => {
       const bad = makeFakeAgent({ clipChars: 20000 });
       bad.corruptOnRead();
       const cBad = build({}, { fakeAgent: bad, engine: "local" }).ctx;
-      const badShot = String(await call(cBad, "or_screenshot", { target: "window" }, 40000));
+      const badShot = String(await call(cBad, "or_screenshot", { _route: "window" }, 40000));
       const badImgs = vm.runInContext("window.__rsRecentImages()", cBad);
       ok("a corrupted capture is NOT attached as if it were the screenshot", badImgs.length === 0 && /^ERROR/.test(badShot), badShot.slice(0, 240));
       ok("...and the failure says the capture itself worked, only the hand-over did not", /could not be read back|damaged|incomplete|checksum/i.test(badShot), badShot.slice(0, 300));
@@ -785,9 +810,10 @@ const call = async (c, tool, args, ms = 9000) => {
       ok("shot_test proves the path on the old agent (self-test, no Studio open)", /Everything a screenshot needs works/i.test(st), st.slice(0, 260));
       ok("...it reports each step that passed", /checksum verified/i.test(st) && /script written into the agent workspace/i.test(st), st.slice(0, 260));
       ok("...and it names the tunnel as the hand-over in use", /TEXT TUNNEL/i.test(st), st.slice(0, 200));
-      for (const alias of ["or_shot_test", "screenshot_test", "test_screenshot"]) {
-        const t2 = String(await call(cAgent, alias, {}, 40000));
-        ok("shot_test alias " + alias + " answers", /Output of 'shot_test'/.test(t2), t2.slice(0, 120));
+      for (const gone of ["or_shot_test", "screenshot_test", "test_screenshot"]) {
+        const t2 = String(await call(cAgent, gone, {}, 40000));
+        ok("the removed name '" + gone + "' points at shot_test instead of running",
+           /is not a command/.test(t2) && /shot_test \{\}/.test(t2) && !/Output of/.test(t2), t2.slice(0, 200));
       }
       {
         const broken = makeFakeAgent({}); broken.selftestBroken = true;
@@ -811,11 +837,11 @@ const call = async (c, tool, args, ms = 9000) => {
         const cDesk = build({}, { fakeAgent: desk, engine: "local" }).ctx;
         await waitConnected(cDesk);
         const shotRuns = [];
-        for (const t of ["desktop", "screen", "pc", "os"]) {
+        for (const t of ["desktop"]) {
           const out = String(await call(cDesk, "or_screenshot", { target: t }, 40000));
           shotRuns.push({ t, out, imgs: vm.runInContext("window.__rsRecentImages()", cDesk).length });
         }
-        ok("a whole-PC screenshot really captures the desktop (desktop/screen/pc/os)",
+        ok("a whole-PC screenshot really captures the desktop (the one spelling: desktop)",
            shotRuns.every((r) => /attached to THIS message/i.test(r.out) && r.imgs >= 1),
            JSON.stringify(shotRuns.map((r) => [r.t, r.imgs, r.out.slice(0, 40)])).slice(0, 400));
         ok("...and it says it was the whole screen, not the Studio window",
@@ -1073,7 +1099,7 @@ const call = async (c, tool, args, ms = 9000) => {
       {
         const nc = makeFakeAgent({}); nc.noCompile = true; nc.trailingNoise = true;
         const cNc = build({}, { fakeAgent: nc, engine: "local" }).ctx;
-        const nshot = String(await call(cNc, "or_screenshot", { target: "window" }, 40000));
+        const nshot = String(await call(cNc, "or_screenshot", { _route: "window" }, 40000));
         const nimgs = vm.runInContext("window.__rsRecentImages()", cNc);
         ok("a PC that cannot compile the fast helper still gets its screenshot", /attached to THIS message/i.test(nshot) && nimgs.length === 1, nshot.slice(0, 300));
         ok("...and the result says the fallback route was used, not a silent downgrade", /fallback route/i.test(nshot), nshot.slice(0, 300));
@@ -1082,7 +1108,7 @@ const call = async (c, tool, args, ms = 9000) => {
       {
         const cf = makeFakeAgent({}); cf.captureFails = true;
         const cCf = build({}, { fakeAgent: cf, engine: "local" }).ctx;
-        const fshot = String(await call(cCf, "or_screenshot", { target: "window" }, 40000));
+        const fshot = String(await call(cCf, "or_screenshot", { _route: "window" }, 40000));
         const fimgs = vm.runInContext("window.__rsRecentImages()", cCf);
         ok("a capture-step failure is reported with the script's own reason", fimgs.length === 0 && /capture step failed/i.test(fshot), fshot.slice(0, 320));
         ok("...and the blocked-compile detail is passed on, not swallowed", /could not load file or assembly|CodeDom/i.test(fshot), fshot.slice(0, 320));
@@ -1092,7 +1118,7 @@ const call = async (c, tool, args, ms = 9000) => {
       const big = makeFakeAgent({ clipChars: 20000 });
       big.maxReadBytes = 60000;                    // the 90 KB image's base64 is ~123 KB -> refused
       const cBig = build({}, { fakeAgent: big, engine: "local" }).ctx;
-      const bigShot = String(await call(cBig, "or_screenshot", { target: "window" }, 40000));
+      const bigShot = String(await call(cBig, "or_screenshot", { _route: "window" }, 40000));
       const bigImgs = vm.runInContext("window.__rsRecentImages()", cBig);
       ok("a capture too big for the agent to read is retaken smaller, not reported as a dead end",
          /attached to THIS message/i.test(bigShot) && /retaken smaller/i.test(bigShot), bigShot.slice(0, 300));
@@ -1101,7 +1127,7 @@ const call = async (c, tool, args, ms = 9000) => {
       const gone = makeFakeAgent({ clipChars: 20000 });
       gone.hideB64OnRead();
       const cGone = build({}, { fakeAgent: gone, engine: "local" }).ctx;
-      const goneShot = String(await call(cGone, "or_screenshot", { target: "window" }, 40000));
+      const goneShot = String(await call(cGone, "or_screenshot", { _route: "window" }, 40000));
       ok("a missing tunnel file is reported plainly, never as an empty success", /^ERROR/.test(goneShot) && !/attached to THIS message/i.test(goneShot), goneShot.slice(0, 240));
     }
   }
