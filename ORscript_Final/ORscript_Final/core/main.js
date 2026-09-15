@@ -1971,8 +1971,8 @@
       // Unknown target names fall back to "auto" instead of silently capturing
       // nothing (a typo used to read as "Studio MCP + tab capture both failed").
       const rawTarget = String(args.target || args.source || "auto").toLowerCase();
-      const target = /^(auto|studio|roblox|viewport|blender|tab|chat|page|self)$/.test(rawTarget) ? rawTarget : "auto";
-      const { shots, notes } = await captureShots(target);
+      const target = /^(auto|studio|roblox|viewport|blender|blender_window|window|studio_window|os|desktop|tab|chat|page|self)$/.test(rawTarget) ? rawTarget : "auto";
+      const { shots, notes } = await captureShots(target, { focus: args.focus === true, maxWidth: args.max_width });
       if (!shots.length) {
         return "ERROR: or_screenshot captured nothing. " +
           (notes.join(" | ") || "both the Studio capture and the tab fallback failed.") +
@@ -2074,6 +2074,24 @@
         `Attached 1 image (${img.mimeType || "image/png"}, ~${sizeKb} KB${ageS !== null ? ", captured " + ageS + "s ago" : ""}) from ${where || "the last capture"}.\n` +
         lines.join("\n") +
         "\n(The image is attached to THIS message — you can see it directly. Analyse it and continue.)";
+    }
+    // ── or_focus_studio: bring the Roblox Studio window to the front ──────────
+    // Windows only lets a process take the foreground when it owns the last input
+    // event, so the agent attaches to the foreground thread's input queue and
+    // raises the window (see studio_shot.ps1). Opt-in by definition: it steals
+    // focus, so it never happens inside an automatic capture.
+    if (name === "or_focus_studio" || name === "focus_studio" || name === "bring_studio_to_front" ||
+        name === "studio_focus" || name === "studio_to_front") {
+      const r = await bg({ type: "studio_window_shot", focus_only: true });
+      if (!r || !r.ok) {
+        return "ERROR: could not bring Studio to the front: " + String((r && r.error) || "unknown") +
+          "\n(Runs through or-agent.exe's run_command on Windows; it needs the agent running and a Studio window that exists.)";
+      }
+      const meta = r.meta || {};
+      const w = meta.window || {};
+      return "Output of 'or_focus_studio':\n" + (r.text || "Studio raised.") +
+        (w.process ? ` (${w.process}${w.pid ? " pid " + w.pid : ""}${w.width ? ", " + w.width + "x" + w.height + " px" : ""})` : "") +
+        "\nNow take the picture with or_screenshot {\"target\":\"window\"} - the OS-side capture needs no page permission.";
     }
     if (name === "or_debug" || name === "debug_run" || name === "debug_console") {
       const code = [
@@ -2215,7 +2233,7 @@
       const animLines = requested === "roblox" ? RSAnim.describeCommands() : [];
       const skillLines = (requested === "roblox" && typeof RobloxScriptSkills !== "undefined") ? RobloxScriptSkills.describeCommands() : [];
       const agentLines = (requested === "local" && typeof AgentScriptSkills !== "undefined") ? AgentScriptSkills.describeCommands() : [];
-      const webLines = [`— OR Status: or_status {} — live engine, work mode, extra thinking, bridge, blender. Call this if you are unsure which mode you are in.`, `— Web Tools (bridge-level, no Studio needed): web_fetch {url?, query?, max_chars?} — fetch a URL, OR pass query to search the web then fetch the top result; web_search {query, limit?} — DuckDuckGo titles+URLs`, `— Screenshot: or_screenshot {target?: auto|studio|tab|blender} — take a screenshot of Studio, this chat tab, or Blender and attach it to your next message so you can see it. Aliases: screenshot, take_screenshot, send_screenshot.`, `— Attach images: attach_feedback {index?, path?, source?, copy?, paste?, send?} — re-send the most recent screenshot (or any workspace file via path) as an attachment on this message and copy it to the clipboard so the user can paste it. Aliases: attachfeedbackor, attach_image, attach_file, attach_screenshot, attach_last_screenshot, attach_recent_image, copy_screenshot, paste_screenshot.`, `— Debugger: or_debug {} — Studio LogService errors/warnings. Automatic Debugger (Settings) appends new errors after mutating commands.`, `— Multi-Agent: or_agent {role: planner|builder|reviewer|debugger, task?} — hand off to a specialist. Enable Multi-Agent in Settings.`, `— Developer Products: developer_product_create {name, price, description?, reward?} — create a real Roblox Developer Product on this published universe (sign into roblox.com in Chrome). developer_product_list {} lists them. Aliases: create_developer_product, create_dev_product.`];
+      const webLines = [`— OR Status: or_status {} — live engine, work mode, extra thinking, bridge, blender. Call this if you are unsure which mode you are in.`, `— Web Tools (bridge-level, no Studio needed): web_fetch {url?, query?, max_chars?} — fetch a URL, OR pass query to search the web then fetch the top result; web_search {query, limit?} — DuckDuckGo titles+URLs`, `— Screenshot: or_screenshot {target?: auto|studio|tab|blender} — take a screenshot of Studio, this chat tab, or Blender and attach it to your next message so you can see it. Aliases: screenshot, take_screenshot, send_screenshot.`, `— Studio window: or_focus_studio {} — bring the Roblox Studio window to the front on Windows (steals focus, so it is opt-in). or_screenshot {target:"window"} photographs that window straight through the agent, which works even when the browser is in front.`, `— Attach images: attach_feedback {index?, path?, source?, copy?, paste?, send?} — re-send the most recent screenshot (or any workspace file via path) as an attachment on this message and copy it to the clipboard so the user can paste it. Aliases: attachfeedbackor, attach_image, attach_file, attach_screenshot, attach_last_screenshot, attach_recent_image, copy_screenshot, paste_screenshot.`, `— Debugger: or_debug {} — Studio LogService errors/warnings. Automatic Debugger (Settings) appends new errors after mutating commands.`, `— Multi-Agent: or_agent {role: planner|builder|reviewer|debugger, task?} — hand off to a specialist. Enable Multi-Agent in Settings.`, `— Developer Products: developer_product_create {name, price, description?, reward?} — create a real Roblox Developer Product on this published universe (sign into roblox.com in Chrome). developer_product_list {} lists them. Aliases: create_developer_product, create_dev_product.`];
       const virtualCount = animLines.length + skillLines.length + agentLines.length + webLines.length;
       return `Output of '${name}':\n${requested} commands (${scoped.length}${virtualCount ?  ` + ${virtualCount} OR virtual tools` : ""}):\n\n${lines.join("\n\n")}${animLines.length ?  "\n\n" + animLines.join("\n\n") : ""}${skillLines.length ?  "\n\n" + skillLines.join("\n\n") : ""}${agentLines.length ?  "\n\n" + agentLines.join("\n\n") : ""}\n\n${webLines.join("\n")}`;
     }
@@ -2282,7 +2300,8 @@
 
   // Shared capture routine: used by or_screenshot AND attach_feedback so both
   // agree on what "studio", "tab" and "blender" mean.
-  async function captureShots(target) {
+  async function captureShots(target, opts) {
+    const o = opts || {};
     const shots = [];
     const notes = [];
     const tryMcp = async (toolName, label) => {
@@ -2301,11 +2320,40 @@
       return false;
     };
     const wantStudio = target === "auto" || target === "studio" || target === "roblox" || target === "viewport";
-    const wantBlend = target === "auto" || target === "blender";
+    const wantBlend = target === "auto" || target === "blender" || target === "blender_window";
+    const wantWindow = target === "auto" || target === "window" || target === "studio_window" || target === "os" || target === "desktop";
     const wantTab = target === "tab" || target === "chat" || target === "page" || target === "self";
     if (wantStudio) await tryMcp("screen_capture", "studio");
     if (wantBlend && !shots.length) await tryMcp("get_viewport_screenshot", "blender");
+    // OS-side fallback: photograph the Studio WINDOW itself (agent + PowerShell).
+    // Works while Studio is behind the browser, so it is a better fallback than a
+    // tab capture - and the only path that works when the picture must be of
+    // Studio rather than of this page.
+    if (wantWindow && !shots.length) {
+      try {
+        const r = await bg({ type: "studio_window_shot", focus: !!opts.focus, max_width: opts.maxWidth });
+        if (r && r.ok && r.images && r.images.length) {
+          shots.push(...r.images);
+          notes.push("studio window: " + (r.text || "captured"));
+        } else {
+          notes.push("studio window: " + String((r && r.error) || "capture failed").slice(0, 300));
+        }
+      } catch (e) {
+        notes.push("studio window: " + String((e && e.message) || e).slice(0, 200));
+      }
+    }
     if (wantTab || (target === "auto" && !shots.length)) {
+      // Chrome's tab capture photographs whatever is in FRONT, so say so BEFORE
+      // taking it - a shot of another tab is worse than no shot, because the
+      // model describes it as if it were the user's screen.
+      try {
+        const front = await bg({ type: "tab_front" });
+        if (front && front.ok && front.is_sender_tab === false) {
+          const what = front.title || front.url || "another tab";
+          notes.push("front tab is '" + String(what).slice(0, 80) + "', not this chat");
+          try { ui.toast("Capturing the tab in FRONT (" + String(what).slice(0, 40) + "), not this chat — bring this tab forward for a shot of the conversation.", 6000); } catch {}
+        }
+      } catch {}
       try {
         const r = await bg({ type: "capture_tab" });
         if (r && r.ok && r.images && r.images.length) {

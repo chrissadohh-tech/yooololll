@@ -57,8 +57,9 @@ if (RS) {
     /read_file_base64/.test(RS.buildSystemPrompt({ engine: "local" })) && /attach_feedback/.test(RS.buildSystemPrompt({ engine: "local" })));
   ok("the live roster appends TOOL_NOTES by bare name", /RS\.TOOL_NOTES\[bareToolName\(t\.name\)\]/.test(mainSrc));
   ok("prompt no longer claims web_search is DuckDuckGo-only", !/web_search\\?`? {query, limit\?} DuckDuckGo/.test(prompt));
-  ok("prompt keeps the screenshot target list", prompt.includes('{target?:"auto"|"studio"|"tab"|"blender"}'));
-  ok("prompt points at the per-target reason on empty capture", /captured NOTHING/i.test(prompt));
+  ok("prompt lists every screenshot target", /\{target\?:"auto"\|"studio"\|"blender"\|"window"\|"tab"/.test(prompt) && prompt.includes("or_focus_studio"));
+  ok("prompt explains the window target needs no page permission", /needs no page permission/i.test(prompt));
+  ok("prompt points at the per-target reason on empty capture", /reports NOTHING/i.test(prompt) && /per-target reason/i.test(prompt));
   ok("tool notes survive into the roster text", typeof RS.compactTools === "function");
   ok("attach_feedback is a screen-category tool", RS.toolCategory("attach_feedback") === "screen");
   ok("or_screenshot alias is a screen-category tool", RS.toolCategory("screenshot") === "screen");
@@ -135,11 +136,11 @@ ok("blenderCall explains a failed readback", bgSrc.includes("image_error"));
 ok("capture_tab still exists for tab targets", bgSrc.includes('case "capture_tab"'));
 
 // ── 6. core/main.js: screenshots + attach_feedback ───────────────────────────
-ok("main has one shared capture routine", (mainSrc.match(/async function captureShots\(target\)/g) || []).length === 1);
+ok("main has one shared capture routine", (mainSrc.match(/async function captureShots\(target, opts\)/g) || []).length === 1);
 ok("the tab note carries the front-tab warning", /r\.warning \? " - " \+ r\.warning/.test(mainSrc));
 ok("the capture failure explains both causes", /old one drops image blocks/.test(mainSrc) && /whichever tab is in FRONT/.test(mainSrc));
 ok("the failure tells the model not to retry blindly", /do NOT retry blindly/i.test(mainSrc));
-ok("or_screenshot uses the shared routine", /captureShots\(target\)/.test(mainSrc));
+ok("or_screenshot uses the shared routine", /captureShots\(target, \{ focus:/.test(mainSrc));
 ok("captureShots is the only screen_capture caller", (mainSrc.match(/tryMcp\("screen_capture"/g) || []).length === 1);
 ok("recent captures are remembered", mainSrc.includes("function rememberImages(") && mainSrc.includes("RECENT_IMAGES_MAX"));
 ok("image payloads become reusable blobs", mainSrc.includes("function imageToBlob(") && mainSrc.includes("function imageToPngBlob("));
@@ -651,6 +652,51 @@ const WIKI_JSON = JSON.stringify({ query: { search: [{ title: "Roblox" }, { titl
     const dsSrc2 = fs.readFileSync(path.join(root, "providers/deepseek.js"), "utf8");
     ok("deepseek vision never falls back to false", !/_visLatchSet|_visLatch\b/.test(dsSrc2));
     ok("deepseek readiness tolerates having no picker", /legacyPicker/.test(dsSrc2));
+  }
+
+  // ── 16. Studio WINDOW capture + bringing Studio to the front (OS side) ─────
+  // A browser extension cannot photograph another application's window, so this
+  // runs through the agent: studio_shot.ps1 uses PrintWindow while Studio is
+  // BEHIND other windows, and only falls back to raising it + grabbing the screen.
+  {
+    const ps = fs.readFileSync(path.join(root, "studio_shot.ps1"), "utf8");
+    ok("studio_shot.ps1 ships", ps.length > 2000);
+    ok("it targets the real Studio process", /RobloxStudioBeta/.test(ps));
+    ok("PrintWindow is used with PW_RENDERFULLCONTENT", /PrintWindow/.test(ps) && /PW_RENDERFULLCONTENT\s*=\s*0x2/.test(ps));
+    ok("a blank GPU frame is detected, not shipped", /printwindow-blank/.test(ps) && /Get-FrameStats/.test(ps));
+    ok("focus uses the input-queue attach trick", /AttachThreadInput/.test(ps) && /SetForegroundWindow/.test(ps));
+    ok("a minimized window is restored first", /IsIconic/.test(ps) && /SW_RESTORE/.test(ps));
+    ok("it raises the window even when focus is refused", /SetWindowPos/.test(ps) && /0x0003/.test(ps));
+    ok("the screen-grab path exists as the fallback", /CopyFromScreen/.test(ps));
+    ok("focus-only mode captures nothing", /FocusOnly/.test(ps) && /focus_only = \$true/.test(ps));
+    ok("it prints one machine-readable result line", /OR_STUDIO_SHOT/.test(ps) && /ConvertTo-Json -Compress/.test(ps));
+    ok("it fails cleanly when Studio is not open", /no visible Roblox Studio window found/.test(ps) && /exit 2/.test(ps));
+    ok("the image is written to the workspace", /Join-Path \(Get-Location\) \$Out/.test(ps));
+    ok("output is scaled to a sane width", /Scale-Bitmap/.test(ps) && /MaxWidth/.test(ps));
+    ok("it never touches the banned shim port", !ps.includes("17617"));
+
+    // background wiring
+    ok("bg exposes the window-shot message", bgSrc.includes('case "studio_window_shot"'));
+    ok("bg has the studioWindowShot helper", /async function studioWindowShot/.test(bgSrc));
+    ok("the PS script is written into the workspace first", /async function ensureStudioShotScript/.test(bgSrc) && bgSrc.includes('extText("studio_shot.ps1")'));
+    ok("the PNG is read back through the bridge", /studioWindowShot[\s\S]{0,2600}localReadBase64\(file\)/.test(bgSrc));
+    ok("a missing agent is reported as such", /is or-agent\.exe running\?/.test(bgSrc));
+    ok("bg answers tab_front before a capture", bgSrc.includes('case "tab_front"'));
+
+    // main wiring
+    ok("main routes the window target", /studio_window|"window"/.test(mainSrc) && /wantWindow/.test(mainSrc));
+    ok("auto falls back to the WINDOW before the tab", /if \(wantWindow && !shots\.length\)/.test(mainSrc) &&
+      mainSrc.indexOf("studio_window_shot") < mainSrc.indexOf('case "tab"') + 1e9 && mainSrc.indexOf("if (wantWindow && !shots.length)") < mainSrc.indexOf("if (wantTab || (target === \"auto\""));
+    ok("or_focus_studio is dispatched", mainSrc.includes('name === "or_focus_studio"'));
+    for (const alias of ["focus_studio", "bring_studio_to_front", "studio_focus", "studio_to_front"]) {
+      ok("focus alias " + alias + " routed", mainSrc.includes(`name === "${alias}"`));
+    }
+    ok("the focus command explains itself when it fails", /or-agent\.exe's run_command on Windows/.test(mainSrc));
+    ok("focus is opt-in, never automatic", /focus: args\.focus === true/.test(mainSrc) && /focus: false|focus: !!o\.focus/.test(mainSrc) === false);
+    ok("the pre-capture focus check warns before shooting", /tab_front/.test(mainSrc) && /before taking it|BEFORE a capture/.test(mainSrc) || /tab_front/.test(bgSrc));
+    ok("the front-tab warning is also a user toast", /Capturing the tab in FRONT/.test(mainSrc));
+    ok("the model is told when a shot is not this chat", /not this chat/.test(mainSrc));
+    ok("TOOL_NOTES documents the window target", /or_focus_studio/.test(cfgSrc) && /needs NO page permission/.test(cfgSrc));
   }
 
   // ── 10. No stale code paths left behind ────────────────────────────────────

@@ -1128,7 +1128,7 @@ async function blenderPayload(name, args) {
   if (bare === "get_scene_info" || bare === "blender_get_scene_info") return { type: "get_scene_info", params: {} };
   if (bare === "get_object_info" || bare === "blender_get_object_info") return { type: "get_object_info", params: { name: a.name || a.object_name || "" } };
   if (bare === "execute_blender_code" || bare === "execute_code" || bare === "blender_execute_code") return { type: "execute_code", params: { code: wrapBlenderUserCode(a.code || "") } };
-  if (bare === "get_viewport_screenshot" || bare === "blender_screenshot") {
+  if (bare === "get_viewport_screenshot" || bare === "blender_screenshot" || bare === "blender_viewport_shot" || bare === "blender_window_shot") {
     let shot = "or_blender_shot.png";
     const root = await agentWorkspaceRoot();
     if (root) shot = root.replace(/[\\/]+$/, "") + "/or_blender_shot.png";
@@ -1276,6 +1276,68 @@ async function blenderCall(name, args, timeout) {
   await prev.catch(() => {});
   try { return await run(); }
   finally { release(); }
+}
+
+// ── Studio WINDOW capture / focus (OS side, needs or-agent.exe) ─────────────
+// A browser extension cannot photograph a desktop window, and captureVisibleTab
+// only ever sees the tab IN FRONT. Studio is a separate application, so this goes
+// through the agent: studio_shot.ps1 (written into the agent workspace) uses
+// PrintWindow first - which works while Studio is behind other windows - and
+// falls back to raising the window and grabbing the screen.
+let studioShotScriptReady = false;   // same pattern as ensureBlenderScripts
+
+async function ensureStudioShotScript() {
+  if (studioShotScriptReady) return;
+  const ps = await extText("studio_shot.ps1");
+  await localWrite("studio_shot.ps1", ps);
+  studioShotScriptReady = true;
+}
+
+// capture:true → also write the PNG. Focus-only is the "make Studio the front
+// window" action (no capture). Returns { ok, text, images, meta }.
+async function studioWindowShot({ focus = false, focusOnly = false, maxWidth = 1600, out = "or_studio_window.png" } = {}) {
+  const ps1 = (cmd) => `powershell -NoProfile -ExecutionPolicy Bypass -File studio_shot.ps1 ${cmd}`;
+  try {
+    await ensureStudioShotScript();
+  } catch (e) {
+    return { ok: false, error: "could not write studio_shot.ps1 into the agent workspace: " + String((e && e.message) || e) + " (is or-agent.exe running?)" };
+  }
+  const flags = [
+    focusOnly ? "-FocusOnly" : `-Out ${out}`,
+    focus && !focusOnly ? "-Focus" : "",
+    focusOnly ? "" : `-MaxWidth ${Math.max(320, Math.min(3000, Number(maxWidth) || 1600))}`,
+  ].filter(Boolean).join(" ");
+  const cmd = ps1(flags);
+  const r = await localRun(cmd, 45);
+  const raw = String((r && (r.text || r.error)) || "");
+  const m = raw.match(/OR_STUDIO_SHOT\s+(\{[\s\S]*?\})\s*$/m);
+  let meta = null;
+  if (m) { try { meta = JSON.parse(m[1]); } catch {} }
+  if (!meta) {
+    return { ok: false, error: (raw.slice(-400) || "no answer from the agent (is or-agent.exe running?)"), command: cmd,
+             hint: "the script prints one OR_STUDIO_SHOT {...} line; a PowerShell parse error or a missing Add-Type means this needs the rebuilt agent" };
+  }
+  if (!meta.ok) return { ok: false, error: meta.error || "capture failed", meta, command: cmd };
+  if (focusOnly) {
+    return { ok: true, text: (meta.focused ? "Roblox Studio is now the FRONT window" : "Windows refused keyboard focus; Studio was raised above other windows instead"), meta, command: cmd };
+  }
+  const file = meta.file || out;
+  let images = [];
+  try {
+    const b64 = await localReadBase64(file);
+    images = [{ mimeType: b64.mimeType || "image/png", data: b64.data }];
+  } catch (e) {
+    return { ok: false, error: "the window was captured to " + file + " but could not be read back: " + String((e && e.message) || e),
+             meta, command: cmd };
+  }
+  const how = meta.method === "printwindow" ? "PrintWindow (Studio never had to come forward)"
+    : meta.method === "screen" ? "screen grab after raising the Studio window" : String(meta.method || "capture");
+  return {
+    ok: true, images, meta, command: cmd,
+    text: `Captured the Roblox Studio WINDOW via ${how} — ${meta.window && meta.window.width}x${meta.window && meta.window.height} px, saved as ${file}.` +
+      (meta.method === "screen" && meta.focused ? " Studio is now the front window." : "") +
+      (meta.method === "screen" && !meta.focused ? " (Windows would not give Studio keyboard focus; it was raised above other windows.)" : ""),
+  };
 }
 
 async function robloxCsrf() {
@@ -1504,6 +1566,17 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         } catch (e) {
           sendResponse({ ok: false, error: String(e && e.message || e) });
         }
+        break;
+      }
+      // OS-side Studio window capture / focus (no page permission involved).
+      case "studio_window_shot": {
+        const r = await studioWindowShot({
+          focus: msg.focus === true,
+          focusOnly: msg.focus_only === true,
+          maxWidth: msg.max_width,
+          out: msg.out,
+        });
+        sendResponse(r);
         break;
       }
       case "blender_connect": {
@@ -1755,6 +1828,28 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       case "list_dev_products": {
         try { sendResponse(await robloxListDevProducts(msg)); }
         catch (e) { sendResponse({ ok: false, error: String(e && e.message || e) }); }
+        break;
+      }
+      // Which tab is IN FRONT, asked BEFORE a capture: captureVisibleTab always
+      // photographs that one, so the caller can warn instead of silently handing
+      // the model a picture of an unrelated page.
+      case "tab_front": {
+        const windowId = (_sender.tab && _sender.tab.windowId) || undefined;
+        const senderTabId = (_sender.tab && _sender.tab.id) || null;
+        let front = null;
+        try {
+          const tabs = await chrome.tabs.query(
+            windowId === undefined ? { active: true, lastFocusedWindow: true } : { active: true, windowId }
+          );
+          front = (tabs && tabs[0]) || null;
+        } catch {}
+        sendResponse({
+          ok: true,
+          url: (front && front.url) || "",
+          title: (front && front.title) || "",
+          is_sender_tab: !!front && senderTabId !== null && front.id === senderTabId,
+          capturable: !!front && /^https?:/i.test((front && front.url) || ""),
+        });
         break;
       }
       case "capture_tab": {
