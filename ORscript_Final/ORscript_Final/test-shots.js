@@ -150,6 +150,15 @@ function makeFakeAgent(opts) {
   state.captureFails = false;              // the capture step itself threw
   state.requireCaptureId = false;          // "schema" | "error": the MCP demands a capture_id
   state.noResultLine = false;              // the script ran but printed nothing (blocked / refused)
+  state.avBlocksPs1 = false;               // the scanner refuses the .ps1 FILE (the live report)
+  state.studioId = "";                     // non-empty: Studio's MCP demands this exact CONNECTED id
+  state.studioIdShape = "json";            // json | text | human: how list_roblox_studios answers
+  state.studioIdByError = false;           // no schema: the demand shows only in the error text
+  state.noCatalogue = false;               // this agent forwards no tool list at all
+  state.mcpNamesFile = false;              // the MCP saves the shot and NAMES the file in its text
+  state.lastArgs = {};                     // the arguments the last capture tool was called with
+  state.studioIdCalls = 0;                 // how often the connected id was looked up
+  state.ps1Runs = 0;                       // how often the (blocked) script was actually started
   state.studioWindowMissing = false;       // no Studio window open: the real ps1 says so and exits
   state.trailingNoise = false;             // PowerShell printed something after the result line
   state.selftestBroken = false;            // PowerShell/GDI failure
@@ -165,13 +174,23 @@ function makeFakeAgent(opts) {
   // The tool list this agent advertises - schemas included, exactly as a real MCP's
   // list_tools would pass them through. Some capture tools can WRITE the picture
   // instead of returning it, and OR only retries that way when the schema says so.
-  const toolList = () => (state.mcpImages || state.mcpSavePath ? OLD_TOOLS.concat(["screen_capture", "get_studio_state"]) : OLD_TOOLS)
-    .map((n) => {
+  const toolList = () => {
+    if (state.noCatalogue) return [];            // an older agent forwards nothing at all
+    const extra = [];
+    // The Studio MCP appears only when this fixture actually models it: a plain fixture is
+    // the 18-tool build the user runs.
+    if (state.mcpImages || state.mcpSavePath || state.mcpNamesFile || state.studioId) extra.push("screen_capture", "get_studio_state");
+    if (state.mcpImages || state.mcpSavePath || state.mcpNamesFile || state.studioId) extra.push("screen_capture");
+    if (state.studioId) extra.push("list_roblox_studios");
+    return OLD_TOOLS.concat(extra).map((n) => {
       if (n !== "screen_capture") return { name: n };
       if (state.mcpSavePath) return { name: n, inputSchema: { type: "object", properties: { save_path: { type: "string", description: "where to write the PNG" } } } };
+      // Studio's real schema: capture_id AND the CONNECTED studio_id are required.
+      if (state.studioId && !state.studioIdByError) return { name: n, inputSchema: { type: "object", properties: { capture_id: { type: "string", description: "identifier for this capture" }, studio_id: { type: "string", description: "the connected Studio instance" } }, required: ["capture_id", "studio_id"] } };
       if (state.requireCaptureId === "schema") return { name: n, inputSchema: { type: "object", properties: { capture_id: { type: "string", description: "identifier for this capture" } }, required: ["capture_id"] } };
       return { name: n };
     });
+  };
   const handle = (sock, msg) => {
     if (!msg || typeof msg !== "object") return;
     const { id, type, name, arguments: a } = msg;
@@ -181,10 +200,17 @@ function makeFakeAgent(opts) {
     if (name === "run_command") state.commands.push(String((a && a.command) || ""));
     if (hang.indexOf(String(name)) >= 0) return;   // a stuck server: accepts the call, never answers
     const okText = (text) => reply(sock, { type: "tool_result", id, ok: true, text });
+    if (name === "run_command" && state.avBlocksPs1 && /studio_shot\.ps1/.test(String(a.command || ""))) {
+      // The live report, in the shape the user pasted: the scanner refuses the FILE itself,
+      // so the script never runs and PowerShell only prints its own complaint.
+      state.ps1Runs++;
+      okText("At line:1 char:1\r\n+ # SPDX-License-Identifier: GPL-3.0-or-later\r\n+ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\r\nThis script contains malicious content and has been blocked by your antivirus software.\r\n    + CategoryInfo          : ParserError: (:) [], ParentContainsErrorRecordException\r\n    + FullyQualifiedErrorId : ScriptContainedMaliciousContent");
+      return;
+    }
     if (name === "run_command" && state.noResultLine && /studio_shot\.ps1/.test(String(a.command || ""))) {
       // Security software, a group policy, or a parse failure: PowerShell returns
       // something that never contains the script's result line.
-      okText("At line:1 char:1\r\n+ powershell -NoProfile -ExecutionPolicy Bypass -File studio_shot.ps1 -Out or_studio_window.png\r\n+ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\r\nThis script contains malicious content and has been blocked by your antivirus software.\r\n    + CategoryInfo          : ParserError: (:) [], ParentContainsErrorRecordException");
+      okText("At line:1 char:1\r\n+ powershell -NoProfile -ExecutionPolicy Bypass -File studio_shot.ps1 -Out or_studio_window.png\r\n+ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\r\n    + CategoryInfo          : NotSpecified: (:) [], ParentContainsErrorRecordException\r\n    + FullyQualifiedErrorId : NativeCommandError");
       return;
     }
     if (name === "run_command" && state.studioWindowMissing && /studio_shot\.ps1/.test(String(a.command || "")) &&
@@ -218,6 +244,19 @@ function makeFakeAgent(opts) {
       files["or_blender_shot.png"] = bpng;
       files["or_blender_out.json"] = Buffer.from(JSON.stringify({ status: "ok", result: { ok: true, filepath: "or_blender_shot.png", width: 1280, height: 720 } }), "utf8");
       okText("OR_BLENDER_OK");
+      return;
+    }
+    if (name === "run_command" && /certutil -encode/i.test(String(a.command || ""))) {
+      // certutil: the signed Windows program that turns the PNG into text with no script
+      // file anywhere. Writes the .b64 next to the picture, exactly like the real one.
+      const m = String(a.command || "").match(/certutil -encode "([^"]+)" "([^"]+)"/i);
+      const src = m ? resolve(m[1]) : null;
+      const dst = m ? base(m[2]) : "";
+      const data = src ? files[src] : null;
+      if (!data || !dst) { fail("The system cannot find the file specified."); return; }
+      const b64 = data.toString("base64");
+      files[dst] = Buffer.from(b64.match(/.{1,64}/g).join("\n") + "\n", "utf8");
+      okText("Input Length = " + data.length + "\nOutput Length = " + b64.length + "\nCertUtil: -encode command completed successfully.\n");
       return;
     }
     if (name === "run_command" && /-B64Only/.test(String(a.command || ""))) {
@@ -293,6 +332,38 @@ function makeFakeAgent(opts) {
       if (end < arr.length) body += "\n... lines " + (end + 1) + "-" + arr.length + " continue (use offset=" + (end + 1) + ")";
       if (body.length > clipChars) body = body.slice(0, clipChars) + "\n... [output truncated at " + clipChars + " characters]";
       okText(body);
+      return;
+    }
+    if (name === "list_roblox_studios") {
+      state.studioIdCalls++;
+      const sid = state.studioId || "st_none";
+      if (state.studioIdShape === "text") { okText("Connected studios: " + JSON.stringify({ studios: [{ studio_id: sid, connected: true }] })); return; }
+      if (state.studioIdShape === "human") { okText("Connected studios (1):\n- studio_id: " + sid + "  name: OR Test Place  (connected)"); return; }
+      okText(JSON.stringify({ studios: [{ studio_id: sid, name: "OR Test Place", connected: true }] }));
+      return;
+    }
+    if (name === "screen_capture" && state.studioId) {
+      state.lastArgs = Object.assign({}, a || {});
+      const want = state.studioId;
+      const have = String((a && a.studio_id) || "");
+      if (state.studioIdByError && !have) { state.requiredArgErrors = (state.requiredArgErrors || 0) + 1; fail("Missing required argument: studio_id"); return; }
+      if (have !== want) {
+        // The server's own words (the user pasted them): an id that is NOT the connected one.
+        fail("The requested `studio_id` is not connected - that Roblox Studio instance may have been closed or its place unloaded. Call list_roblox_studios for the current list.");
+        return;
+      }
+      if (state.mcpNamesFile) {
+        const png = Buffer.alloc(2600);
+        for (let i = 0; i < png.length; i++) png[i] = (i * 13 + 9) & 0xff;
+        files["or_mcp_shot.png"] = png;
+        okText("captured 1280x800 -> C:\\Users\\Chris\\ORWorkspace\\or_mcp_shot.png");
+        return;
+      }
+      if (state.mcpImages) {
+        reply(sock, { type: "tool_result", id, ok: true, text: "", images: [{ mimeType: "image/png", data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8AAAwAB/AF+7E1mAAAAAElFTkSuQmCC" }] });
+        return;
+      }
+      okText("captured 1280x800");
       return;
     }
     if (name === "screen_capture" && state.requireCaptureId && !(a && a.capture_id)) {
@@ -771,6 +842,80 @@ const call = async (c, tool, args, ms = 9000) => {
         ok("...and it does NOT pretend the window route worked",
            !/attached to THIS message/i.test(out), out.slice(-200));
       }
+      {
+        // THE LIVE REPORT: "This script contains malicious content and has been blocked by
+        // your antivirus software." at studio_shot.ps1:1 char:1. The script cannot run at
+        // all on that PC, so OR must say so in one line, offer the route that needs no
+        // script, and never start the blocked file again (every attempt is another alert).
+        const avb = makeFakeAgent({}); avb.avBlocksPs1 = true;
+        const cAvb = build({}, { fakeAgent: avb, engine: "local" }).ctx;
+        await waitConnected(cAvb);
+        const out = String(await call(cAvb, "ViewportScreenshotRoblox", { _route: "window" }, 40000));
+        ok("an antivirus that blocks the script is named as the cause, in one line",
+           /blocked by this PC's antivirus/i.test(out) && /studio_shot\.ps1/.test(out), out.slice(0, 420));
+        ok("...and it points at the route that needs no script at all",
+           /inside Studio over the MCP/i.test(out) && /nothing for the scanner to see/i.test(out), out.slice(0, 620));
+        ok("...and it does NOT pretend the window route worked", !/attached to THIS message/i.test(out), out.slice(-200));
+        const runs = avb.ps1Runs;
+        ok("...the blocked script was started once", runs === 1, "runs=" + runs);
+        const again = String(await call(cAvb, "ViewportScreenshotRoblox", { _route: "window" }, 40000));
+        ok("...and a second capture does NOT start it again (no second antivirus alert)",
+           avb.ps1Runs === runs && /blocked by this PC's antivirus/i.test(again), "runs=" + avb.ps1Runs);
+      }
+      {
+        // The live MCP refusal: "the tool requires capture_id, studio_id" and then "The
+        // requested studio_id is not connected ... Call list_roblox_studios for the
+        // current ...". The id is LOOKED UP - never invented - and the picture then comes
+        // from inside Studio with no PowerShell anywhere.
+        const sid = makeFakeAgent({}); sid.mcpImages = true; sid.studioId = "st_9f2c41";
+        const cSid = build({}, { fakeAgent: sid, engine: "local" }).ctx;
+        await waitConnected(cSid);
+        const shot = String(await call(cSid, "ViewportScreenshotRoblox", {}, 40000));
+        const imgs = vm.runInContext("window.__rsRecentImages()", cSid);
+        ok("the CONNECTED studio_id is looked up with list_roblox_studios and sent",
+           imgs.length > 0 && sid.calls.includes("list_roblox_studios") && sid.lastArgs.studio_id === "st_9f2c41",
+           "args=" + JSON.stringify(sid.lastArgs) + " calls=" + sid.calls.join(","));
+        ok("...together with the capture_id the same schema requires (nothing left to refuse)",
+           typeof sid.lastArgs.capture_id === "string" && sid.lastArgs.capture_id.length > 3, JSON.stringify(sid.lastArgs));
+        ok("...the picture is attached and never claimed for another app",
+           /attached to THIS message/i.test(shot) && !/whole screen/i.test(shot), shot.slice(0, 300));
+        ok("...and NO PowerShell script was involved (nothing for an antivirus to block)",
+           !sid.commands.some((cm) => /studio_shot\.ps1/.test(cm)), sid.commands.join(" | ").slice(0, 200));
+        ok("...and the reply says which arguments OR filled in",
+           /filled the argument/i.test(shot) && /studio_id/.test(shot), shot.slice(0, 420));
+      }
+      {
+        // An agent that forwards NO schemas at all (and answers the id list as a plain
+        // human list): the demand is only in the error text, so that is where the key is
+        // read from - one lookup, one retry, picture arrives.
+        const sr = makeFakeAgent({}); sr.mcpImages = true; sr.studioId = "st_live_77";
+        sr.studioIdByError = true; sr.noCatalogue = true; sr.studioIdShape = "human";
+        const cSr = build({}, { fakeAgent: sr, engine: "local" }).ctx;
+        await waitConnected(cSr);
+        const shot = String(await call(cSr, "ViewportScreenshotRoblox", {}, 40000));
+        const imgs = vm.runInContext("window.__rsRecentImages()", cSr);
+        ok("an id demanded only in the ERROR text is read from there and looked up",
+           imgs.length > 0 && sr.calls.includes("list_roblox_studios") && sr.lastArgs.studio_id === "st_live_77",
+           "args=" + JSON.stringify(sr.lastArgs) + " calls=" + sr.calls.join(","));
+        ok("...with exactly one refusal and one retry, never a loop",
+           (sr.requiredArgErrors || 0) === 1, "required-argument errors: " + (sr.requiredArgErrors || 0));
+      }
+      {
+        // The MCP saves the picture and NAMES the file. Getting those bytes back must not
+        // depend on the script the antivirus blocks: certutil (a signed program) does it.
+        const nf = makeFakeAgent({}); nf.mcpNamesFile = true; nf.studioId = "st_file_1";
+        const cNf = build({}, { fakeAgent: nf, engine: "local" }).ctx;
+        await waitConnected(cNf);
+        const shot = String(await call(cNf, "ViewportScreenshotRoblox", {}, 40000));
+        const imgs = vm.runInContext("window.__rsRecentImages()", cNf);
+        ok("a picture the MCP saved to a file is read back WITHOUT PowerShell",
+           imgs.length > 0 && /attached to THIS message/i.test(shot), shot.slice(0, 320));
+        ok("...via the signed converter, not the blocked script",
+           nf.commands.some((cm) => /certutil -encode/.test(cm)) && !nf.commands.some((cm) => /studio_shot\.ps1/.test(cm)),
+           nf.commands.join(" | ").slice(0, 240));
+        ok("...and the attached bytes are the MCP's own file",
+           String(imgs[0].data || "").length > 1000 && /read back as base64 TEXT/.test(shot), "len=" + String(imgs[0].data || "").length);
+      }
       ok("...and it never stole focus from whatever is in front (no -Focus in the command)",
          agent.commands.some((cm) => /-Out/.test(cm)) && !agent.commands.some((cm) => /-Focus(?!Only)/.test(cm)),
          agent.commands.slice(-1)[0] || "(no command)");
@@ -1093,7 +1238,7 @@ const call = async (c, tool, args, ms = 9000) => {
            /no picture came back/i.test(shot), shot.slice(0, 400));
         ok("...and it names the cause (this build cannot carry image data) and both ways forward",
            /o\u0072-agent\.exe \(\d+ tools, no read_file_base64\)/i.test(shot) && /cannot carry IMAGE DATA/i.test(shot) &&
-           /the name is read back as text/.test(shot) && /target:"window"/.test(shot), shot.slice(0, 520));
+           /without PowerShell/.test(shot) && /Studio-window rescue/.test(shot), shot.slice(0, 520));
         ok("...and the window route still delivers the picture in that case (goodbye until a rebuild)",
            /attached to THIS message/i.test(shot), shot.slice(0, 300));
       }

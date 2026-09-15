@@ -1048,6 +1048,33 @@ async function localReadTextFile(path, opts) {
 // Verify the tunnel end-to-end: same byte count, and the same SHA-256 the script
 // computed, so a truncated or re-encoded picture is never attached as if it were
 // the screenshot.
+// ── a capture FILE -> base64 TEXT, with NO PowerShell involved ───────────────
+// The user's antivirus blocks studio_shot.ps1 outright, and turning a PNG into text
+// never needed a script in the first place: certutil is a signed Windows program, and
+// base64 ships with every POSIX box. An executable is not a script, so the script
+// scanner has nothing to read. The paged TEXT read and the three checks in
+// b64ToVerifiedImage are unchanged - only the converter is different.
+async function b64FileViaConverter(file) {
+  const src = String(file || "");
+  if (!src) return null;
+  const tmp = src.replace(/[\\/]+$/, "") + ".or.b64";
+  let win = true;
+  try { win = (await chrome.runtime.getPlatformInfo()).os === "win"; } catch {}
+  const cmd = win ? `certutil -encode "${src}" "${tmp}"` : `base64 -w 76 "${src}" > "${tmp}"`;
+  let r = null;
+  try { r = await localRun(cmd, 45); } catch { return null; }
+  const txt = String((r && (r.text || r.error)) || "");
+  if (noteAvBlock(txt)) return null;                       // refused, not "not found"
+  if (r && r.ok === false) return null;
+  // certutil reports the source size, which is what the byte-count check downstream
+  // wants; the base64 length of N bytes is fixed padding included.
+  const bytes = Number((txt.match(/Input Length\s*=\s*(\d+)/i) || [])[1]) || 0;
+  if (win && !bytes) return null;
+  return { ok: true, file: src, base64_file: tmp, bytes,
+    base64_chars: bytes ? 4 * Math.ceil(bytes / 3) : 0,
+    mime: /\.png$/i.test(src) ? "image/png" : "image/jpeg" };
+}
+
 async function b64ToVerifiedImage(b64, meta) {
   const clean = String(b64 || "").replace(/[^A-Za-z0-9+/=]/g, "");
   if (!clean) throw new Error("the capture text arrived empty");
@@ -1078,7 +1105,11 @@ async function b64ToVerifiedImage(b64, meta) {
         String(meta.sha256).slice(0, 12) + "…, got " + hex.slice(0, 12) + "…)");
     }
   }
-  return { mimeType: (meta && meta.mime) || "image/jpeg", data: clean, bytes: bytes.length };
+  // A file named .jpg that is really a PNG (or the reverse) must not be handed over
+  // under the wrong type: the first bytes are the truth when they name a format.
+  const sniff = bytes.length > 8 && bytes[0] === 0x89 && bytes[1] === 0x50 ? "image/png"
+    : (bytes[0] === 0xff && bytes[1] === 0xd8) ? "image/jpeg" : "";
+  return { mimeType: sniff || (meta && meta.mime) || "image/jpeg", data: clean, bytes: bytes.length };
 }
 
 // Hand a picture file to the browser by ANY route the agent supports:
@@ -1175,6 +1206,121 @@ function missingArgIn(text) {
   const m = String(text || "").match(REQUIRED_ARG_RE);
   return m ? m[1] : "";
 }
+// ── the CONNECTED studio id (looked up, never invented) ─────────────────────
+// Studio's own screen_capture declares capture_id AND studio_id required, and a made-up
+// id is REFUSED: "The requested `studio_id` is not connected - that Roblox Studio
+// instance may have been closed or its place unloaded. Call list_roblox_studios for the
+// current ...". So the id is taken from where that error says it lives. This is a plain
+// MCP call: no PowerShell, no script file written to disk, nothing for security software
+// to scan - which is why the picture can be taken with the antivirus left alone. Cached
+// briefly (a Studio restart hands out a new id), refreshed ONCE when the server refuses.
+let studioIdCache = { id: "", at: 0 };
+const STUDIO_ID_TTL_MS = 120000;
+const STUDIO_ID_TOOL = "list_roblox_studios";
+const STUDIO_ID_KEY_RE = /^(?:studio|instance|place|editor)_?id$/i;
+// Empty list = the agent forwards no catalogue at all (an older build): then the call is
+// worth a try, because those are exactly the builds whose captures failed this way.
+function mcpToolNames() {
+  try { return (Array.isArray(toolsCache) ? toolsCache : []).map((t) => String((t && (t.name || t.id)) || "")); }
+  catch { return []; }
+}
+function studioIdFromJson(node, depth, strong, weak, generic, inStudio) {
+  if (!node || depth > 6) return;
+  if (Array.isArray(node)) { node.forEach((x) => studioIdFromJson(x, depth + 1, strong, weak, generic, inStudio)); return; }
+  if (typeof node !== "object") return;
+  Object.keys(node).forEach((k) => {
+    const key = String(k).toLowerCase().replace(/[^a-z0-9]/g, "");
+    const v = node[k];
+    const studioish = inStudio || /studio|instance|place|editor|connection/.test(key);
+    if (v !== null && typeof v === "object") { studioIdFromJson(v, depth + 1, strong, weak, generic, studioish); return; }
+    const s = String(v === null || v === undefined ? "" : v).trim();
+    if (!s || s.length > 200) return;
+    const bucket = (key === "studioid" || key === "instanceid") ? strong
+      : (key === "id" ? (studioish ? weak : generic) : null);
+    if (bucket && bucket.indexOf(s) < 0) bucket.push(s);
+  });
+}
+function jsonInText(text) {
+  const t = String(text || "");
+  const first = [t.indexOf("{"), t.indexOf("[")].filter((i) => i >= 0).sort((a, b) => a - b)[0];
+  if (first === undefined) return null;
+  const last = Math.max(t.lastIndexOf("}"), t.lastIndexOf("]"));
+  if (last <= first) return null;
+  try { return JSON.parse(t.slice(first, last + 1)); } catch { return null; }
+}
+// The answer arrives as JSON (structured, or as JSON inside a text block) or as a human
+// list; both shapes are read here. A bare "id" only counts as a studio id when it sits
+// next to studio-ish wording, so an unrelated id can never be sent as the place to shoot.
+function pickStudioId(r) {
+  try {
+    const raw = String((r && (r.text || r.error)) || "");
+    const strong = [], weak = [], generic = [];
+    const parsed = jsonInText(raw);
+    if (parsed) studioIdFromJson(parsed, 0, strong, weak, generic, false);
+    const all = strong.concat(weak, generic);
+    if (all.length) return all[0];
+    const pats = [/"studio_?id"\s*:\s*"?([A-Za-z0-9_.:\-]{2,200})/i,
+                  /\bstudio_?id\b[\s"']*[:=][\s"']*([A-Za-z0-9_.:\-]{2,200})/i,
+                  /\binstance_?id\b[\s"']*[:=][\s"']*([A-Za-z0-9_.:\-]{2,200})/i];
+    for (const p of pats) { const m = raw.match(p); if (m) return m[1]; }
+  } catch {}
+  return "";
+}
+async function resolveStudioId(force) {
+  const now = Date.now();
+  if (!force && studioIdCache.id && now - studioIdCache.at < STUDIO_ID_TTL_MS) return studioIdCache.id;
+  const names = mcpToolNames();
+  if (names.length && names.indexOf(STUDIO_ID_TOOL) < 0) return "";      // the server does not offer it
+  try {
+    const r = await send({ type: "call_tool", name: STUDIO_ID_TOOL, arguments: {}, timeout: 8000 }, 12000, { connectWait: 2500 });
+    const id = r && r.ok !== false ? pickStudioId(r) : "";
+    if (id) { studioIdCache = { id, at: Date.now() }; return id; }
+  } catch {}
+  if (force) studioIdCache = { id: "", at: 0 };
+  return "";
+}
+// Which argument of THIS tool wants a studio id? Read from its own schema, so no other
+// tool is ever sent an argument it did not ask for. The model may have supplied one
+// itself - a hallucinated value - so the key is looked up before any dummy is filled.
+function studioIdKeyFor(name, args) {
+  try {
+    const a = args || {};
+    const schema = mcpSchemaFor(name);
+    const props = (schema && schema.properties) || {};
+    const req = (schema && Array.isArray(schema.required)) ? schema.required : [];
+    const wanted = req.filter((k) => STUDIO_ID_KEY_RE.test(String(k)));
+    // Anything REQUIRED is filled; an OPTIONAL studio id is only worth a lookup for the
+    // capture tools (which is what the live refusal was about), so a tool that merely
+    // accepts one never costs an extra round trip on every call.
+    if (!wanted.length && !/screenshot|screen_capture|capture|viewport/i.test(String(name || ""))) return "";
+    const keys = wanted.length ? wanted : Object.keys(props).filter((k) => STUDIO_ID_KEY_RE.test(String(k)));
+    return keys.find((k) => a[k] === undefined || a[k] === "") || "";
+  } catch { return ""; }
+}
+function coerceArgToSchema(value, spec) {
+  const t = spec && spec.type;
+  if ((t === "integer" || t === "number") && /^-?\d+$/.test(String(value))) return Number(value);
+  return String(value);
+}
+// Required arguments, then the one thing a dummy can never satisfy: the CONNECTED id.
+async function prepareArgs(name, args) {
+  const key = studioIdKeyFor(name, args);
+  const pre = fillRequiredArgs(name, args);
+  const filled = pre.filled.filter((k) => k !== key);
+  if (key) {
+    const id = await resolveStudioId(false);
+    if (id) {
+      const props = ((mcpSchemaFor(name) || {}).properties) || {};
+      pre.args[key] = coerceArgToSchema(id, props[key]);
+      filled.push(key);
+    }
+  }
+  return { args: pre.args, filled, studioIdKey: key };
+}
+// "that studio id is gone" (Studio closed, or the place reloaded) - the one failure worth
+// a fresh lookup. Deliberately narrow: a bridge/socket error must not be read as this.
+const STUDIO_ID_ERR_RE = /studio_?id|list_roblox_studios|that Roblox Studio instance|no active Studio|previously active Studio has disconnected|Studio is not connected/i;
+function isStudioIdError(text) { return STUDIO_ID_ERR_RE.test(String(text || "")); }
 // Applies to capture-ish tools only: a tool that merely MENTIONS a .png (a file
 // listing, say) must not drag an unrelated picture into the model's context.
 const CAPTURE_TOOL_RE = /screenshot|screen_capture|capture|viewport/i;
@@ -1190,14 +1336,14 @@ async function harvestToolImage(r, toolName) {
     // Nothing convertible in the answer. "No picture" is true but useless on its own:
     // a build without image support THROWS PICTURES AWAY, and the user cannot tell that
     // apart from a Studio that never took one. Say which it probably is, and what to do.
-    let note = "no picture came back: the answer held no image data, named no image file and contained no base64, " +
-      "so there was nothing this build could turn into an attachment (a tool that writes the shot and names it, or inlines base64, works)";
+    let note = "no picture came back: the answer held no image data, named no image file and contained no base64," +
+      " so there was nothing this build could turn into an attachment (a tool that saves the shot AND NAMES IT, or inlines base64, works - neither needs PowerShell)";
     try {
       const info = await agentInfo();
       if (info && info.has_base64 === false) {
-        note = "no picture came back: this or-agent.exe (" + info.tools + " tools, no read_file_base64) cannot carry IMAGE DATA, " +
-          "and this MCP's answer named no file and held no base64 - so there was nothing to convert into an attachment. " +
-          "The file route still works when the tool saves the shot (the name is read back as text), and {target:\"window\"} always works.";
+        note = "no picture came back: this or-agent.exe (" + info.tools + " tools, no read_file_base64) cannot carry IMAGE DATA," +
+          " and this MCP's answer named no file and held no base64, so there was nothing to convert. Rebuild it (cd agent && cargo build --release)" +
+          " for the MCP image path; a tool that NAMES the saved file still works without PowerShell, and the Studio-window rescue still delivers.";
       }
     } catch {}
     return Object.assign({}, r, { image_error: note });
@@ -1213,11 +1359,18 @@ async function harvestToolImage(r, toolName) {
 
 async function tunnelReadImage(file, knownMeta) {
   let meta = knownMeta && knownMeta.base64_file ? knownMeta : null;
-  if (!meta) {
+  // The MCP (or any other tool) may simply NAME the picture it saved. Turning that file
+  // into text must not depend on the script the antivirus blocks, so the converter is
+  // tried first and PowerShell only after it (and never when the scanner already said no).
+  if (!meta) meta = await b64FileViaConverter(file);
+  if (!meta && !ps1BlockedNow()) {
     const r = await localRun(`powershell -NoProfile -ExecutionPolicy Bypass -File studio_shot.ps1 -B64Only "${file}"`, 45);
-    const m2 = parseShotMeta(String((r && (r.text || r.error)) || ""));
+    const raw = String((r && (r.text || r.error)) || "");
+    const m2 = noteAvBlock(raw) ? null : parseShotMeta(raw);
     if (!m2 || !m2.ok) {
-      const err = new Error((m2 && m2.error) || ("could not prepare " + file + " for text readback") +
+      const err = new Error((m2 && m2.error) || (ps1BlockedNow()
+        ? "cannot read " + file + " back as text: the antivirus blocks studio_shot.ps1 and the certutil converter did not answer (is or-agent.exe running?)"
+        : "could not prepare " + file + " for text readback") +
         (r && r.error && r.error !== (m2 && m2.error) ? " (" + String(r.error).slice(0, 160) + ")" : ""));
       if (m2 && /too big to hand over as text|too large to read whole/i.test(String(m2.error || ""))) err.code = "too-large";
       throw err;
@@ -1627,8 +1780,43 @@ function wholeScreenOut(name) {
   return /studio/i.test(s) ? s.replace(/studio_window/i, "screen").replace(/studio/i, "screen") : s;
 }
 
-async function studioWindowShot({ focus = false, focusOnly = false, maxWidth = 1600, out = "or_studio_window.png", wholeScreen = false } = {}) {
+// One place decides "the scanner stopped the script": the capture step and the
+// -B64Only readback both come back with the same words, and either one is enough to
+// stop trying the script at all.
+function noteAvBlock(text) {
+  const t = String(text || "");
+  if (!AV_BLOCK_RE.test(t)) return false;
+  ps1Block = { why: t.replace(/\s+/g, " ").trim().slice(-240), at: Date.now() };
+  return true;
+}
+// ── the antivirus on this PC blocks the SCRIPT FILE ──────────────────────────
+// Live report from the user's machine: "This script contains malicious content and has
+// been blocked by your antivirus software." at studio_shot.ps1:1 char:1 - so BOTH
+// PowerShell routes (the Studio window and the whole screen) die there. Running the
+// blocked file again would only print the same wall and keep poking the scanner, so the
+// first such answer switches the PowerShell route OFF for a while and the failure says
+// why in one line. The Roblox picture does not need it at all: it is taken inside Studio
+// over the MCP, where no script file exists to be scanned.
+const AV_BLOCK_RE = /blocked by your antivirus|contains malicious content|antivirus software|running scripts is disabled|not digitally signed|UnauthorizedAccessException/i;
+let ps1Block = { why: "", at: 0 };
+const PS1_BLOCK_MS = 600000;                   // tried again after ten minutes
+function ps1BlockedNow() {
+  if (!ps1Block.why) return "";
+  if (Date.now() - ps1Block.at > PS1_BLOCK_MS) { ps1Block = { why: "", at: 0 }; return ""; }
+  return ps1Block.why;
+}
+function ps1BlockedReply() {
+  return {
+    ok: false, av_blocked: true,
+    error: "the PowerShell capture script (studio_shot.ps1) is blocked by this PC's antivirus, so the window and whole-screen routes are off - this is the antivirus, not OR and not Studio.",
+    hint: "the Roblox picture does not need that script: ViewportScreenshotRoblox {} takes it inside Studio over the MCP, with nothing for the scanner to see. To keep the desktop route as well, allow studio_shot.ps1 in Windows Security (Virus & threat protection > Exclusions) or press Win+Shift+S to take the desktop shot by hand.",
+  };
+}
+async function studioWindowShot({ focus = false, focusOnly = false, maxWidth = 1600, out = "or_studio_window.png", wholeScreen = false, force = false } = {}) {
   const ps1 = (cmd) => `powershell -NoProfile -ExecutionPolicy Bypass -File studio_shot.ps1 ${cmd}`;
+  // A blocked script is not attempted again in a loop: the answer is instant and says
+  // what is wrong. `force` (the explicit retry) overrides it.
+  if (!force && ps1BlockedNow()) return ps1BlockedReply();
   try {
     await ensureStudioShotScript();
   } catch (e) {
@@ -1645,6 +1833,9 @@ async function studioWindowShot({ focus = false, focusOnly = false, maxWidth = 1
   const r = await localRun(cmd, 45);
   const raw = String((r && (r.text || r.error)) || "");
   let meta = parseShotMeta(raw);
+  // The antivirus refusing to load the FILE looks like this (seen live): PowerShell
+  // reports it at line 1 char 1 and the script never prints its OR_STUDIO_SHOT line.
+  if (!meta && noteAvBlock(raw)) return Object.assign(ps1BlockedReply(), { command: cmd, text: raw.slice(-400) });
   if (!meta) {
     return { ok: false, error: (raw.slice(-400) || "no answer from the agent (is or-agent.exe running?)"), command: cmd,
              // The script prints EXACTLY ONE OR_STUDIO_SHOT line. Nothing came back, so
@@ -1974,32 +2165,55 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           break;
         }
         // Fill whatever the tool's schema says is required (Studio's screen_capture
-        // wants a capture_id) before the very first call, so the common failure never
-        // happens at all.
-        const pre = fillRequiredArgs(msg.name, msg.arguments);
+        // wants a capture_id AND the CONNECTED studio_id) before the very first call,
+        // so the common failures never happen at all. The studio id is looked up with
+        // list_roblox_studios - an invented one is refused by the server.
+        const pre = await prepareArgs(msg.name, msg.arguments);
         let r = await send(
           { type: "call_tool", name: msg.name, arguments: pre.args, timeout: msg.timeout },
           timeout,
           { connectWait: msg.connectWait }   // a screenshot asks for a short budget
         );
-        // The schema may be missing (an older agent does not forward MCP schemas) or
-        // incomplete. The server's own error names the argument it wanted, so send that
-        // one and try again - ONCE. A second failure is reported with the cause.
+        // One repair, never a loop: the server says what it wanted (a missing argument) or
+        // that the studio id it was given is not connected any more (Studio closed, place
+        // reloaded) - and in that second case the id is looked up again because the error
+        // itself names list_roblox_studios as where the current one lives.
         let filled = pre.filled.slice();
         if (r && r.ok === false) {
-          const miss = missingArgIn(r.error || r.text);
-          if (miss && pre.args[miss] === undefined) {
+          const errText = (r.error || r.text);
+          const miss = missingArgIn(errText);
+          const again = Object.assign({}, pre.args);
+          let changed = false;
+          if (miss && again[miss] === undefined) {
             const schema = mcpSchemaFor(msg.name);
             const props = (schema && schema.properties) || {};
-            const again = Object.assign({}, pre.args);
             again[miss] = valueForArg(miss, props[miss]);
             filled = filled.concat([miss]);
+            changed = true;
+          }
+          if (isStudioIdError(errText)) {
+            // Which argument wants it? The schema says so; when an old agent forwards no
+            // schema, the server's own error names it ("Missing required argument: studio_id"),
+            // and that name is the key - a dummy value can never satisfy it.
+            const key = pre.studioIdKey
+              || (miss && STUDIO_ID_KEY_RE.test(String(miss)) ? miss : "")
+              || studioIdKeyFor(msg.name, {});
+            const fresh = key ? await resolveStudioId(true) : "";
+            if (key && fresh && String(again[key]) !== String(fresh)) {
+              const props = ((mcpSchemaFor(msg.name) || {}).properties) || {};
+              again[key] = coerceArgToSchema(fresh, props[key]);
+              filled = filled.concat([key]);
+              changed = true;
+            }
+          }
+          if (changed) {
             const r2 = await send(
               { type: "call_tool", name: msg.name, arguments: again, timeout: msg.timeout },
               timeout,
               { connectWait: msg.connectWait }
             );
-            r = (r2 && r2.ok) ? r2 : Object.assign({}, r2 || r, { required_arg_missing: miss });
+            r = (r2 && r2.ok) ? r2 : Object.assign({}, r2 || r, { required_arg_missing: miss || undefined });
+            if (r && r.ok === false && isStudioIdError(r.error || r.text)) r.studio_id_stale = true;
           }
         }
         if (filled.length) r = Object.assign({}, r, { filled_args: filled });
@@ -2051,7 +2265,9 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           maxWidth: msg.max_width,
           out: msg.out,
           wholeScreen: msg.whole_screen === true,
+          force: msg.force_ps1 === true,     // the explicit retry after the AV call
         });
+        if (r && r.ok) ps1Block = { why: "", at: 0 };   // the script runs again
         sendResponse(r);
         break;
       }

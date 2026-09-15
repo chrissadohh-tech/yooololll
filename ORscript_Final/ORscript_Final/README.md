@@ -124,10 +124,31 @@ file back as base64 text), or **base64 text** in the answer. If the tool's own s
 with image support; the other two work on the current exe with no rebuild. Whichever way it arrived,
 the answer says so.
 
+**The connected `studio_id` is looked up, never invented.** Studio's `screen_capture` declares
+`capture_id` *and* `studio_id` required, and it refuses a made-up id — "The requested `studio_id` is
+not connected … Call `list_roblox_studios` for the current …". So OR asks `list_roblox_studios` for
+the connected instance and sends *that* id: looked up before the first call, cached for two minutes,
+refreshed once when the server says the id it was given has gone stale. A demand that only appears in
+the error text (an agent that forwards no schemas) is read from the error itself and repaired the same
+way — and any capture tool that wants a studio id gets it, not just the screenshot commands. One
+repair attempt, never a loop.
+
+**Antivirus: the Roblox picture needs no script.** `ViewportScreenshotRoblox` rides the Studio MCP
+only — no `studio_shot.ps1`, no PowerShell, nothing on disk for a script scanner to quarantine. When
+security software *does* block the script ("This script contains malicious content and has been
+blocked by your antivirus software."), OR says so in one line and **stops starting it**: every later
+capture reports the block instantly instead of poking the scanner again. The one route that still
+needs PowerShell is the whole-desktop grab — the last resort of `ViewportScreenshot {}` — and its
+failure message says exactly that.
+
 **The base64 text tunnel.** Handing a file to the browser normally needs the agent's
 `read_file_base64` (1.18.0+). An older `or-agent.exe` — including the prebuilt one in this repo,
-which lists 18 tools and everything but that — still has `read_file` and `run_command`, so
-`studio_shot.ps1` also writes the capture as `<file>.b64` and OR reads it back in chunks of
+which lists 18 tools and everything but that — still has `read_file` and `run_command`, so OR turns
+the capture file into text with **`certutil -encode`** (a signed Windows program — an executable, not
+a script, so no script scanner has a say; `base64` on Linux/macOS) and reads
+that text back in chunks of numbered lines. PowerShell is the second choice now, used only when
+certutil cannot answer — and never at all once the scanner has blocked the script. OR then checks the
+byte count and SHA-256 before attaching anything:
 numbered lines, then checks the byte count and SHA-256 before attaching anything. A picture that
 was cut short or damaged is refused with the reason, never attached silently. Rebuilding the agent
 (`cd agent && cargo build --release`) is therefore an optimisation, not a requirement.

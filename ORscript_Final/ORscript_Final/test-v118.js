@@ -790,8 +790,8 @@ const WIKI_JSON = JSON.stringify({ query: { search: [{ title: "Roblox" }, { titl
     // user a rebuild was required, which is no longer true for those servers.
     ok("a picture-less capture explains the old agent and every route that still works",
        /cannot carry IMAGE DATA/.test(bgSrc) && /named no file and held no base64/.test(bgSrc) &&
-       /The file route still works when the tool saves the shot/.test(bgSrc) &&
-       /and \{target:\\"window\\"\} always works/.test(bgSrc));
+       /NAMES the saved file still works without PowerShell/.test(bgSrc) &&
+       /Studio-window rescue still delivers/.test(bgSrc));
     ok("...and the no-picture note says what WOULD have been convertible",
        /named no image file and contained no base64/.test(bgSrc) && /inlines base64, works/.test(bgSrc));
     ok("an MCP that answers with a PATH is converted into a real attachment",
@@ -1010,15 +1010,55 @@ const WIKI_JSON = JSON.stringify({ query: { search: [{ title: "Roblox" }, { titl
        /Array\.isArray\(schema\.required\)/.test(bgSrc) && /function valueForArg/.test(bgSrc));
     ok("...and the server's own error text is enough for one repair retry",
        /function missingArgIn/.test(bgSrc) && /REQUIRED_ARG_RE/.test(bgSrc) &&
-       /missing required \(\?:argument\|parameter/.test(bgSrc) && /const miss = missingArgIn\(r\.error \|\| r\.text\)/.test(bgSrc));
+       /missing required \(\?:argument\|parameter/.test(bgSrc) &&
+       /const errText = \(r\.error \|\| r\.text\)/.test(bgSrc) && /const miss = missingArgIn\(errText\)/.test(bgSrc));
     ok("...a value is always produced, never an empty string",
        /"or_capture_" \+ Date\.now\(\)\.toString\(36\)/.test(bgSrc) && /s\.enum\[0\]/.test(bgSrc));
     ok("...and the page tells the user which argument was sent",
-       /OR sent a usable value/.test(mainSrc) && /filled_args/.test(bgSrc) && /required_arg_missing/.test(mainSrc));
+       /filled the argument\(s\) the tool requires/.test(mainSrc) && /filled_args/.test(bgSrc) &&
+       /required_arg_missing/.test(mainSrc) && /studio_id_stale/.test(mainSrc));
     ok("screen_capture is no longer called with no arguments at all",
-       /const pre = fillRequiredArgs\(msg\.name, msg\.arguments\)/.test(bgSrc) &&
+       /const pre = await prepareArgs\(msg\.name, msg\.arguments\)/.test(bgSrc) &&
+       /async function prepareArgs\(name, args\)/.test(bgSrc) &&
        /arguments: pre\.args, timeout: msg\.timeout/.test(bgSrc) &&
        !/arguments: msg\.arguments, timeout: msg\.timeout/.test(bgSrc));
+
+    // ── the LIVE studio_id refusal ─────────────────────────────────────────────
+    // "the tool requires capture_id, studio_id" and then "The requested studio_id is not
+    // connected ... Call list_roblox_studios for the current ...". The id is LOOKED UP
+    // where the server says it lives - never invented - and the prompts must not forbid
+    // the very call the server asks for.
+    ok("the connected studio_id is looked up, never invented",
+       /STUDIO_ID_TOOL = "list_roblox_studios"/.test(bgSrc) && /async function resolveStudioId/.test(bgSrc) &&
+       /function studioIdKeyFor/.test(bgSrc) && /function pickStudioId/.test(bgSrc));
+    ok("...a stale id is refreshed once, and a demand made only in the error text is read too",
+       /const STUDIO_ID_ERR_RE/.test(bgSrc) && /await resolveStudioId\(true\)/.test(bgSrc) &&
+       /STUDIO_ID_KEY_RE\.test\(String\(miss\)\)/.test(bgSrc) && /studio_id_stale/.test(bgSrc));
+    ok("...and the page explains a stale id instead of echoing the server's wall",
+       /no Roblox Studio is connected to the MCP right now/.test(mainSrc));
+    ok("...the prompts no longer forbid the tool the server tells them to call",
+       /list_roblox_studios/.test(cfgSrc) && !/do NOT call list_roblox_studios/.test(cfgSrc) &&
+       !/NEVER HALLUCINATE a Studio\/instance ID/.test(cfgSrc) && /CONNECTED id is looked up/.test(cfgSrc));
+    ok("...and the Roblox command's own note says how the id is obtained",
+       /looks that id up itself with list_roblox_studios/.test(cfgSrc) && /no PowerShell and no script file/.test(cfgSrc));
+
+    // ── the antivirus-free hand-over ───────────────────────────────────────────
+    // The user's scanner blocks studio_shot.ps1 OUTRIGHT ("This script contains malicious
+    // content ..."), so the script may never be the automatic rescue: it is detected once,
+    // switched off, and the picture is taken inside Studio over the MCP instead - with a
+    // signed converter (certutil) reading a saved file back when the server names one.
+    ok("a script the antivirus blocks is detected and never started again",
+       /const AV_BLOCK_RE/.test(bgSrc) && /function noteAvBlock/.test(bgSrc) && /av_blocked: true/.test(bgSrc) &&
+       /if \(!force && ps1BlockedNow\(\)\) return ps1BlockedReply\(\);/.test(bgSrc));
+    ok("...and the block reaches the user as one plain line",
+       /blocked by this PC's antivirus/.test(bgSrc) && /Windows Security/.test(bgSrc) && /Win\+Shift\+S/.test(bgSrc));
+    ok("a picture FILE is turned into text WITHOUT PowerShell (signed converter first)",
+       /async function b64FileViaConverter/.test(bgSrc) && /certutil -encode/.test(bgSrc) &&
+       bgSrc.indexOf("await b64FileViaConverter(file)") < bgSrc.indexOf("studio_shot.ps1 -B64Only"));
+    ok("...and the mime type comes from the bytes when the file name lies",
+       /bytes\[0\] === 0x89 && bytes\[1\] === 0x50/.test(bgSrc) && /bytes\[0\] === 0xff && bytes\[1\] === 0xd8/.test(bgSrc));
+    ok("...and no note tells the user to ask for a target that no longer exists",
+       !/\{target:\\"window\\"\}/.test(bgSrc) && !/\{target:\\"auto\\"\}/.test(bgSrc));
     ok("a capture that produced no result line names security software, not a mystery",
        /did not run to completion/.test(bgSrc) && /antivirus/i.test(bgSrc) &&
        /ExecutionPolicy Bypass/.test(bgSrc) && /group policy/i.test(bgSrc));

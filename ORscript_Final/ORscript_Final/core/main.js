@@ -2069,11 +2069,13 @@
         // there. Short wait, so trying is always cheap and we never skip a route that
         // would have worked (the status frame can predate the connection).
         const r = await bg({ type: "call_tool", name: toolName, arguments: {}, timeout: 20000, connectWait: 3000 });
-        // The MCP may demand an argument Studio's capture tools declare as required
-        // (capture_id). The worker fills it - say so, so the user knows what was sent
-        // rather than seeing a bare "capture_id" error they cannot act on.
-        if (r && r.filled_args && r.filled_args.length) notes.push(label + ": the tool requires " + r.filled_args.join(", ") + " - OR sent a usable value");
-        if (r && r.required_arg_missing) notes.push(label + ": the tool still insists on '" + r.required_arg_missing + "' (it rejected the value OR sent) - its schema needs a real " + r.required_arg_missing + ", so fill it in by hand via call_tool");
+        // The MCP demands the arguments its own schema declares required - for Studio's
+        // capture that is a capture_id AND the CONNECTED studio_id (an invented one is
+        // refused by name). The worker fills them, and this says so in plain words
+        // instead of leaving behind a parameter error the user cannot act on.
+        if (r && r.filled_args && r.filled_args.length) notes.push(label + ": filled the argument(s) the tool requires (" + r.filled_args.join(", ") + ") and sent them");
+        if (r && r.required_arg_missing) notes.push(label + ": the tool still insists on '" + r.required_arg_missing + "' after the value OR sent (its schema needs a real one here)");
+        if (r && r.studio_id_stale) notes.push(label + ": no Roblox Studio is connected to the MCP right now - the studio_id the server answers with has gone stale, so open Studio and take the picture again");
         if (takeMcpAnswer(r, label, toolName)) return true;
         // ONE bounded retry, and only when the tool's own schema offers a place to write
         // the picture. This is the last chance for a server whose only answer is an image
@@ -2176,7 +2178,8 @@
           notes.push(label + ": " + (r.text || "captured"));
           return true;
         }
-        notes.push(label + ": " + String((r && r.error) || "capture failed").slice(0, 320));
+notes.push(label + ": " + String((r && r.error) || "capture failed").slice(0, 320) +
+          (r && r.hint ? " [" + String(r.hint).slice(0, 400) + "]" : ""));
       } catch (e) {
         notes.push(label + ": " + String((e && e.message) || e).slice(0, 200));
       }
