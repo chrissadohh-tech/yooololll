@@ -94,7 +94,7 @@ function makeWindow(doc) {
     IntersectionObserver: class { observe() {} disconnect() {} },
     requestIdleCallback: (fn) => setTimeout(fn, 0), cancelIdleCallback: clearTimeout,
     postMessage() {}, open: () => null, focus() {}, scrollTo() {}, getSelection: () => ({ toString: () => "" }),
-    atob, btoa, Blob: class { constructor(p) { this.parts = p; } }, File: class { constructor(p, n, o) { this.parts = p; this.name = n; this.type = (o || {}).type; } },
+    atob, btoa, crypto: require("crypto").webcrypto, Blob: class { constructor(p) { this.parts = p; } }, File: class { constructor(p, n, o) { this.parts = p; this.name = n; this.type = (o || {}).type; } },
     DataTransfer: class { constructor() { this.items = { add() {}, length: 0 }; this.files = []; } },
     ClipboardItem: class { constructor(o) { Object.assign(this, o); } },
     Image: class { set src(_v) {} },
@@ -112,19 +112,171 @@ function makeWindow(doc) {
   return win;
 }
 
+
+// ── a FAKE or-agent.exe ────────────────────────────────────────────────────
+// Deliberately the build the user actually runs: 18 tools, read_file_base64
+// MISSING. It speaks the real bridge protocol ({"type":"tool_result",...}) over a
+// paired in-memory WebSocket, has a virtual workspace, and its read_file numbers
+// lines and CLIPS the reply the way agent/src/workspace.rs does - so the chunked
+// text tunnel is exercised for real, including the self-healing on a clipped page.
+const crypto = require("crypto");
+function makeFakeAgent(opts) {
+  const o = opts || {};
+  const OLD_TOOLS = ["workspace_info", "list_directory", "tree", "read_file", "write_file", "edit_file",
+    "create_folder", "delete_path", "move_path", "search_files", "grep_files", "run_command",
+    "file_info", "env_info", "process_list", "process_kill", "open_path", "download_file"];
+  const clipChars = o.clipChars || 40000;     // MAX_TEXT_CHARS in workspace.rs
+  const files = o.files || Object.create(null);
+  const state = { calls: [], connected: 0 };
+  // A deterministic ~90 KB "JPEG": big enough to need several read_file pages.
+  const shotBytes = Buffer.alloc(90 * 1024);
+  for (let i = 0; i < shotBytes.length; i++) shotBytes[i] = (i * 31 + 7) & 0xff;
+  files["or_studio_window.jpg"] = shotBytes;                       // what the ps1 writes
+  files["or_studio_window.jpg.b64"] = Buffer.from(shotBytes.toString("base64"), "utf8");
+  // Damage the file AT READ TIME: a fresh capture rewrites the .b64 twin, so
+  // corrupting it up front would be silently repaired by the capture itself.
+  const damage = { on: false, hide: false };
+  state.selftestBroken = false;            // PowerShell/GDI failure
+  state.selftestBadRoundtrip = false;      // the script cannot decode its own tunnel text
+  state.maxReadBytes = 0;                 // 0 = no limit; set to model the agent's 2 MB cap
+  state.smallPayload = false;             // true after a -MaxWidth <= 1100 re-capture
+  state.corruptOnRead = () => { damage.on = true; };
+  state.hideB64OnRead = () => { damage.hide = true; };
+  const base = (p) => String(p || "").split(/[\\/]/).pop();
+  const resolve = (p) => { const b = base(p); return files[b] ? b : (files[p] ? p : null); };
+  const reply = (sock, obj) => { try { sock.__toClient(JSON.stringify(obj)); } catch {} };
+  const handle = (sock, msg) => {
+    if (!msg || typeof msg !== "object") return;
+    const { id, type, name, arguments: a } = msg;
+    if (type === "list_tools") { reply(sock, { type: "tools", id, ok: true, tools: OLD_TOOLS.map((n) => ({ name: n })) }); return; }
+    if (type !== "call_tool") return;
+    state.calls.push(name);
+    const okText = (text) => reply(sock, { type: "tool_result", id, ok: true, text });
+    const fail = (error) => reply(sock, { type: "tool_result", id, ok: false, error });
+    if (name === "read_file_base64") { fail("unknown tool: read_file_base64"); return; }   // THE OLD EXE
+    if (name === "write_file") { files[a.path] = Buffer.from(String(a.content || ""), "utf8"); okText("wrote " + a.path); return; }
+    if (name === "run_command" && /-SelfTest/.test(String(a.command || ""))) {
+      const selftest = Buffer.alloc(1500);
+      for (let i = 0; i < selftest.length; i++) selftest[i] = (i * 17 + 3) & 0xff;
+      files["or_shot_selftest.jpg"] = selftest;
+      const b64 = selftest.toString("base64");
+      const body = b64.match(/.{1,400}/g).join("\n") + "\n";
+      files["or_shot_selftest.jpg.b64"] = Buffer.from(body, "utf8");
+      if (state.selftestBroken) { okText("OR_STUDIO_SHOT " + JSON.stringify({ ok: false, selftest: true, error: "self-test failed: A generic error occurred in GDI+" })); return; }
+      okText("OR_STUDIO_SHOT " + JSON.stringify({ ok: true, selftest: true, file: "or_shot_selftest.jpg", bytes: selftest.length, mime: "image/jpeg",
+        base64_file: "or_shot_selftest.jpg.b64", base64_chars: b64.length, base64_lines: b64.length / 400,
+        sha256: crypto.createHash("sha256").update(selftest).digest("hex"), roundtrip_ok: !state.selftestBadRoundtrip, jpeg_ok: true, tunnel_error: "" }));
+      return;
+    }
+    if (name === "run_command" && /9876/.test(String(a.command || ""))) { okText("BLENDER_UP"); return; }   // the Blender addon's port answers
+    if (name === "run_command" && /blender_once\.(py|ps1)/.test(String(a.command || ""))) {
+      const bpng = Buffer.alloc(45 * 1024);
+      for (let i = 0; i < bpng.length; i++) bpng[i] = (i * 7 + 11) & 0xff;
+      files["or_blender_shot.png"] = bpng;
+      files["or_blender_out.json"] = Buffer.from(JSON.stringify({ status: "ok", result: { ok: true, filepath: "or_blender_shot.png", width: 1280, height: 720 } }), "utf8");
+      okText("OR_BLENDER_OK");
+      return;
+    }
+    if (name === "run_command" && /-B64Only/.test(String(a.command || ""))) {
+      const fm = String(a.command || "").match(/-B64Only\s+"?([^"\s]+)"?/);
+      const target = resolve(fm ? fm[1] : "");
+      const data = target ? files[target] : null;
+      if (!data) { okText("OR_STUDIO_SHOT " + JSON.stringify({ ok: false, b64_only: true, error: "no such file: " + target })); return; }
+      const b64 = data.toString("base64");
+      files[target + ".b64"] = Buffer.from(b64.match(/.{1,400}/g).join("\n") + "\n", "utf8");
+      okText("OR_STUDIO_SHOT " + JSON.stringify({ ok: true, b64_only: true, file: target, bytes: data.length, mime: /png$/.test(target) ? "image/png" : "image/jpeg",
+        base64_file: target + ".b64", base64_chars: b64.length, base64_lines: b64.length / 400,
+        sha256: crypto.createHash("sha256").update(data).digest("hex"), tunnel_error: "" }));
+      return;
+    }
+    if (name === "run_command") {
+      const m = String(a.command || "").match(/-Out\s+(\S+)/);
+      const out = m ? m[1].replace(/\.png$/i, ".jpg") : "or_studio_window.jpg";
+      const wm = String(a.command || "").match(/-MaxWidth\s+(\d+)/);
+      if (wm && Number(wm[1]) <= 1100) state.smallPayload = true;      // the retake is smaller
+      const bytes = files[out] || (state.smallPayload ? Buffer.alloc(20 * 1024) : shotBytes);
+      if (state.smallPayload && !files["__small__"]) { files[out] = Buffer.alloc(20 * 1024); files["__small__"] = Buffer.from("x"); }
+      const real = files[out] || bytes;
+      const b64 = real.toString("base64");
+      const lines = [];
+      for (let i = 0; i < b64.length; i += 400) lines.push(b64.slice(i, i + 400));
+      files[out + ".b64"] = Buffer.from(lines.join("\n") + "\n", "utf8");
+      const meta = { ok: true, file: out, bytes: real.length, method: "printwindow", focused: false,
+        window: { process: "RobloxStudioBeta", pid: 4242, width: 1280, height: 800 },
+        base64_file: out + ".b64", base64_chars: b64.length, base64_lines: lines.length,
+        sha256: crypto.createHash("sha256").update(real).digest("hex"), mime: "image/jpeg" };
+      okText("OR_STUDIO_SHOT " + JSON.stringify(meta));
+      return;
+    }
+    if (name === "read_file") {
+      if (damage.hide && /b64$/.test(String(a.path))) { fail("no such file: " + a.path); return; }
+      const key = resolve(a.path);
+      let data = key ? files[key] : null;
+      // The real agent refuses any file over MAX_READ_BYTES (2 MB) with this wording.
+      if (data && state.maxReadBytes && data.length > state.maxReadBytes) {
+        fail("'" + a.path + "' is " + (data.length / 1024).toFixed(1) + " KB - too large to read whole (limit 2.0 MB). Read it in parts with offset/limit if you really need to.");
+        return;
+      }
+      if (!data) { fail("no such file: " + a.path); return; }
+      let all = data.toString("utf8");
+      if (damage.on && /b64$/.test(String(a.path))) {
+        const mid = Math.floor(all.length / 2);
+        all = all.slice(0, mid) + (all[mid] === "A" ? "B" : "A") + all.slice(mid + 1);   // one wrong character
+      }
+      const arr = all.split("\n"); if (arr.length > 1 && arr[arr.length - 1] === "") arr.pop();
+      const start = Math.max(1, Number(a.offset) || 1);
+      const limit = Math.min(4000, Math.max(1, Number(a.limit) || 2000));
+      const page = arr.slice(start - 1, start - 1 + limit);
+      const header = a.path + "  (" + arr.length + " lines)";
+      if (!page.length) { okText(header + "\n(no lines in range " + start + "-" + (start + limit - 1) + ")"); return; }
+      let body = header + "\n" + page.map((l, i) => String(start + i).padStart(5) + " | " + l).join("\n");
+      const end = start - 1 + page.length;
+      if (end < arr.length) body += "\n... lines " + (end + 1) + "-" + arr.length + " continue (use offset=" + (end + 1) + ")";
+      if (body.length > clipChars) body = body.slice(0, clipChars) + "\n... [output truncated at " + clipChars + " characters]";
+      okText(body);
+      return;
+    }
+    if (name === "screen_capture") { okText("screen capture taken (this build drops image blocks)"); return; }
+    if (name === "list_directory") { okText("(1 entry)\n" + Object.keys(files).join("\n")); return; }
+    okText("ok: " + name);
+  };
+  // one paired socket per connection attempt, like a real server
+  state.openSocket = () => {
+    const client = { readyState: 0, onopen: null, onmessage: null, onerror: null, onclose: null,
+      send(str) { let m = null; try { m = JSON.parse(str); } catch {} setTimeout(() => handle(this, m), 0); },
+      close() { this.readyState = 3; } };
+    const toClient = (str) => setTimeout(() => { try { client.onmessage && client.onmessage({ data: str }); } catch {} }, 0);
+    client.__toClient = toClient;
+    setTimeout(() => {
+      client.readyState = 1;
+      try { client.onopen && client.onopen(); } catch {}
+      state.connected++;
+      toClient(JSON.stringify({ type: "connected", workspace_root: "C:\\OR-workspace", tools: OLD_TOOLS.map((n) => ({ name: n })) }));
+    }, 1);
+    return client;
+  };
+  return state;
+}
+
 // ── the bridge: real background.js behind a chrome.runtime mock ─────────────
-function makeBridge() {
+function makeBridge(engine) {
   const listeners = [];
   const chromeStub = {
     runtime: {
       id: "or-test",
       onMessage: { addListener: (fn) => listeners.push(fn) },
+      // Callback form AND promise form: MV3's sendMessage returns a promise when no
+      // callback is passed, and the worker calls .catch() on it in several places.
       sendMessage: (msg, cb) => {
-        const respond = (r) => { try { cb && cb(r); } catch {} };
+        let answer = { ok: false, error: "no background listener" };
+        const respond = (r) => { answer = r === undefined ? { ok: false } : r; try { cb && cb(answer); } catch {} };
         const hit = listeners.find(Boolean);
-        if (!hit) { respond({ ok: false, error: "no background listener" }); return; }
-        try { hit(msg, { tab: { id: 7, url: "https://chat.deepseek.com/", windowId: 1 } }, respond); }
-        catch (e) { respond({ ok: false, error: String(e && e.message || e) }); }
+        if (hit) {
+          try { hit(msg, { tab: { id: 7, url: "https://chat.deepseek.com/", windowId: 1 } }, respond); }
+          catch (e) { respond({ ok: false, error: String(e && e.message || e) }); }
+        }
+        if (typeof cb === "function") return undefined;
+        return Promise.resolve(answer);
       },
       getURL: (p) => "chrome-extension://or-test/" + p,
       getPlatformInfo: () => Promise.resolve({ os: "win", arch: "x86-64" }),
@@ -141,7 +293,11 @@ function makeBridge() {
     alarms: { create() {}, clear: () => Promise.resolve(), onAlarm: { addListener() {} } },
     contextMenus: { create() {}, removeAll: () => Promise.resolve(), onClicked: { addListener() {} } },
     commands: { onCommand: { addListener() {} } },
-    storage: { local: { get: (_k, cb) => { cb && cb({}); return Promise.resolve({}); }, set: () => Promise.resolve(), remove: () => Promise.resolve() }, onChanged: { addListener() {} } },
+    storage: { local: {
+      // The engine lives in storage; "local" is the AgentScript engine backed by
+      // or-agent.exe, which is what the user runs.
+      get: (k, cb) => { const o = (engine === "local" && (k === "rs-engine" || (k && k["rs-engine"] === undefined))) ? { "rs-engine": "local" } : {}; const r = (typeof k === "string" && engine === "local" && k === "rs-engine") ? { "rs-engine": "local" } : {}; const out = Object.keys(r).length ? r : o; if (cb) cb(out); return Promise.resolve(out); },
+      set: () => Promise.resolve(), remove: () => Promise.resolve() }, onChanged: { addListener() {} } },
     tabs: {
       query: () => Promise.resolve([{ id: 7, url: "https://chat.deepseek.com/", title: "OR test chat", windowId: 1 }]),
       sendMessage: () => Promise.resolve(),
@@ -183,22 +339,58 @@ function makeProvider(win, log) {
 // ── load everything ────────────────────────────────────────────────────────
 const skipped = [];
 let ctx = null;
-function build(replies) {
+function build(replies, opts) {
+  const fakeAgent = (opts && opts.fakeAgent) || null;
   const doc = makeDoc();
   const win = makeWindow(doc);
-  const { chromeStub } = makeBridge();
+  const { chromeStub } = makeBridge(opts && opts.engine);
   const log = { attached: [], toasts: [] };
   const sandbox = win;
   sandbox.chrome = chromeStub;
   sandbox.RS = vm.runInNewContext(cfgSrc + "\n;RS;", { window: {}, console });
   sandbox.RSProvider = makeProvider(win, log);
-  sandbox.fetch = async () => { throw new Error("no network in this harness"); };
+  // A packaged extension file must be readable through fetch() (that is how the
+  // worker gets studio_shot.ps1), so serve chrome-extension:// from disk; anything
+  // else still fails - no network here on purpose.
+  sandbox.fetch = async (url) => {
+    const u = String(url);
+    if (u.startsWith("chrome-extension://or-test/")) {
+      const rel = u.replace("chrome-extension://or-test/", "").split("?")[0];
+      const full = path.join(root, rel);
+      if (fs.existsSync(full)) {
+        const buf = fs.readFileSync(full);
+        return { ok: true, status: 200, text: async () => buf.toString("utf8"), json: async () => JSON.parse(buf.toString("utf8")), arrayBuffer: async () => buf.buffer };
+      }
+      return { ok: false, status: 404, text: async () => "", json: async () => ({}) };
+    }
+    throw new Error("no network in this harness");
+  };
   // A real browser fails a loopback WebSocket FAST (connection refused -> onerror),
   // and nothing is listening on the agent port in this sandbox. A stub that never
   // fires onerror would make every agent call sit on its whole timeout, which is a
   // harness artifact, not the product's behaviour.
   sandbox.WebSocket = class {
-    constructor() { this.readyState = 0; setTimeout(() => { this.readyState = 3; try { this.onerror && this.onerror(new Event("error")); } catch {} }, 5); }
+    constructor(url) {
+      // The fake agent lives on the LOCAL ENGINE port only. The bridge socket
+      // (17613) is NOT answered - nothing is listening there in this sandbox - so a
+      // stub that connects everything would fake a Roblox MCP that does not exist.
+      const isLocalEngine = fakeAgent && /:17615\b/.test(String(url || ""));   // PORT_LOCAL: the agent's own socket
+      if (isLocalEngine) {                               // a live (fake) or-agent.exe
+        const sock = fakeAgent.openSocket();
+        this.readyState = 0;
+        Object.defineProperty(this, "onopen", { get: () => sock.onopen, set: (f) => { sock.onopen = f; } });
+        Object.defineProperty(this, "onmessage", { get: () => sock.onmessage, set: (f) => { sock.onmessage = f; } });
+        Object.defineProperty(this, "onerror", { get: () => sock.onerror, set: (f) => { sock.onerror = f; } });
+        Object.defineProperty(this, "onclose", { get: () => sock.onclose, set: (f) => { sock.onclose = f; } });
+        Object.defineProperty(this, "readyState", { get: () => sock.readyState, set: (v) => { sock.readyState = v; } });
+        this.send = (str) => sock.send(str);
+        this.close = () => sock.close();
+        this.addEventListener = () => {}; this.removeEventListener = () => {};
+        return;
+      }
+      this.readyState = 0;
+      setTimeout(() => { this.readyState = 3; try { this.onerror && this.onerror(new Event("error")); } catch {} }, 5);
+    }
     send() {} close() { this.readyState = 3; } addEventListener() {} removeEventListener() {}
   };
   sandbox.chrome = chromeStub;
@@ -304,6 +496,125 @@ const call = async (c, tool, args, ms = 4000) => {
     const claimsImage = /attached to THIS message/i.test(s);
     const hasError = /^ERROR/.test(s);
     ok("a capture claim always comes with an image or an error", hasError || claimsImage, s.slice(0, 200));
+  }
+
+  // ── 5. THE USER'S MACHINE: an or-agent.exe with 18 tools and NO read_file_base64 ──
+  // Everything above ran with no agent at all. These run against a fake agent that
+  // is byte-for-byte the build in the repo root (18 tools, read_file_base64 absent),
+  // over the real bridge protocol, with a real ~90 KB capture in its workspace and a
+  // read_file that clips replies the way the Rust one does. If a screenshot can reach
+  // the browser HERE, it can reach it on the user's machine without any rebuild.
+  {
+    const agent = makeFakeAgent({ clipChars: 20000 });   // clip hard -> forces chunk self-healing
+    let cAgent = null;
+    try {
+      cAgent = build({}, { fakeAgent: agent, engine: "local" }).ctx;
+      ok("main.js loads with a live (old) agent attached", true);
+    } catch (e) {
+      ok("main.js loads with a live (old) agent attached", false, e.message);
+    }
+    if (cAgent) {
+      const recent = () => vm.runInContext("typeof window.__rsRecentImages === 'function' ? window.__rsRecentImages() : []", cAgent);
+      const info = String(await call(cAgent, "agent_info", {}, 15000));
+      ok("agent_info reports the running build truthfully", /RUNNING with 18 tools/.test(info) && /read_file_base64 is missing/i.test(info), info.slice(0, 220));
+      ok("...and says screenshots DO work without a rebuild (text tunnel)", /TEXT TUNNEL/i.test(info) && /Screenshots DO work/i.test(info), info.slice(0, 300));
+      ok("...and scopes the rebuild as optional, not required", /Rebuilding is optional/i.test(info), info.slice(0, 220));
+
+      const shot = String(await call(cAgent, "or_screenshot", { target: "window" }, 40000));
+      ok("or_screenshot {target:window} answers on the OLD agent", !/THREW|__timeout__/.test(shot), shot.slice(0, 200));
+      ok("...it claims the picture arrived", /attached to THIS message/i.test(shot), shot.slice(0, 300));
+      ok("...and names the text tunnel as the delivery route", /text tunnel/i.test(shot), shot.slice(0, 300));
+      const imgs = recent();
+      ok("...and image bytes were really attached (not just a claim)", imgs.length > 0 && String(imgs[0].data || "").length > 1000, JSON.stringify({ n: imgs.length, bytes: String((imgs[0] || {}).data || "").length }));
+      const expected = fs.readFileSync(path.join(root, "or-agent.exe")); // any 90KB payload: compare hashes below instead
+      if (imgs.length) {
+        const got = Buffer.from(String(imgs[0].data || ""), "base64");
+        const want = Buffer.alloc(90 * 1024);
+        for (let i = 0; i < want.length; i++) want[i] = (i * 31 + 7) & 0xff;
+        ok("...the attached picture is EXACTLY the captured bytes", got.length === want.length && crypto.createHash("sha256").update(got).digest("hex") === crypto.createHash("sha256").update(want).digest("hex"),
+           "got " + got.length + " bytes, wanted " + want.length);
+        ok("...and it is labelled as a JPEG (a .png name holding JPEG bytes would lie)", String(imgs[0].mimeType) === "image/jpeg", String(imgs[0].mimeType));
+      }
+      ok("the agent was driven over the real protocol (write_file + run_command + read_file)", agent.calls.includes("write_file") && agent.calls.includes("run_command") && agent.calls.includes("read_file"), agent.calls.join(","));
+      ok("read_file was called in pages (the tunnel really chunks)", agent.calls.filter((n) => n === "read_file").length >= 2, String(agent.calls.filter((n) => n === "read_file").length) + " read_file calls");
+
+      // target "studio" with an old agent: the MCP cannot hand over its image blocks,
+      // so the WINDOW route must take over - that is the case that used to fail.
+      const viaStudio = String(await call(cAgent, "or_screenshot", { target: "studio" }, 40000));
+      ok("or_screenshot {target:studio} still delivers on the OLD agent (window fallback)", /attached to THIS message/i.test(viaStudio), viaStudio.slice(0, 260));
+      const viaAuto = String(await call(cAgent, "or_screenshot", {}, 40000));
+      ok("or_screenshot {target:auto} delivers on the OLD agent", /attached to THIS message/i.test(viaAuto), viaAuto.slice(0, 200));
+
+      // ── and it must REFUSE to attach a damaged picture ──
+      const bad = makeFakeAgent({ clipChars: 20000 });
+      bad.corruptOnRead();
+      const cBad = build({}, { fakeAgent: bad, engine: "local" }).ctx;
+      const badShot = String(await call(cBad, "or_screenshot", { target: "window" }, 40000));
+      const badImgs = vm.runInContext("window.__rsRecentImages()", cBad);
+      ok("a corrupted capture is NOT attached as if it were the screenshot", badImgs.length === 0 && /^ERROR/.test(badShot), badShot.slice(0, 240));
+      ok("...and the failure says the capture itself worked, only the hand-over did not", /could not be read back|damaged|incomplete|checksum/i.test(badShot), badShot.slice(0, 300));
+
+      // ── Blender viewport shot on the OLD agent: the addon writes a PNG, the agent
+      //    cannot read it as base64, so it must travel through the text tunnel. ──
+      {
+        const bl = makeFakeAgent({});
+        const cBl = build({}, { fakeAgent: bl, engine: "local" }).ctx;
+        // teach the worker that Blender is connected, exactly like the UI's Connect Blender
+        await call(cBl, "blender_connect", {}, 20000);
+        const bshot = String(await call(cBl, "or_screenshot", { target: "blender" }, 40000));
+        const bimgs = vm.runInContext("window.__rsRecentImages()", cBl);
+        ok("or_screenshot {target:blender} delivers on the OLD agent (PNG via the tunnel)",
+           /attached to THIS message/i.test(bshot) && bimgs.length === 1, bshot.slice(0, 260));
+        if (bimgs.length) {
+          const got = Buffer.from(String(bimgs[0].data || ""), "base64");
+          const want = Buffer.alloc(45 * 1024);
+          for (let i = 0; i < want.length; i++) want[i] = (i * 7 + 11) & 0xff;
+          ok("...the Blender picture is the exact captured file, labelled PNG",
+             got.length === want.length && crypto.createHash("sha256").update(got).digest("hex") === crypto.createHash("sha256").update(want).digest("hex") && String(bimgs[0].mimeType) === "image/png",
+             JSON.stringify({ n: got.length, mime: bimgs[0].mimeType }));
+        }
+        ok("...and the B64Only twin was requested from the script", bl.calls.some((n) => n === "run_command"), bl.calls.join(","));
+      }
+
+      // ── shot_test: "prove it BEFORE I open Studio" ──
+      const st = String(await call(cAgent, "shot_test", {}, 40000));
+      ok("shot_test proves the path on the old agent (self-test, no Studio open)", /Everything a screenshot needs works/i.test(st), st.slice(0, 260));
+      ok("...it reports each step that passed", /checksum verified/i.test(st) && /script written into the agent workspace/i.test(st), st.slice(0, 260));
+      ok("...and it names the tunnel as the hand-over in use", /TEXT TUNNEL/i.test(st), st.slice(0, 200));
+      for (const alias of ["or_shot_test", "screenshot_test", "test_screenshot"]) {
+        const t2 = String(await call(cAgent, alias, {}, 40000));
+        ok("shot_test alias " + alias + " answers", /Output of 'shot_test'/.test(t2), t2.slice(0, 120));
+      }
+      {
+        const broken = makeFakeAgent({}); broken.selftestBroken = true;
+        const cB = build({}, { fakeAgent: broken, engine: "local" }).ctx;
+        const b = String(await call(cB, "shot_test", {}, 40000));
+        ok("a PowerShell failure is reported as a setup problem, with the reason", /SCREENSHOT PATH BROKEN/.test(b) && /GDI|self-test failed/i.test(b), b.slice(0, 300));
+        ok("...and it says the test needs no Studio window", /needs no Studio window/i.test(b), b.slice(0, 300));
+      }
+      {
+        const badRt = makeFakeAgent({}); badRt.selftestBadRoundtrip = true;
+        const cB = build({}, { fakeAgent: badRt, engine: "local" }).ctx;
+        const b = String(await call(cB, "shot_test", {}, 40000));
+        ok("a broken tunnel format is caught by the self-test", /SCREENSHOT PATH BROKEN/.test(b) && /tunnel format is broken/i.test(b), b.slice(0, 300));
+      }
+
+      // ── a capture too big to read back as text must be RETAKEN smaller ──
+      const big = makeFakeAgent({ clipChars: 20000 });
+      big.maxReadBytes = 60000;                    // the 90 KB image's base64 is ~123 KB -> refused
+      const cBig = build({}, { fakeAgent: big, engine: "local" }).ctx;
+      const bigShot = String(await call(cBig, "or_screenshot", { target: "window" }, 40000));
+      const bigImgs = vm.runInContext("window.__rsRecentImages()", cBig);
+      ok("a capture too big for the agent to read is retaken smaller, not reported as a dead end",
+         /attached to THIS message/i.test(bigShot) && /retaken smaller/i.test(bigShot), bigShot.slice(0, 300));
+      ok("...and the smaller picture really is attached", bigImgs.length === 1 && String(bigImgs[0].data || "").length > 100, JSON.stringify({ n: bigImgs.length, len: String((bigImgs[0] || {}).data || "").length }));
+
+      const gone = makeFakeAgent({ clipChars: 20000 });
+      gone.hideB64OnRead();
+      const cGone = build({}, { fakeAgent: gone, engine: "local" }).ctx;
+      const goneShot = String(await call(cGone, "or_screenshot", { target: "window" }, 40000));
+      ok("a missing tunnel file is reported plainly, never as an empty success", /^ERROR/.test(goneShot) && !/attached to THIS message/i.test(goneShot), goneShot.slice(0, 240));
+    }
   }
 
   console.log("\n" + (failed ? failed + " FAILED" : "all screenshot-path checks passed"));

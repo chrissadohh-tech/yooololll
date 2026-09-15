@@ -1980,7 +1980,12 @@
     };
     const wantStudio = target === "auto" || target === "studio" || target === "roblox" || target === "viewport";
     const wantBlend = target === "auto" || target === "blender" || target === "blender_window";
-    const wantWindow = target === "auto" || target === "window" || target === "studio_window" || target === "os" || target === "desktop";
+    // "studio"/"roblox"/"viewport" fall back to the WINDOW route too: it photographs
+    // Studio itself, and it is the only route that still delivers a picture when the
+    // MCP hands the image over as data blocks an older agent drops. The !shots.length
+    // gate below keeps this a FALLBACK - it never runs on top of a good MCP shot.
+    const wantWindow = target === "auto" || target === "window" || target === "studio_window" || target === "os" || target === "desktop" ||
+      target === "studio" || target === "roblox" || target === "viewport";
     const wantTab = target === "tab" || target === "chat" || target === "page" || target === "self";
     // Which servers does the bridge say are alive? Attempting a tool on a server
     // that is NOT there burns the whole timeout (the 11s stall the user saw) and
@@ -1997,29 +2002,39 @@
     // normally known. If it is not known yet, ask ONCE (a local, ~ms round-trip)
     // rather than burning a 20s bridge-connect wait on a screenshot request.
     let bridgeUp = !!(A.bridge && (A.bridge.connected || A.bridge.local_connected || (Array.isArray(A.bridge.servers) && A.bridge.servers.length)));
+    // "Unknown" (no status yet) must TRY - a screenshot request is worth one attempt -
+    // but a state that definitely says nothing is connected should not sit through a
+    // bridge-connect wait first. Declared HERE, above every reader: a late declaration
+    // is the temporal-dead-zone crash this file already suffered once.
+    let definitelyDown = false;
     if (!A.bridge) {
       try {
         const st = await bg({ type: "status" });
         if (st) { A.bridge = st; bridgeUp = !!(st.connected || st.local_connected || (Array.isArray(st.servers) && st.servers.length)); }
       } catch {}
     }
-    if (!bridgeUp) {
-      notes.push("no local connection: or-agent.exe / the bridge is not connected, so no Studio or Blender capture can be taken" +
-        (A.bridge ? "" : " (bridge state unknown - the worker did not answer)") + " - start it with Start-OR-Agent.cmd, then retry");
-    }
+    definitelyDown = !!A.bridge && !bridgeUp;
+    // Held back until we know nothing worked: the agent routes below can still
+    // succeed (a live local engine answers on its own socket even when the bridge
+    // frame says otherwise), and a stale "nothing is connected" note next to a
+    // good picture would be worse than no note.
+    const noConnNote = !definitelyDown ? "" : ("no local connection: or-agent.exe / the bridge is not connected, so no Studio or Blender capture can be taken" +
+      (A.bridge ? "" : " (bridge state unknown - the worker did not answer)") + " - start it with Start-OR-Agent.cmd, then retry");
     const roster = Array.isArray(A.toolList) ? A.toolList : [];
     const hasTool = (t) => !roster.length || roster.some((x) => bareToolName(x && (x.name || x.id)) === t);
     const studioUp = serverUp("roblox") !== false && serverUp("studio") !== false;
     if (wantStudio) {
-      if (!bridgeUp) notes.push("studio: skipped - there is no live agent/bridge connection for the Roblox MCP to ride on");
+      if (definitelyDown) notes.push("studio: skipped - the bridge reports no live connection for the Roblox MCP to ride on");
       else if (!studioUp) notes.push("studio: the Roblox MCP is NOT alive (bridge reports the server down) - skipped the call");
       else if (!hasTool("screen_capture")) notes.push("studio: the MCP advertises no screen_capture tool right now (0 tools listed) - skipped the call; run list_commands / restart_mcp");
       else await tryMcp("screen_capture", "studio");
     }
     if (wantBlend && !shots.length) {
-      if (!bridgeUp) notes.push("blender: skipped - no live agent/bridge connection");
-      else if (A.bridge && A.bridge.blender) await tryMcp("get_viewport_screenshot", "blender");
-      else notes.push("blender: not connected - skipped");
+      // A.bridge.blender is set from the agent's own probe, so it already implies the
+      // agent is reachable; gating this on the aggregate bridge flag only added a way
+      // to skip a working Blender when that flag was stale.
+      if (A.bridge && A.bridge.blender) await tryMcp("get_viewport_screenshot", "blender");
+      else notes.push("blender: not connected - skipped (Connect Blender in the OR panel first)");
     }
     // OS-side fallback: photograph the Studio WINDOW itself (agent + PowerShell).
     // Works while Studio is behind the browser, so it is a better fallback than a
@@ -2067,12 +2082,16 @@
     // so Studio's screenshot arrives as an empty string and every image path fails
     // - including the file readback the Blender-style fallbacks depend on.
     if (!shots.length) {
+      if (noConnNote) notes.push(noConnNote);
       try {
         const info = await bg({ type: "agent_info" });
         if (info && info.has_base64 === false) {
-          notes.push("AGENT OUTDATED: or-agent.exe lists " + info.tools + " tools and cannot hand the browser a file " +
-            "(read_file_base64 is missing), so NO screenshot can reach you from any target. Rebuild it: cd agent && cargo build --release, " +
-            "copy target/release/or-agent.exe over the old one, restart it, then retry. Until then ask for text output instead.");
+          const tunnel = info.has_read_file !== false && info.has_run_command !== false;
+          notes.push("AGENT IS ONE TOOL OLD: or-agent.exe lists " + info.tools + " tools and has no read_file_base64, so the MCP's own image " +
+            "blocks cannot be handed over" +
+            (tunnel
+              ? '. The WINDOW route still works without a rebuild: it writes the capture next to the agent and reads it back as base64 TEXT with read_file - use {target:"window"} or {target:"auto"}. Rebuilding (cd agent && cargo build --release, copy target/release/or-agent.exe over the old one, restart it) only makes it faster and enables the MCP image path.'
+              : ", and this agent is too old to read the file back as text either (read_file/run_command missing), so rebuild it to get any screenshot."));
         } else if (info && info.ok === false) {
           notes.push("AGENT OFFLINE: or-agent.exe is not running (" + (info.reason || "no answer") + "), so the OS-side Studio window capture and file readback are unavailable.");
         }
@@ -2090,6 +2109,9 @@
   // It grants nothing the loop does not already have - it IS the loop's own
   // dispatcher - and it makes screenshot paths testable without a live chat.
   try { window.__rsRunTool = (name, args) => runTool({ tool: name, arguments: args || {} }); } catch {}
+  // What did OR actually attach? Lets a test (or the user in DevTools) confirm a
+  // screenshot really carries image bytes instead of only reading a claim.
+  try { window.__rsRecentImages = () => (A.recentImages || []).map((x) => ({ mimeType: x.mimeType, data: x.data, at: x.at, source: x.source })); } catch {}
 
   async function runTool(call) {
     let name = call.tool;
@@ -2336,6 +2358,47 @@
       const brief = briefs[role] || briefs.builder;
       return "Output of 'or_agent':\nROLE=" + role + "\n" + brief + "\nTASK: " + (task || "(continue the user's request)") + "\nReply as this agent only. ONE command.";
     }
+    // ── shot_test: does the screenshot machinery work on THIS machine, right now?
+    // Runs before the user ever opens Studio: the capture script builds a tiny test
+    // picture, writes the base64 twin, and the extension pulls it back through the
+    // same hand-over a real screenshot uses and verifies the checksum. If this says
+    // OK, or_screenshot has everything it needs except an open Studio window.
+    if (name === "shot_test" || name === "or_shot_test" || name === "screenshot_test" || name === "test_screenshot") {
+      let r = null;
+      try { r = await bg({ type: "shot_test" }); } catch (e) { r = { ok: false, error: String((e && e.message) || e) }; }
+      if (r && r.ok) {
+        ui.toast("Screenshot machinery OK — the picture reached OR and passed its checksum.", 6000);
+        return "Output of 'shot_test':\n" + String(r.text || "OK") +
+          "\nNext: open Roblox Studio and call or_screenshot {target:\"window\"} (or {target:\"auto\"}).";
+      }
+      return "Output of 'shot_test':\nSCREENSHOT PATH BROKEN: " + String((r && r.error) || "the check did not answer") +
+        "\nSteps that DID pass: " + (((r && r.steps) || []).join("; ") || "none") +
+        "\nThis is a setup problem, not a Studio problem - the test needs no Studio window. Fix the reason above, then run shot_test again.";
+    }
+    // ── agent_info: "which or-agent.exe am I talking to, and can a screenshot
+    // really arrive?" One command that answers the question the screenshot errors
+    // dance around, WITHOUT taking a capture first.
+    if (name === "agent_info" || name === "or_agent_info" || name === "agent_status") {
+      let info = null;
+      try { info = await bg({ type: "agent_info" }); } catch (e) { info = { ok: false, reason: String((e && e.message) || e) }; }
+      if (!info || info.ok === false && info.tools == null) {
+        return "Output of 'agent_info':\nAGENT OFFLINE: " + ((info && info.reason) || "or-agent.exe did not answer") +
+          "\nStart it with Start-OR-Agent.cmd (or the exe in the repo root). Until then: no window capture, no file readback, and no Studio/Blender images - " +
+          "only a TAB capture (or_screenshot {target:\"tab\"}) can work, and only on an ordinary http/https page.";
+      }
+      const tunnel = info.has_read_file !== false && info.has_run_command !== false;
+      const lines = [
+        "Output of 'agent_info':",
+        "or-agent.exe is RUNNING with " + info.tools + " tools" + (info.workspace_root ? " (workspace: " + info.workspace_root + ")" : "") + ".",
+        info.has_base64
+          ? "Picture hand-over: FAST PATH - read_file_base64 is present, so any capture file can be read back in ONE call (MCP screen_capture and the Studio-window capture both work)."
+          : (tunnel
+            ? "Picture hand-over: TEXT TUNNEL - read_file_base64 is missing (this is the build you have), so a capture is written next to the agent and read back as BASE64 TEXT in chunks. Screenshots DO work: use or_screenshot {target:\"window\"} or {target:\"auto\"}. The MCP's own image blocks cannot be used by this build."
+            : "Picture hand-over: NONE - this agent has neither read_file_base64 nor read_file/run_command, so no screenshot can reach the browser. Rebuild: cd agent && cargo build --release, copy target/release/or-agent.exe over the old one, restart it."),
+        info.has_base64 ? "Rebuild not needed." : (tunnel ? "Rebuilding is optional - it only makes the hand-over faster and enables the MCP image path." : "Rebuilding is required."),
+      ];
+      return lines.join("\n");
+    }
     if (name === "or_status" || name === "status") {
       let extra = false, plan = false, lvl = "default", wm = "balanced", perm = "sandbox", autoDbg = true, multi = false;
       try { extra = !!(window.__rsExtraThinking && window.__rsExtraThinking()); } catch {}
@@ -2447,7 +2510,7 @@
       const animLines = requested === "roblox" ? RSAnim.describeCommands() : [];
       const skillLines = (requested === "roblox" && typeof RobloxScriptSkills !== "undefined") ? RobloxScriptSkills.describeCommands() : [];
       const agentLines = (requested === "local" && typeof AgentScriptSkills !== "undefined") ? AgentScriptSkills.describeCommands() : [];
-      const webLines = [`— OR Status: or_status {} — live engine, work mode, extra thinking, bridge, blender. Call this if you are unsure which mode you are in.`, `— Web Tools (bridge-level, no Studio needed): web_fetch {url?, query?, max_chars?} — fetch a URL, OR pass query to search the web then fetch the top result; web_search {query, limit?} — DuckDuckGo titles+URLs`, `— Screenshot: or_screenshot {target?: auto|studio|tab|blender} — take a screenshot of Studio, this chat tab, or Blender and attach it to your next message so you can see it. Aliases: screenshot, take_screenshot, send_screenshot.`, `— Studio window: or_focus_studio {} — bring the Roblox Studio window to the front on Windows (steals focus, so it is opt-in). or_screenshot {target:"window"} photographs that window straight through the agent, which works even when the browser is in front.`, `— Attach images: attach_feedback {index?, path?, source?, copy?, paste?, send?} — re-send the most recent screenshot (or any workspace file via path) as an attachment on this message and copy it to the clipboard so the user can paste it. Aliases: attachfeedbackor, attach_image, attach_file, attach_screenshot, attach_last_screenshot, attach_recent_image, copy_screenshot, paste_screenshot.`, `— Debugger: or_debug {} — Studio LogService errors/warnings. Automatic Debugger (Settings) appends new errors after mutating commands.`, `— Multi-Agent: or_agent {role: planner|builder|reviewer|debugger, task?} — hand off to a specialist. Enable Multi-Agent in Settings.`, `— Developer Products: developer_product_create {name, price, description?, reward?} — create a real Roblox Developer Product on this published universe (sign into roblox.com in Chrome). developer_product_list {} lists them. Aliases: create_developer_product, create_dev_product.`];
+      const webLines = [`— OR Status: or_status {} — live engine, work mode, extra thinking, bridge, blender. Call this if you are unsure which mode you are in.`, `— Web Tools (bridge-level, no Studio needed): web_fetch {url?, query?, max_chars?} — fetch a URL, OR pass query to search the web then fetch the top result; web_search {query, limit?} — DuckDuckGo titles+URLs`, `— Screenshot check: shot_test {} — proves the capture + hand-over works on this machine WITHOUT Studio being open (writes a test picture, reads it back, verifies the checksum). Run this first if a screenshot ever fails. Aliases: or_shot_test, screenshot_test, test_screenshot. `, `— Screenshot: or_screenshot {target?: auto|studio|tab|blender} — take a screenshot of Studio, this chat tab, or Blender and attach it to your next message so you can see it. Aliases: screenshot, take_screenshot, send_screenshot.`, `— Studio window: or_focus_studio {} — bring the Roblox Studio window to the front on Windows (steals focus, so it is opt-in). or_screenshot {target:"window"} photographs that window straight through the agent, which works even when the browser is in front.`, `— Attach images: attach_feedback {index?, path?, source?, copy?, paste?, send?} — re-send the most recent screenshot (or any workspace file via path) as an attachment on this message and copy it to the clipboard so the user can paste it. Aliases: attachfeedbackor, attach_image, attach_file, attach_screenshot, attach_last_screenshot, attach_recent_image, copy_screenshot, paste_screenshot.`, `— Agent check: agent_info {} — is or-agent.exe running, which build is it, and can a screenshot actually reach you (one-call file readback vs the base64 text tunnel vs nothing, plus the one thing to do about it). Aliases: or_agent_info, agent_status. `, `— Debugger: or_debug {} — Studio LogService errors/warnings. Automatic Debugger (Settings) appends new errors after mutating commands.`, `— Multi-Agent: or_agent {role: planner|builder|reviewer|debugger, task?} — hand off to a specialist. Enable Multi-Agent in Settings.`, `— Developer Products: developer_product_create {name, price, description?, reward?} — create a real Roblox Developer Product on this published universe (sign into roblox.com in Chrome). developer_product_list {} lists them. Aliases: create_developer_product, create_dev_product.`];
       const virtualCount = animLines.length + skillLines.length + agentLines.length + webLines.length;
       return `Output of '${name}':\n${requested} commands (${scoped.length}${virtualCount ?  ` + ${virtualCount} OR virtual tools` : ""}):\n\n${lines.join("\n\n")}${animLines.length ?  "\n\n" + animLines.join("\n\n") : ""}${skillLines.length ?  "\n\n" + skillLines.join("\n\n") : ""}${agentLines.length ?  "\n\n" + agentLines.join("\n\n") : ""}\n\n${webLines.join("\n")}`;
     }

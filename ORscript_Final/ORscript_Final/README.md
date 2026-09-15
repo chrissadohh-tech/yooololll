@@ -70,6 +70,28 @@ all 14 targets, `screenshot` / `take_screenshot` / `send_screenshot`, `attach_fe
 broke every screenshot with `Cannot access 'RECENT_IMAGES_MAX' before initialization` shows up here
 in under a second, where `node --check` cannot see it. It checks HTTP `:3000` and WS `17613` / `17615` (no Unreal port).
 
+## Screenshots (and what needs what)
+
+Check the machinery before blaming a command: **`shot_test {}`** writes a small test picture
+through the capture script, reads it back exactly the way a real screenshot is handed over, and
+verifies the checksum. It needs no Studio window. `agent_info {}` reports which `or-agent.exe`
+is running and which hand-over is in use.
+
+| route | needs | notes |
+| --- | --- | --- |
+| `or_screenshot {target:"window"}` | or-agent.exe running, Studio open | photographs the Studio **window** — no Roblox MCP, no page permission, works while the browser is in front |
+| `or_screenshot {target:"auto"}` | best of the above | Studio MCP → Blender → Studio window → tab |
+| `or_screenshot {target:"tab"}` | an ordinary http/https page in front | `chrome://`, the New Tab page and PDFs can never be captured |
+| `or_screenshot {target:"studio"}` (MCP) | Roblox MCP + an agent new enough to carry **image blocks** | with an older agent this falls back to the window route automatically |
+
+**The base64 text tunnel.** Handing a file to the browser normally needs the agent's
+`read_file_base64` (1.18.0+). An older `or-agent.exe` — including the prebuilt one in this repo,
+which lists 18 tools and everything but that — still has `read_file` and `run_command`, so
+`studio_shot.ps1` also writes the capture as `<file>.b64` and OR reads it back in chunks of
+numbered lines, then checks the byte count and SHA-256 before attaching anything. A picture that
+was cut short or damaged is refused with the reason, never attached silently. Rebuilding the agent
+(`cd agent && cargo build --release`) is therefore an optimisation, not a requirement.
+
 ## Privacy
 
 Everything runs locally. The extension talks only to `127.0.0.1`. No telemetry. AgentScript stays inside the workspace root unless you flip FULL ACCESS.

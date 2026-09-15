@@ -21,6 +21,7 @@ const ok = (name, cond, extra) => {
 
 const root = __dirname;
 const bgSrc = fs.readFileSync(path.join(root, "background.js"), "utf8");
+const ps1Src = fs.readFileSync(path.join(root, "studio_shot.ps1"), "utf8");
 const mainSrc = fs.readFileSync(path.join(root, "core/main.js"), "utf8");
 const cfgSrc = fs.readFileSync(path.join(root, "core/config.js"), "utf8");
 const pySrc = fs.readFileSync(path.join(root, "blender_ops.py"), "utf8");
@@ -719,7 +720,29 @@ const WIKI_JSON = JSON.stringify({ query: { search: [{ title: "Roblox" }, { titl
     ok("Blender is only attempted when connected", /A\.bridge && A\.bridge\.blender\) await tryMcp\("get_viewport_screenshot"/.test(mainSrc));
     // agent version diagnosis
     ok("the failure asks the agent what it supports", /type: "agent_info"/.test(mainSrc));
-    ok("an outdated agent produces a REBUILD instruction", /AGENT OUTDATED/.test(mainSrc) && /cargo build --release/.test(mainSrc));
+    // An agent that is only missing read_file_base64 is NOT useless any more: the
+    // capture is handed over as base64 TEXT, so the note must say what still works
+    // (and keep the rebuild as the optional upgrade).
+    ok("a one-tool-old agent is described as usable, not broken", /AGENT IS ONE TOOL OLD/.test(mainSrc) && /WINDOW route still works without a rebuild/.test(mainSrc));
+    ok("...and the rebuild is still spelled out for the no-tunnel case", /cargo build --release/.test(mainSrc) && /read_file\/run_command missing/.test(mainSrc));
+    ok("the tunnel needs read_file + run_command, reported by the worker", /has_read_file/.test(bgSrc) && /has_run_command/.test(bgSrc));
+    ok("the text tunnel reads numbered read_file pages", /name: "read_file"/.test(bgSrc) && /output truncated at/.test(bgSrc));
+    ok("...and re-reads a clipped page at a smaller size instead of trusting it", /linesPerCall = Math\.max\(4, Math\.floor\(linesPerCall \/ 2\)\)/.test(bgSrc));
+    ok("a damaged picture is refused, never attached", /checksum mismatch/.test(bgSrc) && /the picture arrived incomplete/.test(bgSrc) && /the capture text is incomplete/.test(bgSrc));
+    ok("the capture script writes a base64 twin for the tunnel", /ToBase64String/.test(ps1Src) && /base64_file/.test(ps1Src));
+    {
+      const tunnelFn = ps1Src.split("function Write-B64File")[1] || "";
+      ok("...with LF-only line endings (a stray CR would land inside the base64)",
+         /Append\("`n"\)/.test(tunnelFn) && !/Append\("`r`n"\)/.test(tunnelFn) && /WriteAllText/.test(tunnelFn));
+    }
+    ok("agent_info is a real command, not just an internal message", /name === "agent_info"/.test(mainSrc) && /or_agent_info/.test(mainSrc));
+    ok("...and a self-test command exists that needs no Studio window", /name === "shot_test"/.test(mainSrc) && /case "shot_test"/.test(bgSrc) && /-SelfTest/.test(ps1Src));
+    ok("the self-test reads its picture back through the same hand-over", /shot_test/.test(bgSrc) && /tunnelReadImage|localReadBase64/.test(bgSrc) && /checksum verified/.test(bgSrc));
+    ok("an existing file (Blender's PNG) can be tunnelled too", /-B64Only/.test(ps1Src) && /tunnelReadImage\(shotPath/.test(bgSrc));
+    ok("a file too big for text is retaken smaller, not reported as a dead end", /retaken smaller at/.test(bgSrc));
+    // the engine read must not touch bindings declared later in the file (TDZ crash)
+    ok("the startup storage read is deferred, so it cannot hit a temporal dead zone", /Promise\.resolve\(\)\.then\(\(\) => chrome\.storage\?\.local\.get\(ENGINE_KEY/.test(bgSrc));
+    ok("...and it is advertised in the tool list", /Agent check: agent_info \{\}/.test(mainSrc));
     ok("an offline agent is named too", /AGENT OFFLINE/.test(mainSrc));
     ok("the window target is described as the Blender-style route", /Blender-style route/.test(mainSrc));
 

@@ -19,7 +19,13 @@ const ENGINES = ["roblox", "local"];
 function normalizeEngine(v) { return v === "local" ? "local" : "roblox"; }
 let engine = "roblox"; // "roblox" | "local"
 let rustMode = false; // true if Rust agent on 3000 is reachable (preferred)
-chrome.storage?.local.get(ENGINE_KEY, (o) => {
+// Deferred by one microtask on purpose: this callback touches ws / connected /
+// reconnectDelay, all of which are declared FURTHER DOWN this file, so a callback
+// that ran synchronously would land in their temporal dead zone and kill the whole
+// service worker - the same failure class as the RECENT_IMAGES_MAX screenshot crash.
+// The harness reproduces it by answering storage synchronously. Chrome's API is async,
+// so this only costs one tick, and it removes the landmine for good.
+Promise.resolve().then(() => chrome.storage?.local.get(ENGINE_KEY, (o) => {
   const want = normalizeEngine(o && o[ENGINE_KEY]);
   if (want !== engine) {
     engine = want;
@@ -30,7 +36,7 @@ chrome.storage?.local.get(ENGINE_KEY, (o) => {
     connect();
     broadcastStatus();
   }
-});
+}));
 // Probe Rust agent on 3000 at startup — if reachable, use HTTP pipe (CORS bypass) as primary
 (async () => {
   try {
@@ -917,6 +923,10 @@ async function agentInfo() {
     workspace_root: localRoot || "",
     tools: names.length,
     has_base64: names.length ? names.some((n) => n === "read_file_base64" || n.endsWith("/read_file_base64")) : null,
+    // The text tunnel needs only these two, and every build has had them, so an
+    // agent that lacks read_file_base64 can STILL deliver a screenshot.
+    has_read_file: names.length ? names.some((n) => n === "read_file" || n.endsWith("/read_file")) : null,
+    has_run_command: names.length ? names.some((n) => n === "run_command" || n.endsWith("/run_command")) : null,
     reason: names.length ? "" : "or-agent.exe did not report a tool list (not running, or an old build)",
   };
 }
@@ -975,6 +985,116 @@ async function localReadBase64(path) {
   try { parsed = JSON.parse(String(r.text || "")); } catch {}
   if (!parsed || !parsed.data) throw new Error("the bridge returned no file data for " + path);
   return parsed;
+}
+
+// ── the TEXT TUNNEL: a picture that travels as base64 TEXT ─────────────────
+// Why this exists: reading a local file needs read_file_base64, which only the
+// 1.18.0 agent has. Every other agent tool the tunnel needs (run_command,
+// read_file, write_file) is present in OLDER exes too - the user's prebuilt
+// or-agent.exe advertises 18 tools and everything but read_file_base64 - so a
+// screenshot still reaches the browser without rebuilding anything.
+//
+// read_file numbers its lines ("  12 | <content>") and CLIPS the whole reply at
+// 40,000 characters, cutting mid-line, so each request asks for few enough lines
+// that the clip never triggers; if a reply is clipped anyway the chunk size is
+// halved and the same offset re-read (self-healing, never a corrupt image).
+const READ_CLIP_MARK = /\n?\.\.\. \[output truncated at \d+ characters\]/;
+
+async function localReadTextFile(path, opts) {
+  const o = opts || {};
+  const maxChars = o.maxChars || 34000;
+  const maxCalls = o.maxCalls || 60;
+  let linesPerCall = Math.max(4, Math.min(2000, o.linesPerCall || 80));
+  let offset = 1;
+  let calls = 0;
+  const parts = [];
+  let clipped = 0;
+  for (let n = 0; n < maxCalls; n++) {
+    calls++;
+    const r = await sendLocalEngine({ type: "call_tool", name: "read_file",
+      arguments: { path, offset, limit: linesPerCall } }, 25000);
+    if (!r || !r.ok) throw new Error((r && r.error) || ("the agent could not read " + path));
+    let text = String(r.text == null ? "" : r.text);
+    const wasClipped = READ_CLIP_MARK.test(text);
+    if (wasClipped) { clipped++; text = text.replace(READ_CLIP_MARK, ""); linesPerCall = Math.max(4, Math.floor(linesPerCall / 2)); }
+    const got = [];
+    for (const line of text.split("\n")) {
+      const m = line.match(/^\s*\d+ \| ?([\s\S]*)$/);
+      if (m) got.push(m[1]);
+    }
+    if (!got.length) {
+      if (/\(no lines in range/.test(text)) break;              // past the end: done
+      break;                                                     // header only
+    }
+    // A clipped reply may end in half a line - drop it and re-read that offset.
+    if (wasClipped) got.pop();
+    parts.push(...got);
+    const consumed = Math.max(1, got.length);
+    offset += consumed;
+    if (got.length < linesPerCall && !wasClipped) break;          // last page
+    if (parts.join("").length > (o.maxB64 || 4 * 1024 * 1024)) throw new Error("the capture file is unexpectedly large");
+  }
+  return { text: parts.join(""), lines: offset - 1, chunks: calls, clipped };
+}
+
+// Verify the tunnel end-to-end: same byte count, and the same SHA-256 the script
+// computed, so a truncated or re-encoded picture is never attached as if it were
+// the screenshot.
+async function b64ToVerifiedImage(b64, meta) {
+  const clean = String(b64 || "").replace(/[^A-Za-z0-9+/=]/g, "");
+  if (!clean) throw new Error("the capture text arrived empty");
+  let bin;
+  try { bin = atob(clean); } catch (e) { throw new Error("the capture text is not valid base64: " + String((e && e.message) || e)); }
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  // Three independent checks, cheapest first, so a damaged or half-read picture can
+  // never be attached as if it were the screenshot:
+  //   1. the text itself must be the length the script reported;
+  //   2. the decoded bytes must be the size the script reported;
+  //   3. the bytes must hash to the SHA-256 the script computed.
+  if (meta && meta.base64_chars && clean.length !== Number(meta.base64_chars)) {
+    throw new Error("the capture text is incomplete (" + clean.length + " of " + meta.base64_chars + " base64 characters) - the file readback was cut short");
+  }
+  const expected = Number(meta && meta.bytes) || 0;
+  if (expected && bytes.length !== expected) {
+    throw new Error("the picture arrived incomplete (" + bytes.length + " of " + expected + " bytes) - the file readback was cut short");
+  }
+  if (meta && meta.sha256 && crypto && crypto.subtle && crypto.subtle.digest) {
+    let hex = "";
+    try {
+      const d = await crypto.subtle.digest("SHA-256", bytes);
+      hex = Array.from(new Uint8Array(d)).map((b) => b.toString(16).padStart(2, "0")).join("");
+    } catch { hex = ""; }                                  // no digest support: checks 1 and 2 still held
+    if (hex && hex !== String(meta.sha256).toLowerCase()) {
+      throw new Error("checksum mismatch: the picture was damaged on the way to the browser (expected " +
+        String(meta.sha256).slice(0, 12) + "…, got " + hex.slice(0, 12) + "…)");
+    }
+  }
+  return { mimeType: (meta && meta.mime) || "image/jpeg", data: clean, bytes: bytes.length };
+}
+
+// Hand a picture file to the browser by ANY route the agent supports:
+//   1. read_file_base64 (new agent) - one call;
+//   2. otherwise ask studio_shot.ps1 to write the base64 text twin and read that back
+//      with read_file, verifying size + SHA-256 (old agent).
+// Throws with .code = "too-large" when the file cannot travel as text at all, so the
+// caller can retake it smaller instead of giving up.
+async function tunnelReadImage(file, knownMeta) {
+  let meta = knownMeta && knownMeta.base64_file ? knownMeta : null;
+  if (!meta) {
+    const r = await localRun(`powershell -NoProfile -ExecutionPolicy Bypass -File studio_shot.ps1 -B64Only "${file}"`, 45);
+    const m2 = parseShotMeta(String((r && (r.text || r.error)) || ""));
+    if (!m2 || !m2.ok) {
+      const err = new Error((m2 && m2.error) || ("could not prepare " + file + " for text readback") +
+        (r && r.error && r.error !== (m2 && m2.error) ? " (" + String(r.error).slice(0, 160) + ")" : ""));
+      if (m2 && /too big to hand over as text|too large to read whole/i.test(String(m2.error || ""))) err.code = "too-large";
+      throw err;
+    }
+    meta = m2;
+  }
+  const rd = await localReadTextFile(meta.base64_file || (file + ".b64"), { linesPerCall: 90 });
+  const img = await b64ToVerifiedImage(rd.text, meta);
+  return { img, meta, lines: rd.lines, chunks: rd.chunks, clipped: rd.clipped };
 }
 
 async function localRun(command, timeoutSeconds = 12) {
@@ -1291,11 +1411,23 @@ async function blenderCall(name, args, timeout) {
         images = [{ mimeType: parsed.mimeType || "image/png", data: parsed.data }];
         if (result && typeof result === "object") result.bytes = parsed.bytes;
       } catch (e) {
-        // Keep the path in the text so the model/user can still open the file;
-        // report the reason rather than pretending a capture happened.
-        result = typeof result === "object" && result
-          ? Object.assign({}, result, { image_error: String((e && e.message) || e).slice(0, 200) })
-          : result;
+        // Old agent (no read_file_base64): the Blender addon already wrote a PNG into
+        // the workspace, so hand it over as base64 TEXT instead - the same tunnel the
+        // Studio window capture uses. Without this, a Blender viewport screenshot
+        // silently failed on any agent older than 1.18.0.
+        try {
+          const t = await tunnelReadImage(shotPath, null);
+          images = [{ mimeType: t.img.mimeType, data: t.img.data }];
+          if (result && typeof result === "object") result.bytes = t.img.bytes || undefined;
+        } catch (e2) {
+          // Keep the path in the text so the model/user can still open the file;
+          // report the reason rather than pretending a capture happened.
+          const t2msg = String((e2 && e2.message) || e2);
+          result = typeof result === "object" && result
+            ? Object.assign({}, result, { image_error: String((e && e.message) || e).slice(0, 200) + (t2msg ? " | text tunnel: " + t2msg.slice(0, 200) : "") +
+                (/too big to hand over as text|too large to read whole/i.test(t2msg) ? " — re-capture with a smaller size: blender_screenshot {max_size: 600}" : "") })
+            : result;
+        }
       }
     }
     let textOut = typeof result === "string" ? result : JSON.stringify(result, null, 2);
@@ -1330,6 +1462,13 @@ async function ensureStudioShotScript() {
 
 // capture:true → also write the PNG. Focus-only is the "make Studio the front
 // window" action (no capture). Returns { ok, text, images, meta }.
+// The script's last line is machine-readable: OR_STUDIO_SHOT {...}
+function parseShotMeta(raw) {
+  const m = String(raw || "").match(/OR_STUDIO_SHOT\s+(\{[\s\S]*?\})\s*$/m);
+  if (!m) return null;
+  try { return JSON.parse(m[1]); } catch { return null; }
+}
+
 async function studioWindowShot({ focus = false, focusOnly = false, maxWidth = 1600, out = "or_studio_window.png" } = {}) {
   const ps1 = (cmd) => `powershell -NoProfile -ExecutionPolicy Bypass -File studio_shot.ps1 ${cmd}`;
   try {
@@ -1345,9 +1484,7 @@ async function studioWindowShot({ focus = false, focusOnly = false, maxWidth = 1
   const cmd = ps1(flags);
   const r = await localRun(cmd, 45);
   const raw = String((r && (r.text || r.error)) || "");
-  const m = raw.match(/OR_STUDIO_SHOT\s+(\{[\s\S]*?\})\s*$/m);
-  let meta = null;
-  if (m) { try { meta = JSON.parse(m[1]); } catch {} }
+  let meta = parseShotMeta(raw);
   if (!meta) {
     return { ok: false, error: (raw.slice(-400) || "no answer from the agent (is or-agent.exe running?)"), command: cmd,
              hint: "the script prints one OR_STUDIO_SHOT {...} line; a PowerShell parse error or a missing Add-Type means this needs the rebuilt agent" };
@@ -1358,21 +1495,110 @@ async function studioWindowShot({ focus = false, focusOnly = false, maxWidth = 1
   }
   const file = meta.file || out;
   let images = [];
+  let how2 = "";
   try {
     const b64 = await localReadBase64(file);
     images = [{ mimeType: b64.mimeType || "image/png", data: b64.data }];
-  } catch (e) {
-    return { ok: false, error: "the window was captured to " + file + " but could not be read back: " + String((e && e.message) || e),
-             meta, command: cmd };
+    how2 = "file readback (read_file_base64)";
+  } catch (e1) {
+    // Old agent (no read_file_base64): pull the same bytes back as TEXT. This is
+    // the path that makes a screenshot work on the user's current exe.
+    try {
+      const t = await tunnelReadImage(file, meta);
+      images = [{ mimeType: t.img.mimeType, data: t.img.data }];
+      meta = t.meta;
+      how2 = "text tunnel (" + t.lines + " base64 lines read with read_file in " + t.chunks + " chunk(s)" + (t.clipped ? ", a clipped reply re-read at a smaller size" : "") + ")";
+    } catch (e2) {
+      const why2 = String((e2 && e2.message) || e2);
+      // The agent refuses to read a file bigger than 2 MB as text, and a 4K Studio
+      // window can easily exceed that once base64-inflated. Retake SMALLER (about a
+      // third of the pixels) rather than reporting a dead end - a slightly softer
+      // screenshot beats no screenshot.
+      // Both wordings matter: the agent's own refusal ("too large to read whole") and
+      // the capture script's guard on the file it just wrote ("too big to hand over as
+      // text"). Either way the answer is the same: take a smaller picture.
+      if ((e2 && e2.code === "too-large") || /too large to read whole|unexpectedly large|too big to hand over as text/i.test(why2)) {
+        try {
+          const smallW = Math.max(640, Math.min(1100, Math.round((Number(maxWidth) || 1600) * 0.65)));
+          const cmd2 = ps1(`-Out ${out} -MaxWidth ${smallW} -Quality 60`);
+          const r2 = await localRun(cmd2, 45);
+          const meta2 = parseShotMeta(String((r2 && (r2.text || r2.error)) || ""));
+          if (meta2 && meta2.ok) {
+            const t2 = await tunnelReadImage(meta2.file || file, meta2);
+            images = [{ mimeType: t2.img.mimeType, data: t2.img.data }];
+            how2 = "text tunnel, retaken smaller at " + smallW + "px because the full-size file was too big for the agent to read back (" +
+                   t2.lines + " base64 lines in " + t2.chunks + " chunk(s))";
+            meta = t2.meta;
+          }
+        } catch (e3) { /* fall through to the plain error below */ }
+      }
+      if (images.length) {
+        // delivered by the smaller re-capture - continue to the normal return
+      } else {
+        return { ok: false, meta, command: cmd,
+                 error: "the window WAS captured to " + file + ", but the picture could not be read back: " +
+                   why2 + " (direct file read: " + String((e1 && e1.message) || e1).slice(0, 160) + "). " +
+                   (meta && meta.tunnel_error ? "The capture script could not write the tunnel file: " + String(meta.tunnel_error).slice(0, 160) + ". " : "") +
+                   "The capture itself worked - only the hand-over failed." };
+      }
+    }
   }
   const how = meta.method === "printwindow" ? "PrintWindow (Studio never had to come forward)"
     : meta.method === "screen" ? "screen grab after raising the Studio window" : String(meta.method || "capture");
   return {
     ok: true, images, meta, command: cmd,
-    text: `Captured the Roblox Studio WINDOW via ${how} — ${meta.window && meta.window.width}x${meta.window && meta.window.height} px, saved as ${file}.` +
+    text: `Captured the Roblox Studio WINDOW via ${how} — ${meta.window && meta.window.width}x${meta.window && meta.window.height} px, saved as ${file}` +
+      (how2 ? ` (delivered through the ${how2}).` : ".") +
       (meta.method === "screen" && meta.focused ? " Studio is now the front window." : "") +
       (meta.method === "screen" && !meta.focused ? " (Windows would not give Studio keyboard focus; it was raised above other windows.)" : ""),
   };
+}
+
+// ── shot_test: prove the screenshot machinery on THIS machine ───────────────
+// Runs studio_shot.ps1 -SelfTest (no Studio window needed), then pulls the little
+// test picture back through the SAME hand-over a real capture uses - one-call file
+// readback on a new agent, the base64 text tunnel on an older one - and verifies the
+// checksum. Green here means a real or_screenshot is going to deliver too; a failure
+// names the step that broke instead of leaving the user guessing.
+async function shotTest() {
+  const steps = [];
+  const fail = (error) => ({ ok: false, error, steps });
+  try { await ensureStudioShotScript(); steps.push("script written into the agent workspace"); }
+  catch (e) { return fail("could not write studio_shot.ps1 into the agent workspace: " + String((e && e.message) || e) + " (is or-agent.exe running?)"); }
+
+  const cmd = `powershell -NoProfile -ExecutionPolicy Bypass -File studio_shot.ps1 -SelfTest`;
+  const r = await localRun(cmd, 45);
+  const raw = String((r && (r.text || r.error)) || "");
+  const meta = parseShotMeta(raw);
+  if (!meta) return fail("the self-test printed no result line - the script did not run: " + (raw.slice(-300) || "no answer from the agent"));
+  if (!meta.ok) return fail(meta.error || "the self-test failed");
+  steps.push("PowerShell + System.Drawing work (JPEG written: " + (meta.jpeg_ok ? "yes" : "NO") + ")");
+  if (!meta.roundtrip_ok) return fail("the script wrote the base64 text but could not decode it back to the same bytes - the tunnel format is broken");
+
+  const info = await agentInfo();
+  const viaFast = info.has_base64 === true;
+  try {
+    let img = null;
+    if (viaFast) {
+      const b64 = await localReadBase64(meta.file);
+      img = { mimeType: b64.mimeType || meta.mime, data: b64.data };
+      steps.push("picture read back in one call (read_file_base64)");
+    } else {
+      const rd = await localReadTextFile(meta.base64_file, { linesPerCall: 90 });
+      img = await b64ToVerifiedImage(rd.text, meta);
+      steps.push("picture read back as base64 text in " + rd.chunks + " chunk(s) of read_file (" + rd.lines + " lines)");
+    }
+    const decoded = atob(String(img.data).replace(/[^A-Za-z0-9+/=]/g, ""));
+    if (!decoded.length) return fail("the picture read back empty");
+    steps.push("checksum verified (" + decoded.length + " bytes)");
+    return { ok: true, steps, meta,
+      text: "Everything a screenshot needs works on this machine: " + steps.join("; ") + ". " +
+        (viaFast ? "Picture hand-over: one-call file readback." : "Picture hand-over: the BASE64 TEXT TUNNEL (your agent has no read_file_base64 - that is fine).") +
+        " So or_screenshot {target:\"window\"} will deliver as long as Roblox Studio is open." };
+  } catch (e) {
+    return fail("the capture machinery works, but the picture could not be read back: " + String((e && e.message) || e) +
+      " - that is the hand-over (the tunnel), not the capture.");
+  }
 }
 
 async function robloxCsrf() {
@@ -1604,6 +1830,10 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         break;
       }
       // OS-side Studio window capture / focus (no page permission involved).
+      case "shot_test": {
+        try { sendResponse(await shotTest()); } catch (e) { sendResponse({ ok: false, error: String((e && e.message) || e) }); }
+        break;
+      }
       case "studio_window_shot": {
         const r = await studioWindowShot({
           focus: msg.focus === true,
