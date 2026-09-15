@@ -1129,13 +1129,14 @@ async function harvestToolImage(r, toolName) {
     // Nothing convertible in the answer. "No picture" is true but useless on its own:
     // a build without image support THROWS PICTURES AWAY, and the user cannot tell that
     // apart from a Studio that never took one. Say which it probably is, and what to do.
-    let note = "no picture came back with the answer, and nothing in it named a file or held base64";
+    let note = "no picture came back: the answer held no image data, named no image file and contained no base64, " +
+      "so there was nothing this build could turn into an attachment (a tool that writes the shot and names it, or inlines base64, works)";
     try {
       const info = await agentInfo();
       if (info && info.has_base64 === false) {
-        note = "no picture came back: this or-agent.exe (" + info.tools + " tools, no read_file_base64) predates image handling, " +
-          "so a picture Studio sent as IMAGE DATA was thrown away here. Either rebuild the agent (cd agent && cargo build --release) " +
-          "for in-Studio screenshots, or use {target:\"window\"} now.";
+        note = "no picture came back: this or-agent.exe (" + info.tools + " tools, no read_file_base64) cannot carry IMAGE DATA, " +
+          "and this MCP's answer named no file and held no base64 - so there was nothing to convert into an attachment. " +
+          "The file route still works when the tool saves the shot (the name is read back as text), and {target:\"window\"} always works.";
       }
     } catch {}
     return Object.assign({}, r, { image_error: note });

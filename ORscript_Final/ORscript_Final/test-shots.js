@@ -81,10 +81,16 @@ function makeDoc() {
   return doc;
 }
 function makeWindow(doc) {
+  // Real listener registry: page code that subscribes to "error" / "unhandledrejection"
+  // must actually receive them in the harness, otherwise the error-capture path is
+  // untestable and a broken listener would ship unnoticed.
+  const listeners = {};
   const win = {
     document: doc, location: { href: "https://chat.deepseek.com/", hostname: "chat.deepseek.com", pathname: "/", origin: "https://chat.deepseek.com", search: "" },
     innerWidth: 1280, innerHeight: 800, devicePixelRatio: 1, navigator: { userAgent: "Mozilla/5.0 Chrome/128", clipboard: { write: async () => {} } },
-    addEventListener() {}, removeEventListener() {}, dispatchEvent: () => true,
+    addEventListener(type, fn) { (listeners[type] = listeners[type] || []).push(fn); },
+    removeEventListener() {},
+    dispatchEvent(ev) { (listeners[(ev && ev.type) || ""] || []).forEach((f) => { try { f(ev); } catch {} }); return true; },
     setTimeout, clearTimeout, setInterval: (fn, ms) => setInterval(fn, ms), clearInterval,
     requestAnimationFrame: (fn) => setTimeout(() => fn(Date.now()), 0), cancelAnimationFrame: clearTimeout,
     getComputedStyle: () => ({ getPropertyValue: () => "", display: "block", visibility: "visible", opacity: "1" }),
@@ -128,6 +134,7 @@ function makeFakeAgent(opts) {
   const clipChars = o.clipChars || 40000;     // MAX_TEXT_CHARS in workspace.rs
   const files = o.files || Object.create(null);
   const state = { calls: [], connected: 0 };
+  const hang = (o.hang || []).slice();   // tools that never answer (a stuck MCP server)
   // A deterministic ~90 KB "JPEG": big enough to need several read_file pages.
   const shotBytes = Buffer.alloc(90 * 1024);
   for (let i = 0; i < shotBytes.length; i++) shotBytes[i] = (i * 31 + 7) & 0xff;
@@ -166,6 +173,7 @@ function makeFakeAgent(opts) {
     if (type !== "call_tool") return;
     state.calls.push(name);
     if (name === "run_command") state.commands.push(String((a && a.command) || ""));
+    if (hang.indexOf(String(name)) >= 0) return;   // a stuck server: accepts the call, never answers
     const okText = (text) => reply(sock, { type: "tool_result", id, ok: true, text });
     const fail = (error) => reply(sock, { type: "tool_result", id, ok: false, error });
     if (name === "read_file_base64") { fail("unknown tool: read_file_base64"); return; }   // THE OLD EXE
@@ -426,15 +434,15 @@ function makeBridge(engine) {
 }
 
 // ── provider stub: the seam main.js talks to instead of a real chat site ────
-function makeProvider(win, log) {
+function makeProvider(win, log, opts) {
   const editor = win.document.createElement("textarea");
   return {
     id: "deepseek", displayName: "DeepSeek (test stub)",
     timings: { typeMs: 1, sendWaitMs: 10, pollMs: 10, genIdleMs: 50, turnMaxMs: 2000 },
     supportsVision: true,
     thinkingSel: ".think", chipAtItemLevel: false, reliableCounts: false,
-    attachImages: async (images) => { log.attached.push(...(images || [])); return true; },
-    clearAttachments: async () => true,
+    attachImages: async (images) => { log.attached.push(...(images || [])); return !(opts && opts.attachFail); },
+    clearAttachments: async () => { log.cleared = (log.cleared || 0) + 1; return true; },
     allItems: () => [], isUserItem: () => false, isAssistantItem: () => false, itemText: () => "", classifyText: () => ({ body: "", hasCommand: false }),
     assistantCount: () => 0, userCount: () => 0, lastAssistant: () => null, lastAssistantId: () => null, itemKey: () => "k",
     readAssistant: () => "", streamLen: () => 0, snapshot: () => ({}),
@@ -463,7 +471,7 @@ function build(replies, opts) {
   const sandbox = win;
   sandbox.chrome = chromeStub;
   sandbox.RS = vm.runInNewContext(cfgSrc + "\n;RS;", { window: {}, console });
-  sandbox.RSProvider = makeProvider(win, log);
+  sandbox.RSProvider = makeProvider(win, log, opts);
   // A packaged extension file must be readable through fetch() (that is how the
   // worker gets studio_shot.ps1), so serve chrome-extension:// from disk; anything
   // else still fails - no network here on purpose.
@@ -789,6 +797,77 @@ const call = async (c, tool, args, ms = 9000) => {
         ok("...and the file it saved is named for the screen, not for Studio",
            /saved as or_screen\.jpg/i.test(shotRuns[0].out), shotRuns[0].out.slice(0, 260));
       }
+      {
+        // A capture tool that never answers must not become the loop the user kept
+        // hitting: the call is bounded, so the loop gets a definitive answer and moves on.
+        const cH = build({}, { engine: "local", fakeAgent: makeFakeAgent({ hang: ["screen_capture"] }) }).ctx;
+        await waitConnected(cH, 4000);
+        ok("the picture budget is short by DEFAULT (a capture is never a 2-minute wait)",
+           await vm.runInContext("(window.__rsToolTimeouts().picture <= 30000)", cH));
+        await vm.runInContext("window.__rsSetPictureMs(400)", cH);   // same bound, test-sized
+        const t0 = Date.now();
+        const hung = String(await call(cH, "screen_capture", {}, 20000));
+        const took = Date.now() - t0;
+        ok("a capture tool that never answers is abandoned, not waited on forever",
+           took < 15000 && /timed out after 0s|timed out/i.test(hung) && /bridge did not respond in time/i.test(hung), took + "ms :: " + hung.slice(0, 200));
+        ok("...and the timeout message states the real budget, not a hardcoded 120s",
+           /timed out after (0|1)s/.test(hung) && !/timed out after 120s/.test(hung), hung.slice(0, 120));
+      }
+      // ── attach_check: does THIS chat accept attachments? (the user's question) ──
+      {
+        const cA = build({}, { engine: "local" }).ctx;
+        const check = String(await call(cA, "attach_check", {}, 40000));
+        ok("attach_check answers in plain words and names the site",
+           /Attachment compatibility for/.test(check) && /OR_ATTACH_CHECK \{/.test(check), check.slice(0, 200));
+        ok("...it reports that the provider's upload path works here",
+           /Pictures: YES/i.test(check) && /Verdict: or_screenshot and attach_feedback can deliver/i.test(check), check.slice(0, 420));
+        ok("...and it removed the test picture again (nothing left staged)",
+           /Cleanup: composer left empty/i.test(check) && /"cleaned":true/.test(check), check.slice(-260));
+        ok("...and the alias names answer too",
+           /Attachment compatibility/.test(String(await call(cA, "attachment_check", {}, 40000))) &&
+           /Attachment compatibility/.test(String(await call(cA, "attach_support", {}, 40000))));
+        ok("...a working site keeps the answer short unless the whole table is asked for",
+           !/Other providers in this build/.test(check) &&
+           /Other providers in this build/.test(String(await call(cA, "attach_check", { all: true }, 40000))));
+      }
+      {
+        // A site that refuses the upload: the check must SAY so and point at the manual
+        // route, because OR now refuses to send a picture-less message.
+        const cF = build({}, { engine: "local", attachFail: true }).ctx;
+        const bad = String(await call(cF, "attach_check", {}, 40000));
+        ok("attach_check reports a site that refuses the upload instead of pretending",
+           /Pictures: NO/i.test(bad) && /"images":false/.test(bad) && /attach_feedback \{copy:true\}/.test(bad), bad.slice(0, 420));
+        ok("...and says nothing is sent pretending otherwise",
+           /attaching is broken here/i.test(bad) && /nothing is sent pretending otherwise/i.test(bad), bad.slice(-300));
+        ok("...and points at the OTHER providers that can attach, from the checked table",
+           /Other providers in this build/.test(bad) && /-> DeepSeek/.test(bad) && /images: yes/.test(bad), bad.slice(-700));
+        ok("...including the page taps that are not chat providers at all",
+           /page taps, not chat providers/.test(bad), bad.slice(-300));
+      }
+      {
+        // ── or_report: the one block the user pastes when something is wrong ──
+        const cR = build({}, { engine: "local", fakeAgent: makeFakeAgent({}) }).ctx;
+        await waitConnected(cR);
+        // A page error, exactly the one the user hit - dispatched as a real error EVENT,
+        // so the listener that captures it for the report is what is being tested.
+        vm.runInContext("dispatchEvent({ type: 'error', message: \"Cannot read properties of null (reading 'classList')\", filename: 'chrome-extension://or-test/core/main.js', lineno: 6953, error: { stack: \"TypeError: Cannot read properties of null (reading 'classList')\\n    at renderBar (core/main.js:6953:34)\\n    at setStatus (core/main.js:7908:7)\" } })", cR);
+        // and a SITE script's error must not be blamed on OR - the origin filter is the
+        // reason the report can be trusted
+        vm.runInContext("dispatchEvent({ type: 'error', message: 'site noise', filename: 'https://chat.deepseek.com/app.js', lineno: 1 })", cR);
+        const rep = String(await call(cR, "or_report", {}, 40000));
+        ok("or_report gathers the build, page, bridge, agent and attachments",
+           /OR diagnostic report/.test(rep) && /- Build: OR /.test(rep) && /- Bridge: \{/.test(rep) &&
+           /- Agent: \d+ tools/.test(rep) && /- Attachments:/.test(rep), rep.slice(0, 320));
+        ok("...and hands over the captured page error with its function and line",
+           /Cannot read properties of null \(reading 'classList'\)/.test(rep) &&
+           /at renderBar \(core\/main\.js:6953:34\) \| at setStatus \(core\/main\.js:7908:7\)/.test(rep), rep.slice(0, 900));
+        ok("...and a broken script from the SITE is not blamed on OR", !/site noise/.test(rep), rep.slice(0, 400));
+        ok("...and ends with the machine-readable block, so it can be grepped",
+           /OR_REPORT \{/.test(rep) && /"errors":\[/.test(rep) && /"diag_tail":\[/.test(rep), rep.slice(-400));
+        ok("...and the aliases answer too",
+           /OR diagnostic report/.test(String(await call(cR, "bug_report", {}, 40000))) &&
+           /OR diagnostic report/.test(String(await call(cR, "support_bundle", {}, 40000))));
+      }
       // ── THE ROUTE THE USER ASKED ABOUT: Studio's OWN screenshot, taken INSIDE
       //    Studio. No window, no PowerShell, no focus - only "Studio is open". This is
       //    the user's own topology: local engine, the agent proxying Studio's MCP. ──
@@ -919,9 +998,9 @@ const call = async (c, tool, args, ms = 9000) => {
         const shot = String(await call(cM2, "or_screenshot", { target: "studio" }, 40000));
         ok("when the agent drops image blocks, the answer says so instead of 'captured nothing'",
            /no picture came back/i.test(shot), shot.slice(0, 400));
-        ok("...and it names the cause (this build predates image handling) and both ways forward",
-           /o\u0072-agent\.exe \(\d+ tools, no read_file_base64\)/i.test(shot) && /predates image handling/i.test(shot) &&
-           /cargo build --release/.test(shot) && /target:"window"/.test(shot), shot.slice(0, 500));
+        ok("...and it names the cause (this build cannot carry image data) and both ways forward",
+           /o\u0072-agent\.exe \(\d+ tools, no read_file_base64\)/i.test(shot) && /cannot carry IMAGE DATA/i.test(shot) &&
+           /the name is read back as text/.test(shot) && /target:"window"/.test(shot), shot.slice(0, 520));
         ok("...and the window route still delivers the picture in that case (goodbye until a rebuild)",
            /attached to THIS message/i.test(shot), shot.slice(0, 300));
       }

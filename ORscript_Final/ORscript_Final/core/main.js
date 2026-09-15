@@ -346,7 +346,11 @@
       // never chrome-extension://), so freezes left no fingerprint.
       const file = String((e && e.filename) || "");
       if (file && !file.includes("chrome-extension://")) return;
-      _report("uncaught.error", { msg: e && e.message, line: e && e.lineno, file: e && e.filename });
+      // Keep the first frames of the stack: that is the "which function, which line"
+      // the user would otherwise have to copy out of DevTools by hand. or_report prints it.
+      const st = String((e && e.error && e.error.stack) || "");
+      _report("uncaught.error", { msg: e && e.message, line: e && e.lineno, file: e && e.filename,
+        at: st.split("\n").slice(1, 4).map((x) => x.trim()).filter(Boolean).join(" | ").slice(0, 300) });
     }, true);
     window.addEventListener("unhandledrejection", (e) => {
       const r = e && e.reason;
@@ -1984,7 +1988,7 @@
       const r = A.bridge && (A.bridge.local_root || A.bridge.workspace_root || A.bridge.root);
       return String(r || "").replace(/[\\/]+$/, "");
     };
-    const takeMcpAnswer = (r, label) => {
+    const takeMcpAnswer = (r, label, tool) => {
       if (r && r.ok && r.images && r.images.length) {
         shots.push(...r.images);
         // Say WHERE the picture came from: "image(s)" alone cannot tell the user whether it
@@ -1994,6 +1998,12 @@
       }
       if (r && !r.ok) notes.push(label + ": " + String(r.error || "failed").slice(0, 160));
       else if (r && r.ok && r.image_error) notes.push(label + ": " + String(r.image_error).slice(0, 400));
+      // The MCP answered, reported nothing wrong, and handed over no picture. That is the
+      // OLD-AGENT signature (image blocks dropped before the extension can see them), and
+      // it must never read as "captured nothing" - name it, with the fix.
+      else if (r && r.ok && /screenshot|capture|shot/i.test(String(tool || "")))
+        notes.push(label + ": the " + tool + " call returned no image data - this or-agent.exe drops image blocks " +
+          "(rebuild it, or keep using the window route below, which reads the file back as text)");
       return false;
     };
     const tryMcp = async (toolName, label) => {
@@ -2002,7 +2012,7 @@
         // there. Short wait, so trying is always cheap and we never skip a route that
         // would have worked (the status frame can predate the connection).
         const r = await bg({ type: "call_tool", name: toolName, arguments: {}, timeout: 20000, connectWait: 3000 });
-        if (takeMcpAnswer(r, label)) return true;
+        if (takeMcpAnswer(r, label, toolName)) return true;
         // ONE bounded retry, and only when the tool's own schema offers a place to write
         // the picture. This is the last chance for a server whose only answer is an image
         // block on an agent build that drops them.
@@ -2017,7 +2027,7 @@
           const file = dir + "/or_mcp_shot.png";
           notes.push(label + ": asked the MCP to save the picture to " + file + " (its schema lists " + key + ")");
           const r2 = await bg({ type: "call_tool", name: toolName, arguments: { [key]: file }, timeout: 20000, connectWait: 3000 });
-          if (takeMcpAnswer(r2, label + " (saved file)")) return true;
+          if (takeMcpAnswer(r2, label + " (saved file)", toolName)) return true;
         } else if (r && r.ok) {
           notes.push(label + ": the tool answered with text that named no picture");
         }
@@ -2193,6 +2203,17 @@
   // screenshot really carries image bytes instead of only reading a claim.
   try { window.__rsRecentImages = () => (A.recentImages || []).map((x) => ({ mimeType: x.mimeType, data: x.data, at: x.at, source: x.source })); } catch {}
 
+  // How long a tool that RETURNS A PICTURE may take before the loop gives up. A
+  // screenshot that has not arrived in this long is not going to: waiting two minutes
+  // is what turned a stuck capture into the "loop" the user kept hitting. Named, and
+  // readable/settable through the same debug seam as __rsRunTool, so a test can prove
+  // the bound without spending 25 real seconds on it.
+  let PICTURE_TOOL_MS = 25000;
+  try {
+    window.__rsToolTimeouts = () => ({ picture: PICTURE_TOOL_MS });
+    window.__rsSetPictureMs = (v) => { const n = Number(v); if (n > 0) PICTURE_TOOL_MS = n; return PICTURE_TOOL_MS; };
+  } catch {}
+
   async function runTool(call) {
     let name = call.tool;
     const args = call.arguments || {};
@@ -2316,7 +2337,7 @@
     // source:recent (default) re-uses the last capture, so a screenshot taken
     // earlier in the conversation can be re-sent without re-taking it; pass
     // path:"<workspace file>" to attach a file from disk instead.
-    if (name === "attach_feedback" || name === "attachfeedbackor" || name === "attach_feedback_or" ||
+    if (name === "attach_feedback" || name === "attachfeedbackor" || name === "attach_feedback_or" || name === "attach_images" ||
         name === "or_attach_feedback" || name === "attach_image" || name === "attach_screenshot" ||
         name === "attach_last_screenshot" || name === "attach_recent_image" || name === "or_attach" ||
         name === "attach_file" || name === "copy_screenshot" || name === "paste_screenshot") {
@@ -2440,6 +2461,163 @@
       };
       const brief = briefs[role] || briefs.builder;
       return "Output of 'or_agent':\nROLE=" + role + "\n" + brief + "\nTASK: " + (task || "(continue the user's request)") + "\nReply as this agent only. ONE command.";
+    }
+    // ── attach_check: can OR put a picture (or a file) into THIS chat, right now? ──
+    // Answers "does this site accept attachments?" WITHOUT taking a screenshot: one tiny
+    // test picture goes through the provider's OWN upload path and is removed again.
+    // Nothing is typed and nothing is sent, so it is safe any time - and it turns "the
+    // picture never arrived" into a named reason instead of a guess.
+    if (/^(attach_check|attachment_check|attach_compat|attach_support|attach_test|provider_attach_check|attachment_support)$/.test(name)) {
+      const PROBE_PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8AAAwAB/AF+7E1mAAAAAElFTkSuQmCC";
+      const site = String((P && (P.displayName || P.id)) || "this site");
+      const fn = (f) => typeof (P && P[f]) === "function";
+      const json = { site: site, provider: String((P && P.id) || ""), attachImages: fn("attachImages"), clearAttachments: fn("clearAttachments") };
+      if (!fn("attachImages")) {
+        return "Output of 'attach_check':\nThis provider has NO attach path at all (attachImages is missing), so OR cannot put anything into the composer here.\n" +
+          "Pictures still appear in OR's popup (left side) with a Copy button, so they can be pasted by hand.\n" +
+          "OR_ATTACH_CHECK " + JSON.stringify(json);
+      }
+      const L = [];
+      let inputs = [];
+      try { inputs = Array.from(document.querySelectorAll('input[type="file"]')); } catch {}
+      const accepts = [];
+      let multiple = false;
+      inputs.forEach((i) => {
+        try {
+          const a = String(i.getAttribute("accept") || "").trim();
+          if (a) accepts.push(a);
+          if (i.multiple) multiple = true;
+        } catch {}
+      });
+      const acceptText = accepts.join(" ; ");
+      const docTokens = acceptText.split(/[,\s]+/).filter(Boolean).filter((t) => !/^image\//i.test(t) && t !== "*/*" && t !== "*");
+      const takesDocs = docTokens.length > 0;
+      json.accepts = accepts;
+      json.multiple = multiple;
+      json.files = takesDocs ? docTokens.slice(0, 8) : [];
+      let editor = null;
+      try { editor = P.getEditor ? P.getEditor() : null; } catch {}
+      const scope = (editor && editor.closest && editor.closest("form, div")) || document.body || document;
+      const countStaged = () => {
+        try { return scope.querySelectorAll('[class*="attach" i],[class*="preview" i],[class*="thumbnail" i],[class*="chip" i],[class*="file" i]').length; } catch { return 0; }
+      };
+      let textBefore = "";
+      try { textBefore = P.editorText ? String(P.editorText() || "") : ""; } catch {}
+      const before = countStaged();
+      let imgResult = null, imgErr = "";
+      try { imgResult = await P.attachImages([{ mimeType: "image/png", data: PROBE_PNG }]); }
+      catch (e) { imgErr = String((e && e.message) || e).slice(0, 160); }
+      const sawPreview = countStaged() > before;
+      const imagesOk = imgResult === true || sawPreview;
+      json.images = imagesOk;
+      let docResult = null;
+      if (takesDocs) {
+        try { docResult = await P.attachImages([{ mimeType: "text/plain", data: btoa("OR attachment probe - safe to ignore") }]); }
+        catch { docResult = false; }
+      }
+      json.documents = takesDocs ? (docResult === true || countStaged() > before) : false;
+      try { if (fn("clearAttachments")) await P.clearAttachments(); } catch {}
+      json.cleaned = countStaged() <= before;
+      let textAfter = "";
+      try { textAfter = P.editorText ? String(P.editorText() || "") : ""; } catch {}
+      json.textUntouched = textAfter === textBefore;
+
+      L.push("Attachment compatibility for " + site + (json.provider ? " (provider: " + json.provider + ")" : "") + ":");
+      L.push("Provider: " + (fn("attachImages") ? "attachImages OK" : "attachImages MISSING") + ", " +
+        (fn("clearAttachments") ? "clearAttachments OK" : "clearAttachments missing") + ", " +
+        (fn("ensureComposerReady") ? "ensureComposerReady OK" : "ensureComposerReady missing"));
+      L.push("Site picker: " + (inputs.length
+        ? inputs.length + " file input(s) - accepts: " + (acceptText || "(nothing declared)") + (multiple ? " (multiple files allowed)" : "")
+        : "no file input found - this site uploads by paste/drag only"));
+      L.push("Pictures: " + (imagesOk
+        ? "YES - a 1x1 test picture went through the site's own upload path" + (sawPreview ? " and a preview appeared" : " (the provider reported success)") + ", then it was removed again (nothing was sent)."
+        : "NO - " + (imgErr || "the site never showed a preview of the test picture") + ". OR now REFUSES to send a screenshot it cannot attach, so use the clipboard route: attach_feedback {copy:true} then Ctrl+V."));
+      L.push("Documents: " + (takesDocs
+        ? (json.documents ? "YES - " + docTokens.slice(0, 6).join(", ") + " (a .txt probe staged too)" : "the picker lists " + docTokens.slice(0, 6).join(", ") + ", but the .txt probe did not visibly stage - pictures are the safe bet")
+        : "the picker takes IMAGES only, so non-image files (pdf, txt...) will be refused by the site"));
+      L.push("Cleanup: " + (json.cleaned ? "composer left empty - no leftover probe" : "WARNING - something is still staged in the composer; remove it before sending") + (json.textUntouched ? "" : " (note: the composer text changed - check it)"));
+      if (P && P.supportsVision === false) L.push("Vision: this provider is marked as NOT seeing images - a picture would arrive but could not be read.");
+      L.push("Handy: shot_test {} proves capture + hand-over; agent_info {} names the agent build; or_report {} gathers everything for a bug report.");
+      L.push("Verdict: " + (imagesOk
+        ? "or_screenshot and attach_feedback can deliver pictures in this chat."
+        : "attaching is broken here - captures still appear in OR's popup and on the clipboard, and nothing is sent pretending otherwise."));
+      const wantAll = args.all === true || args.matrix === true || args.providers === true || !imagesOk;
+      let matrix = [];
+      try { matrix = (RS && RS.PROVIDER_ATTACH_MATRIX) || []; } catch {}
+      if (wantAll && matrix.length) {
+        L.push("Other providers in this build (from each provider file, re-checked by the test suite):");
+        matrix.forEach((r) => {
+          const here = String(r.id) === String((P && P.id) || "");
+          L.push("    " + (here ? "-> " : "   ") + String(r.name || r.id).padEnd(12) + " images: " + (r.images ? "yes" : "NO ") + "   vision: " + (r.vision ? "yes" : "NO ") + (here ? "   (this page)" : ""));
+        });
+        L.push("    3 more files (chatgpt-cm, crax-net, qwen-net) are page taps, not chat providers, so they have no composer to attach to.");
+      }
+      L.push("OR_ATTACH_CHECK " + JSON.stringify(json));
+      try { ui.toast(imagesOk ? "Attachments work here (" + site + ")." : "Attachments do NOT work here - see the reply.", 6000); } catch {}
+      return "Output of 'attach_check':\n" + L.join("\n");
+    }
+    // ── or_report: the ONE thing to run when something is wrong ───────────────
+    // The user got tired of describing a bug a different way every time. This gathers
+    // everything a fix needs - build, engine, provider, vision, bridge, the agent build,
+    // attachment capability, the last capture, every captured page error and the tail of
+    // the diag trail - into one block they can paste unchanged.
+    if (/^(or_report|bug_report|or_bug_report|support_bundle|or_diagnostics|diagnostics|or_diag)$/.test(name)) {
+      const j = { at: new Date().toISOString() };
+      const L = ["OR diagnostic report - paste this WHOLE block, it has everything needed."];
+      const line = (k, v) => "- " + k + ": " + v;
+      let ver = "";
+      try { ver = String(chrome.runtime.getManifest().version); } catch {}
+      j.version = ver;
+      let eng = "";
+      try { eng = window.__rsEngine ? String(window.__rsEngine() || "") : ""; } catch {}
+      j.engine = eng;
+      j.provider = String((P && P.id) || "");
+      j.provider_name = String((P && P.displayName) || "");
+      j.vision = (P && P.supportsVision) !== false;
+      j.url = location.hostname + location.pathname;
+      L.push(line("Build", "OR " + (ver || "?") + " - engine: " + (j.engine || "?") + " - provider: " + (j.provider_name || j.provider || "?") + " - vision: " + (j.vision ? "yes" : "NO")));
+      L.push(line("Page", j.url));
+      const b = A.bridge || {};
+      j.bridge = { connected: !!b.connected, mcpAlive: !!b.mcpAlive, studio: !!b.studio, local_connected: !!b.local_connected, tools: Array.isArray(b.tools) ? b.tools.length : null, servers: (b.servers || []).map((x) => x.id + ":" + (x.alive ? "up" : "down")) };
+      L.push(line("Bridge", JSON.stringify(j.bridge)));
+      try {
+        const info = await bg({ type: "agent_info" });
+        j.agent = info ? { tools: info.tools, has_base64: info.has_base64, has_read_file: info.has_read_file, has_run_command: info.has_run_command, workspace: info.workspace_root } : null;
+        L.push(line("Agent", info && info.ok !== false
+          ? info.tools + " tools, read_file_base64: " + (info.has_base64 ? "yes (one-call hand-over)" : "MISSING (base64 text tunnel - screenshots still work)")
+          : "NOT RUNNING or did not answer"));
+      } catch (e) { L.push(line("Agent", "check failed: " + String((e && e.message) || e))); }
+      try {
+        let inputs = [];
+        try { inputs = Array.from(document.querySelectorAll('input[type="file"]')); } catch {}
+        const accepts = inputs.map((i) => String(i.getAttribute("accept") || "").trim()).filter(Boolean);
+        j.attach = { attachImages: typeof P.attachImages === "function", clearAttachments: typeof P.clearAttachments === "function", file_inputs: inputs.length, accepts: accepts };
+        L.push(line("Attachments", (j.attach.attachImages ? "attachImages present" : "attachImages MISSING") + ", file inputs: " + inputs.length + (accepts.length ? " (accepts " + accepts.join(" ; ") + ")" : "") + " - attach_check {} runs the live picture/document test"));
+      } catch (e) { L.push(line("Attachments", "check failed: " + String((e && e.message) || e))); }
+      try {
+        const img = (A.recentImages || [])[0];
+        j.last_capture = img ? { at: img.at, source: img.source, mime: img.mimeType, kb: Math.round(String(img.data || "").length * 3 / 4 / 1024) } : null;
+        L.push(line("Last capture", img ? (img.source || "capture") + ", " + (img.mimeType || "?") + ", ~" + j.last_capture.kb + " KB, " + Math.round((Date.now() - (img.at || Date.now())) / 1000) + "s ago" : "none in this page session"));
+      } catch {}
+      const all = (typeof _diag !== "undefined" && Array.isArray(_diag)) ? _diag : [];
+      const errs = all.filter((e) => /error|crash|reject|fail|blocked/i.test(String(e.event)) || (e.data && (e.data.err || e.data.error || e.data.msg))).slice(-12);
+      j.errors = errs.map((e) => ({ iso: e.iso, event: e.event, detail: String((e.data && (e.data.err || e.data.error || e.data.msg || "")) || "").slice(0, 200), at: String((e.data && e.data.at) || "").slice(0, 140) }));
+      L.push(line("Errors (" + errs.length + ")", errs.length ? "" : "none captured since this page loaded"));
+      errs.forEach((e) => {
+        const d = (e.data || {});
+        const what = String(d.err || d.error || d.msg || "").slice(0, 240);
+        const where = String(d.at || "").slice(0, 240);
+        L.push("    [" + e.iso + "] " + e.event + ": " + what + (d.line ? " (line " + d.line + ")" : "") + (where ? "\n          at " + where : ""));
+      });
+      const tail = all.slice(-14);
+      j.diag_tail = tail.map((e) => ({ iso: e.iso, event: e.event, data: e.data }));
+      L.push(line("Diag tail (" + tail.length + " of " + all.length + ")", ""));
+      tail.forEach((e) => L.push("    [" + e.iso + "] " + e.event + (e.data ? " " + JSON.stringify(e.data).slice(0, 140) : "")));
+      try { L.push(line("Running", "agent: " + !!A.running + ", stop: " + !!A.stop)); } catch {}
+      L.push("OR_REPORT " + JSON.stringify(j));
+      L.push("Tip: if the UI itself looks wrong, or_screenshot {target:\"tab\"} shows me the panel.");
+      try { ui.toast("Report ready - copy the reply block.", 5000); } catch {}
+      return "Output of 'or_report':\n" + L.join("\n");
     }
     // ── shot_test: does the screenshot machinery work on THIS machine, right now?
     // Runs before the user ever opens Studio: the capture script builds a tiny test
@@ -2593,7 +2771,7 @@
       const animLines = requested === "roblox" ? RSAnim.describeCommands() : [];
       const skillLines = (requested === "roblox" && typeof RobloxScriptSkills !== "undefined") ? RobloxScriptSkills.describeCommands() : [];
       const agentLines = (requested === "local" && typeof AgentScriptSkills !== "undefined") ? AgentScriptSkills.describeCommands() : [];
-      const webLines = [`— OR Status: or_status {} — live engine, work mode, extra thinking, bridge, blender. Call this if you are unsure which mode you are in.`, `— Web Tools (bridge-level, no Studio needed): web_fetch {url?, query?, max_chars?} — fetch a URL, OR pass query to search the web then fetch the top result; web_search {query, limit?} — DuckDuckGo titles+URLs`, `— Screenshot check: shot_test {} — proves the capture + hand-over works on this machine WITHOUT Studio being open (writes a test picture, reads it back, verifies the checksum). Run this first if a screenshot ever fails. Aliases: or_shot_test, screenshot_test, test_screenshot. `, `— Screenshot: or_screenshot {target?: auto|studio|tab|blender} — take a screenshot of Studio, this chat tab, or Blender and attach it to your next message so you can see it. Aliases: screenshot, take_screenshot, send_screenshot.`, `— Studio window: or_focus_studio {} — bring the Roblox Studio window to the front on Windows (steals focus, so it is opt-in). or_screenshot {target:"window"} photographs that window straight through the agent, which works even when the browser is in front.`, `— Attach images: attach_feedback {index?, path?, source?, copy?, paste?, send?} — re-send the most recent screenshot (or any workspace file via path) as an attachment on this message and copy it to the clipboard so the user can paste it. Aliases: attachfeedbackor, attach_image, attach_file, attach_screenshot, attach_last_screenshot, attach_recent_image, copy_screenshot, paste_screenshot.`, `— Agent check: agent_info {} — is or-agent.exe running, which build is it, and can a screenshot actually reach you (one-call file readback vs the base64 text tunnel vs nothing, plus the one thing to do about it). Aliases: or_agent_info, agent_status. `, `— Debugger: or_debug {} — Studio LogService errors/warnings. Automatic Debugger (Settings) appends new errors after mutating commands.`, `— Multi-Agent: or_agent {role: planner|builder|reviewer|debugger, task?} — hand off to a specialist. Enable Multi-Agent in Settings.`, `— Developer Products: developer_product_create {name, price, description?, reward?} — create a real Roblox Developer Product on this published universe (sign into roblox.com in Chrome). developer_product_list {} lists them. Aliases: create_developer_product, create_dev_product.`];
+      const webLines = [`— OR Status: or_status {} — live engine, work mode, extra thinking, bridge, blender. Call this if you are unsure which mode you are in.`, `— Web Tools (bridge-level, no Studio needed): web_fetch {url?, query?, max_chars?} — fetch a URL, OR pass query to search the web then fetch the top result; web_search {query, limit?} — DuckDuckGo titles+URLs`, `— Attachment check: attach_check {} — does THIS chat site accept attachments? Stages a 1x1 test picture through the page's own upload path, reports whether pictures AND documents are accepted (from the file picker), removes it again and sends nothing. Aliases: attachment_check, attach_compat, attach_support, attach_test. `, `— Bug report: or_report {} — ONE command when anything is broken: build, engine, provider, bridge, agent build, attachments, the last capture, every captured page error (with function and line) and the diag tail, in one paste-ready block. Run this BEFORE asking the user to describe anything. Aliases: bug_report, support_bundle, or_diagnostics. `, `— Screenshot check: shot_test {} — proves the capture + hand-over works on this machine WITHOUT Studio being open (writes a test picture, reads it back, verifies the checksum). Run this first if a screenshot ever fails. Aliases: or_shot_test, screenshot_test, test_screenshot. `, `— Screenshot: or_screenshot {target?: auto|studio|tab|blender} — take a screenshot of Studio, this chat tab, or Blender and attach it to your next message so you can see it. Aliases: screenshot, take_screenshot, send_screenshot.`, `— Studio window: or_focus_studio {} — bring the Roblox Studio window to the front on Windows (steals focus, so it is opt-in). or_screenshot {target:"window"} photographs that window straight through the agent, which works even when the browser is in front.`, `— Attach images: attach_feedback {index?, path?, source?, copy?, paste?, send?} — re-send the most recent screenshot (or any workspace file via path) as an attachment on this message and copy it to the clipboard so the user can paste it. Aliases: attachfeedbackor, attach_image, attach_images, attach_file, attach_screenshot, attach_last_screenshot, attach_recent_image, copy_screenshot, paste_screenshot.`, `— Agent check: agent_info {} — is or-agent.exe running, which build is it, and can a screenshot actually reach you (one-call file readback vs the base64 text tunnel vs nothing, plus the one thing to do about it). Aliases: or_agent_info, agent_status. `, `— Debugger: or_debug {} — Studio LogService errors/warnings. Automatic Debugger (Settings) appends new errors after mutating commands.`, `— Multi-Agent: or_agent {role: planner|builder|reviewer|debugger, task?} — hand off to a specialist. Enable Multi-Agent in Settings.`, `— Developer Products: developer_product_create {name, price, description?, reward?} — create a real Roblox Developer Product on this published universe (sign into roblox.com in Chrome). developer_product_list {} lists them. Aliases: create_developer_product, create_dev_product.`];
       const virtualCount = animLines.length + skillLines.length + agentLines.length + webLines.length;
       return `Output of '${name}':\n${requested} commands (${scoped.length}${virtualCount ?  ` + ${virtualCount} OR virtual tools` : ""}):\n\n${lines.join("\n\n")}${animLines.length ?  "\n\n" + animLines.join("\n\n") : ""}${skillLines.length ?  "\n\n" + skillLines.join("\n\n") : ""}${agentLines.length ?  "\n\n" + agentLines.join("\n\n") : ""}\n\n${webLines.join("\n")}`;
     }
@@ -2727,7 +2905,8 @@
         return last;
       }
     }
-    const timeout = name === "execute_luau" ? 20000 : 120000;
+    const isPictureTool = /screenshot|screen_capture|viewport|capture_frame/i.test(String(name || ""));
+    const timeout = isPictureTool ? PICTURE_TOOL_MS : (name === "execute_luau" ? 20000 : 120000);
     // Hard watchdog: even if the background worker never answers, the loop
     // gets a definitive result and continues.
     const hardCap = new Promise((res) =>
@@ -2816,7 +2995,7 @@
     }
     if (r.kind === "disconnected") return RS.FEEDBACK.bridgeOffline;
     if (r.kind === "timeout") {
-      return `ERROR: tool '${name}' timed out after ${name === "execute_luau" ? 20 : 120}s.\n${r.error}\nTry a shorter/simpler call or check that Roblox Studio is open and responsive.`;
+      return `ERROR: tool '${name}' timed out after ${Math.round(timeout / 1000)}s.\n${r.error}\nTry a shorter/simpler call or check that Roblox Studio is open and responsive.`;
     }
     if (name === "execute_luau") {
       const err = r.error || "";
@@ -6557,7 +6736,18 @@ function renderCards(panel) {
     //  • session active   → live dot, "Agent active · N tools" (no action)
     //  • fresh blank chat → "Standby…" (or a bridge/Studio warning), action = Start
     //  • existing chat    → "No agent in this chat" (informs only, no action)
+    // renderBar touches a dozen nodes and runs on every status tick. A page missing one
+    // of them (or a Chrome change that drops a node) used to take the whole status update
+    // down with "Cannot read properties of null (reading 'classList')" - the error the
+    // user pasted from renderBar -> setStatus. The work keeps its own name for the tests;
+    // this wrapper records the failure instead of throwing it at the console.
     function renderBar() {
+      try { renderBarUnsafe(); }
+      catch (e) {
+        try { diag("renderBar.crash", { err: String((e && e.message) || e), at: String((e && e.stack) || "").split("\n")[1] || "" }); } catch {}
+      }
+    }
+    function renderBarUnsafe() {
       if (!bar) return;
       // Persona badge: only visible when a specialist persona is active.
       

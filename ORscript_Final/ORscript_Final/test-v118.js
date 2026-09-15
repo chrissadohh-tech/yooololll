@@ -724,10 +724,25 @@ const WIKI_JSON = JSON.stringify({ query: { search: [{ title: "Roblox" }, { titl
     // window route; the reason may only be reported AFTER the call fails.
     // "No picture came back" must name the likely cause on an old build, and both
     // ways forward - otherwise it reads like Studio failed when the agent ate it.
-    ok("a picture-less capture explains the old agent and both ways forward",
-       /predates image handling/.test(bgSrc) && /cargo build --release\) \\n?/.test(bgSrc) === false ?
-         /predates image handling/.test(bgSrc) && /use \{target:\\"window\\"\} now/.test(bgSrc) :
-         /predates image handling/.test(bgSrc) && /use \{target:\\"window\\"\} now/.test(bgSrc));
+    // A picture-less answer must name the likely cause AND every route that still
+    // works. The wording changed when a text answer that names a file (or inlines
+    // base64) started being converted into a real attachment: the old text told the
+    // user a rebuild was required, which is no longer true for those servers.
+    ok("a picture-less capture explains the old agent and every route that still works",
+       /cannot carry IMAGE DATA/.test(bgSrc) && /named no file and held no base64/.test(bgSrc) &&
+       /The file route still works when the tool saves the shot/.test(bgSrc) &&
+       /and \{target:\\"window\\"\} always works/.test(bgSrc));
+    ok("...and the no-picture note says what WOULD have been convertible",
+       /named no image file and contained no base64/.test(bgSrc) && /inlines base64, works/.test(bgSrc));
+    ok("an MCP that answers with a PATH is converted into a real attachment",
+       /async function harvestToolImage/.test(bgSrc) && /function imagePathInText/.test(bgSrc) &&
+       /read back as base64 TEXT in /.test(bgSrc));
+    ok("...and one that inlines base64 is converted too",
+       /function imageDataInText/.test(bgSrc) && /base64 TEXT in the tool's own answer/.test(bgSrc) &&
+       /iVBOR/.test(bgSrc));
+    ok("...but only for tools that are supposed to return a picture",
+       /CAPTURE_TOOL_RE\.test\(String\(toolName\)\)/.test(bgSrc) && /harvestToolImage\(r, msg\.name\)/.test(bgSrc) &&
+       /a tool that merely MENTIONS a \.png/.test(bgSrc));
     ok("the in-Studio capture is attempted, not skipped on a cached snapshot",
        /const before = shots\.length;/.test(mainSrc) && /else await tryMcp\("screen_capture", "studio"\)/.test(mainSrc));
     ok("...and the old silent skips are gone", !/the Roblox MCP is NOT alive \(bridge reports the server down\) - skipped the call/.test(mainSrc) &&
@@ -855,6 +870,67 @@ const WIKI_JSON = JSON.stringify({ query: { search: [{ title: "Roblox" }, { titl
     ok("the local bridge result carries images", /images: Array\.isArray\(msg\.images\) \? msg\.images : \[\]/.test(bgSrc));
     ok("the local engine's tool list is remembered", /localToolsCache = msg\.tools/.test(bgSrc));
   }
+
+    // ── the two newest commands, and the guards that keep them honest ──────────
+    ok("attach_check is a real command with its alias set",
+       /attach_check\|attachment_check\|attach_compat/.test(mainSrc) &&
+       /name === "attach_check"/.test(mainSrc) === false &&
+       /OR_ATTACH_CHECK/.test(mainSrc));
+    ok("...it stages a probe through the provider's OWN upload path and removes it again",
+       /await P\.attachImages\(\[\{ mimeType: "image\/png", data: PROBE_PNG \}\]\)/.test(mainSrc) &&
+       /if \(fn\("clearAttachments"\)\) await P\.clearAttachments\(\)/.test(mainSrc));
+    ok("...it tells pictures apart from documents using the site's own file picker",
+       /docTokens/.test(mainSrc) && /IMAGES only/.test(mainSrc) && /files = takesDocs \? docTokens/.test(mainSrc));
+    ok("...and it never sends or types anything (the probe is removed, the text untouched)",
+       /json\.textUntouched = textAfter === textBefore/.test(mainSrc) && /composer left empty/.test(mainSrc));
+    ok("attach_images is an accepted spelling of attach_feedback",
+       /name === "attach_images"/.test(mainSrc) && /attach_images, attach_file/.test(mainSrc));
+    ok("or_report is a real command with its alias set",
+       /or_report\|bug_report\|or_bug_report\|support_bundle/.test(mainSrc) && /OR_REPORT/.test(mainSrc));
+    ok("...it carries the agent build, the bridge and the attachment surface",
+       /has_base64/.test(mainSrc) && /line\("Bridge", JSON\.stringify/.test(mainSrc) && /line\("Attachments",/.test(mainSrc));
+    ok("...it hands over every captured page error WITH the stack frames",
+       /uncaught\.error/.test(mainSrc) && /e\.error && e\.error\.stack/.test(mainSrc) &&
+       /copy out of DevTools by hand/.test(mainSrc));
+    ok("...and it is exported as one paste-ready block, so the user never retypes a bug",
+       /paste this WHOLE block/.test(mainSrc) && /"errors":/.test(mainSrc) === false &&
+       /j\.errors = errs\.map/.test(mainSrc) && /j\.diag_tail = tail\.map/.test(mainSrc));
+    // The crash the user pasted (renderBar -> setStatus, null.classList) must not be
+    // able to take the whole status update - or the page - down with it.
+    ok("renderBar cannot crash the status update any more",
+       /function renderBarUnsafe\(\)/.test(mainSrc) &&
+       /try \{ renderBarUnsafe\(\); \}/.test(mainSrc) &&
+       /renderBar\.crash/.test(mainSrc));
+    ok("...and the work it does keeps its own name, so the bar still renders",
+       /renderBarUnsafe\(\);\s*\r?\n\s*\}/.test(mainSrc) === false && /diag\("renderBar\.crash"/.test(mainSrc));
+    // "the screenshot never answered" started as a two-minute wait per call.
+    ok("a tool that returns a picture has a short, named budget",
+       /let PICTURE_TOOL_MS = \d+;/.test(mainSrc) && /isPictureTool \? PICTURE_TOOL_MS/.test(mainSrc) &&
+       /__rsToolTimeouts/.test(mainSrc));
+    ok("...and the timeout message states the REAL budget, never a hardcoded 120s",
+       /timed out after \$\{Math\.round\(timeout \/ 1000\)\}s/.test(mainSrc) &&
+       !/timed out after \$\{name === "execute_luau" \? 20 : 120\}s/.test(mainSrc));
+    ok("an MCP that answers with text instead of a picture is NAMED, not called 'nothing captured'",
+       /drops image blocks/.test(mainSrc) && /returned no image data/.test(mainSrc));
+    // ── the provider attachment table must match the provider files ────────────
+    // A table that claims a provider can attach (or that it sees pictures) when the
+    // file says otherwise is worse than no table: it sends the user to the wrong site.
+    {
+      const dir = path.join(root, "providers");
+      const files = fs.readdirSync(dir).filter((f) => f.endsWith(".js"));
+      const facts = files.map((f) => {
+        const src = fs.readFileSync(path.join(dir, f), "utf8");
+        return { id: f.replace(/\.js$/, ""), attach: /attachImages/.test(src), vision: !/supportsVision:\s*false/.test(src) };
+      }).filter((x) => x.attach);
+      const rows = [...cfgSrc.matchAll(/\{ id: "([^"]+)",\s*name: "([^"]*)",\s*images: (true|false), vision: (true|false) \}/g)]
+        .map((m) => ({ id: m[1], name: m[2], images: m[3] === "true", vision: m[4] === "true" }));
+      ok("every provider with an upload path is in the table", rows.length === facts.length && facts.every((f) => rows.some((r) => r.id === f.id)),
+         "table: " + rows.map((r) => r.id).join(",") + " | files: " + facts.map((f) => f.id).join(","));
+      ok("...and each row's vision flag matches its provider file",
+         facts.every((f) => { const r = rows.find((x) => x.id === f.id); return r && r.vision === f.vision; }));
+      ok("...and the table is what the command prints (no hardcoded second copy)",
+         /PROVIDER_ATTACH_MATRIX/.test(mainSrc) && !/images: true, vision/.test(mainSrc));
+    }
 
   // ── 10. No stale code paths left behind ────────────────────────────────────
   ok("old ddgSearch helper is gone", !bgSrc.includes("ddgSearch"));
