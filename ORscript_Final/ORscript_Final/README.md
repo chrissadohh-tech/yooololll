@@ -55,11 +55,20 @@ node test-chatgpt.js
 node test-animlib.js
 node test-v111.js
 node test-v112.js
+node test-v115.js
+node test-shots.js
 node --check core/main.js && node --check core/config.js && node --check background.js
 cd agent && cargo test
 ```
 
-`test-bridges.js` is a live smoke test: start `or-agent` first. It checks HTTP `:3000` and WS `17613` / `17615` (no Unreal port).
+`test-bridges.js` is a live smoke test: start `or-agent` first.
+
+`test-shots.js` needs no browser and no Studio: it loads the real `core/main.js` with the real
+`background.js` behind a fake DOM and calls every screenshot/attach command (`or_screenshot` on
+all 14 targets, `screenshot` / `take_screenshot` / `send_screenshot`, `attach_feedback` plus its
+9 aliases, `or_focus_studio`) through the `window.__rsRunTool` seam. A scope bug like the one that
+broke every screenshot with `Cannot access 'RECENT_IMAGES_MAX' before initialization` shows up here
+in under a second, where `node --check` cannot see it. It checks HTTP `:3000` and WS `17613` / `17615` (no Unreal port).
 
 ## Privacy
 

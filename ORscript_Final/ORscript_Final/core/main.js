@@ -1884,6 +1884,213 @@
     return "Output of 'developer_product_list':\n" + String(r.text || JSON.stringify(r.products || r, null, 2)).slice(0, 4000);
   }
 
+  // ── Image attach plumbing (or_screenshot / attach_feedback / or_focus_studio) ──
+  // NOTE: this block MUST stay at closure scope. It was once inserted inside
+  // runTool() (2-space indent made it look top-level), which put
+  // RECENT_IMAGES_MAX in the temporal dead zone for the or_screenshot branch
+  // declared earlier in the same body - every screenshot died with "Cannot
+  // access 'RECENT_IMAGES_MAX' before initialization" before capturing, and the
+  // popup's Copy / Use-as-feedback buttons could not see these helpers at all.
+  // A static parse cannot see scope (node --check passes on a TDZ error) and greps
+  // only proved the text existed somewhere, so the guard is test-shots.js: it loads
+  // THIS file with the real background.js behind a fake DOM and calls every
+  // screenshot/attach command. With this block inside runTool it reports
+  // "Cannot access 'RECENT_IMAGES_MAX' before initialization" - the exact failure
+  // the user hit - and with it here all 47 checks pass.
+  // One place that turns a tool's base64 images into (a) a remembered recent
+  // capture, (b) a real Blob/File, (c) a clipboard item, and (d) a composer
+  // attachment. Every provider's attachImages() already accepts {mimeType,data}
+  // payloads, so nothing here is provider-specific.
+  const RECENT_IMAGES_MAX = 8;
+  function rememberImages(images, source) {
+    if (!images || !images.length) return;
+    const at = Date.now();
+    for (const img of images) {
+      if (!img || !img.data) continue;
+      A.recentImages.unshift({ mimeType: img.mimeType || "image/png", data: img.data, at, source: source || "capture" });
+    }
+    if (A.recentImages.length > RECENT_IMAGES_MAX) A.recentImages.length = RECENT_IMAGES_MAX;
+    A.lastShot = A.recentImages[0] || null;
+  }
+  function imageToBlob(img) {
+    const mime = (img && img.mimeType) || "image/png";
+    const bin = atob(String((img && img.data) || ""));
+    const arr = new Uint8Array(bin.length);
+    for (let j = 0; j < bin.length; j++) arr[j] = bin.charCodeAt(j);
+    return new Blob([arr], { type: mime });
+  }
+  // Chrome's async clipboard only accepts image/png, so a jpeg/webp capture is
+  // re-encoded through a canvas (which also gives us the pixel size we report).
+  async function imageToPngBlob(img) {
+    const blob = imageToBlob(img);
+    const mime = (img && img.mimeType) || "";
+    if (mime.includes("png")) {
+      try {
+        const bmp = await createImageBitmap(blob);
+        return { blob, width: bmp.width, height: bmp.height };
+      } catch { return { blob, width: 0, height: 0 }; }
+    }
+    try {
+      const bmp = await createImageBitmap(blob);
+      const c = document.createElement("canvas");
+      c.width = bmp.width; c.height = bmp.height;
+      c.getContext("2d").drawImage(bmp, 0, 0);
+      const png = await new Promise((res) => { try { c.toBlob((b) => res(b), "image/png"); } catch { res(null); } });
+      return { blob: png || blob, width: bmp.width, height: bmp.height };
+    } catch {
+      return { blob, width: 0, height: 0 };
+    }
+  }
+  async function copyImageToClipboard(img) {
+    if (!navigator.clipboard || typeof ClipboardItem === "undefined") {
+      return { ok: false, error: "this browser exposes no image clipboard API" };
+    }
+    try {
+      const { blob } = await imageToPngBlob(img);
+      await navigator.clipboard.write([new ClipboardItem({ [blob.type || "image/png"]: blob })]);
+      return { ok: true };
+    } catch (e) {
+      // Chrome demands the tab be focused (and may want a real user gesture) —
+      // report it plainly instead of pretending the copy happened.
+      return { ok: false, error: String((e && e.message) || e).slice(0, 140) };
+    }
+  }
+  const kb = (b64) => Math.round((String(b64 || "").length * 3) / 4 / 102.4) / 10;
+
+  // Shared capture routine: used by or_screenshot AND attach_feedback so both
+  // agree on what "studio", "tab" and "blender" mean.
+  async function captureShots(target, opts) {
+    const o = opts || {};
+    const shots = [];
+    const notes = [];
+    const tryMcp = async (toolName, label) => {
+      try {
+        const r = await bg({ type: "call_tool", name: toolName, arguments: {}, timeout: 20000 });
+        if (r && r.ok && r.images && r.images.length) {
+          shots.push(...r.images);
+          notes.push(label + ": " + r.images.length + " image(s)");
+          return true;
+        }
+        if (r && !r.ok) notes.push(label + ": " + String(r.error || "failed").slice(0, 160));
+        else if (r && r.ok) notes.push(label + ": returned no image data");
+      } catch (e) {
+        notes.push(label + ": " + String((e && e.message) || e).slice(0, 160));
+      }
+      return false;
+    };
+    const wantStudio = target === "auto" || target === "studio" || target === "roblox" || target === "viewport";
+    const wantBlend = target === "auto" || target === "blender" || target === "blender_window";
+    const wantWindow = target === "auto" || target === "window" || target === "studio_window" || target === "os" || target === "desktop";
+    const wantTab = target === "tab" || target === "chat" || target === "page" || target === "self";
+    // Which servers does the bridge say are alive? Attempting a tool on a server
+    // that is NOT there burns the whole timeout (the 11s stall the user saw) and
+    // then reports a generic failure - so check first and say what is missing.
+    const serverUp = (id) => {
+      try {
+        const list = (A.bridge && A.bridge.servers) || [];
+        if (!list.length) return null;              // unknown: try anyway
+        const srv = list.find((x) => x && x.id === id);
+        return srv ? srv.alive !== false : null;
+      } catch { return null; }
+    };
+    // Is ANY agent-side connection live? A status refresh runs every 5s, so this is
+    // normally known. If it is not known yet, ask ONCE (a local, ~ms round-trip)
+    // rather than burning a 20s bridge-connect wait on a screenshot request.
+    let bridgeUp = !!(A.bridge && (A.bridge.connected || A.bridge.local_connected || (Array.isArray(A.bridge.servers) && A.bridge.servers.length)));
+    if (!A.bridge) {
+      try {
+        const st = await bg({ type: "status" });
+        if (st) { A.bridge = st; bridgeUp = !!(st.connected || st.local_connected || (Array.isArray(st.servers) && st.servers.length)); }
+      } catch {}
+    }
+    if (!bridgeUp) {
+      notes.push("no local connection: or-agent.exe / the bridge is not connected, so no Studio or Blender capture can be taken" +
+        (A.bridge ? "" : " (bridge state unknown - the worker did not answer)") + " - start it with Start-OR-Agent.cmd, then retry");
+    }
+    const roster = Array.isArray(A.toolList) ? A.toolList : [];
+    const hasTool = (t) => !roster.length || roster.some((x) => bareToolName(x && (x.name || x.id)) === t);
+    const studioUp = serverUp("roblox") !== false && serverUp("studio") !== false;
+    if (wantStudio) {
+      if (!bridgeUp) notes.push("studio: skipped - there is no live agent/bridge connection for the Roblox MCP to ride on");
+      else if (!studioUp) notes.push("studio: the Roblox MCP is NOT alive (bridge reports the server down) - skipped the call");
+      else if (!hasTool("screen_capture")) notes.push("studio: the MCP advertises no screen_capture tool right now (0 tools listed) - skipped the call; run list_commands / restart_mcp");
+      else await tryMcp("screen_capture", "studio");
+    }
+    if (wantBlend && !shots.length) {
+      if (!bridgeUp) notes.push("blender: skipped - no live agent/bridge connection");
+      else if (A.bridge && A.bridge.blender) await tryMcp("get_viewport_screenshot", "blender");
+      else notes.push("blender: not connected - skipped");
+    }
+    // OS-side fallback: photograph the Studio WINDOW itself (agent + PowerShell).
+    // Works while Studio is behind the browser, so it is a better fallback than a
+    // tab capture - and the only path that works when the picture must be of
+    // Studio rather than of this page.
+    if (wantWindow && !shots.length) {
+      try {
+        const r = await bg({ type: "studio_window_shot", focus: !!opts.focus, max_width: opts.maxWidth });
+        if (r && r.ok && r.images && r.images.length) {
+          shots.push(...r.images);
+          notes.push("studio window: " + (r.text || "captured"));
+        } else {
+          notes.push("studio window: " + String((r && r.error) || "capture failed").slice(0, 300));
+        }
+      } catch (e) {
+        notes.push("studio window: " + String((e && e.message) || e).slice(0, 200));
+      }
+    }
+    if (wantTab || (target === "auto" && !shots.length)) {
+      // Chrome's tab capture photographs whatever is in FRONT, so say so BEFORE
+      // taking it - a shot of another tab is worse than no shot, because the
+      // model describes it as if it were the user's screen.
+      try {
+        const front = await bg({ type: "tab_front" });
+        if (front && front.ok && front.is_sender_tab === false) {
+          const what = front.title || front.url || "another tab";
+          notes.push("front tab is '" + String(what).slice(0, 80) + "', not this chat");
+          try { ui.toast("Capturing the tab in FRONT (" + String(what).slice(0, 40) + "), not this chat — bring this tab forward for a shot of the conversation.", 6000); } catch {}
+        }
+      } catch {}
+      try {
+        const r = await bg({ type: "capture_tab" });
+        if (r && r.ok && r.images && r.images.length) {
+          shots.push(...r.images);
+          // "this is the tab in FRONT, not this chat" - the model must not
+          // describe an unrelated screen as if it were Studio.
+          notes.push("tab: " + r.images.length + " image(s)" + (r.warning ? " - " + r.warning : ""));
+        } else if (r && !r.ok) notes.push("tab: " + String(r.error || "failed").slice(0, 320));
+      } catch (e) {
+        notes.push("tab: " + String((e && e.message) || e).slice(0, 160));
+      }
+    }
+    // Nothing worked: find out WHY in a way the model can act on. The single most
+    // common cause by far is an outdated or-agent.exe: it keeps only text blocks,
+    // so Studio's screenshot arrives as an empty string and every image path fails
+    // - including the file readback the Blender-style fallbacks depend on.
+    if (!shots.length) {
+      try {
+        const info = await bg({ type: "agent_info" });
+        if (info && info.has_base64 === false) {
+          notes.push("AGENT OUTDATED: or-agent.exe lists " + info.tools + " tools and cannot hand the browser a file " +
+            "(read_file_base64 is missing), so NO screenshot can reach you from any target. Rebuild it: cd agent && cargo build --release, " +
+            "copy target/release/or-agent.exe over the old one, restart it, then retry. Until then ask for text output instead.");
+        } else if (info && info.ok === false) {
+          notes.push("AGENT OFFLINE: or-agent.exe is not running (" + (info.reason || "no answer") + "), so the OS-side Studio window capture and file readback are unavailable.");
+        }
+      } catch {}
+    }
+    return { shots, notes };
+  }
+
+
+  // ── Test/debug seam ────────────────────────────────────────────────────────
+  // Run ONE OR command exactly as the agent loop would, without a model:
+  //   await __rsRunTool("or_screenshot", {target:"window"})
+  // in DevTools with the console context set to OR's content-script world
+  // (console context dropdown → the extension entry), or from test-shots.js.
+  // It grants nothing the loop does not already have - it IS the loop's own
+  // dispatcher - and it makes screenshot paths testable without a live chat.
+  try { window.__rsRunTool = (name, args) => runTool({ tool: name, arguments: args || {} }); } catch {}
+
   async function runTool(call) {
     let name = call.tool;
     const args = call.arguments || {};
@@ -2244,175 +2451,6 @@
       const virtualCount = animLines.length + skillLines.length + agentLines.length + webLines.length;
       return `Output of '${name}':\n${requested} commands (${scoped.length}${virtualCount ?  ` + ${virtualCount} OR virtual tools` : ""}):\n\n${lines.join("\n\n")}${animLines.length ?  "\n\n" + animLines.join("\n\n") : ""}${skillLines.length ?  "\n\n" + skillLines.join("\n\n") : ""}${agentLines.length ?  "\n\n" + agentLines.join("\n\n") : ""}\n\n${webLines.join("\n")}`;
     }
-    // ── Image attach plumbing (or_screenshot / attach_feedback) ───────────
-  // One place that turns a tool's base64 images into (a) a remembered recent
-  // capture, (b) a real Blob/File, (c) a clipboard item, and (d) a composer
-  // attachment. Every provider's attachImages() already accepts {mimeType,data}
-  // payloads, so nothing here is provider-specific.
-  const RECENT_IMAGES_MAX = 8;
-  function rememberImages(images, source) {
-    if (!images || !images.length) return;
-    const at = Date.now();
-    for (const img of images) {
-      if (!img || !img.data) continue;
-      A.recentImages.unshift({ mimeType: img.mimeType || "image/png", data: img.data, at, source: source || "capture" });
-    }
-    if (A.recentImages.length > RECENT_IMAGES_MAX) A.recentImages.length = RECENT_IMAGES_MAX;
-    A.lastShot = A.recentImages[0] || null;
-  }
-  function imageToBlob(img) {
-    const mime = (img && img.mimeType) || "image/png";
-    const bin = atob(String((img && img.data) || ""));
-    const arr = new Uint8Array(bin.length);
-    for (let j = 0; j < bin.length; j++) arr[j] = bin.charCodeAt(j);
-    return new Blob([arr], { type: mime });
-  }
-  // Chrome's async clipboard only accepts image/png, so a jpeg/webp capture is
-  // re-encoded through a canvas (which also gives us the pixel size we report).
-  async function imageToPngBlob(img) {
-    const blob = imageToBlob(img);
-    const mime = (img && img.mimeType) || "";
-    if (mime.includes("png")) {
-      try {
-        const bmp = await createImageBitmap(blob);
-        return { blob, width: bmp.width, height: bmp.height };
-      } catch { return { blob, width: 0, height: 0 }; }
-    }
-    try {
-      const bmp = await createImageBitmap(blob);
-      const c = document.createElement("canvas");
-      c.width = bmp.width; c.height = bmp.height;
-      c.getContext("2d").drawImage(bmp, 0, 0);
-      const png = await new Promise((res) => { try { c.toBlob((b) => res(b), "image/png"); } catch { res(null); } });
-      return { blob: png || blob, width: bmp.width, height: bmp.height };
-    } catch {
-      return { blob, width: 0, height: 0 };
-    }
-  }
-  async function copyImageToClipboard(img) {
-    if (!navigator.clipboard || typeof ClipboardItem === "undefined") {
-      return { ok: false, error: "this browser exposes no image clipboard API" };
-    }
-    try {
-      const { blob } = await imageToPngBlob(img);
-      await navigator.clipboard.write([new ClipboardItem({ [blob.type || "image/png"]: blob })]);
-      return { ok: true };
-    } catch (e) {
-      // Chrome demands the tab be focused (and may want a real user gesture) —
-      // report it plainly instead of pretending the copy happened.
-      return { ok: false, error: String((e && e.message) || e).slice(0, 140) };
-    }
-  }
-  const kb = (b64) => Math.round((String(b64 || "").length * 3) / 4 / 102.4) / 10;
-
-  // Shared capture routine: used by or_screenshot AND attach_feedback so both
-  // agree on what "studio", "tab" and "blender" mean.
-  async function captureShots(target, opts) {
-    const o = opts || {};
-    const shots = [];
-    const notes = [];
-    const tryMcp = async (toolName, label) => {
-      try {
-        const r = await bg({ type: "call_tool", name: toolName, arguments: {}, timeout: 45000 });
-        if (r && r.ok && r.images && r.images.length) {
-          shots.push(...r.images);
-          notes.push(label + ": " + r.images.length + " image(s)");
-          return true;
-        }
-        if (r && !r.ok) notes.push(label + ": " + String(r.error || "failed").slice(0, 160));
-        else if (r && r.ok) notes.push(label + ": returned no image data");
-      } catch (e) {
-        notes.push(label + ": " + String((e && e.message) || e).slice(0, 160));
-      }
-      return false;
-    };
-    const wantStudio = target === "auto" || target === "studio" || target === "roblox" || target === "viewport";
-    const wantBlend = target === "auto" || target === "blender" || target === "blender_window";
-    const wantWindow = target === "auto" || target === "window" || target === "studio_window" || target === "os" || target === "desktop";
-    const wantTab = target === "tab" || target === "chat" || target === "page" || target === "self";
-    // Which servers does the bridge say are alive? Attempting a tool on a server
-    // that is NOT there burns the whole timeout (the 11s stall the user saw) and
-    // then reports a generic failure - so check first and say what is missing.
-    const serverUp = (id) => {
-      try {
-        const list = (A.bridge && A.bridge.servers) || [];
-        if (!list.length) return null;              // unknown: try anyway
-        const srv = list.find((x) => x && x.id === id);
-        return srv ? srv.alive !== false : null;
-      } catch { return null; }
-    };
-    const roster = Array.isArray(A.toolList) ? A.toolList : [];
-    const hasTool = (t) => !roster.length || roster.some((x) => bareToolName(x && (x.name || x.id)) === t);
-    const studioUp = serverUp("roblox") !== false && serverUp("studio") !== false;
-    if (wantStudio) {
-      if (!studioUp) notes.push("studio: the Roblox MCP is NOT alive (bridge reports the server down) - skipped the call");
-      else if (!hasTool("screen_capture")) notes.push("studio: the MCP advertises no screen_capture tool right now (0 tools listed) - skipped the call; run list_commands / restart_mcp");
-      else await tryMcp("screen_capture", "studio");
-    }
-    if (wantBlend && !shots.length) {
-      if (A.bridge && A.bridge.blender) await tryMcp("get_viewport_screenshot", "blender");
-      else notes.push("blender: not connected - skipped");
-    }
-    // OS-side fallback: photograph the Studio WINDOW itself (agent + PowerShell).
-    // Works while Studio is behind the browser, so it is a better fallback than a
-    // tab capture - and the only path that works when the picture must be of
-    // Studio rather than of this page.
-    if (wantWindow && !shots.length) {
-      try {
-        const r = await bg({ type: "studio_window_shot", focus: !!opts.focus, max_width: opts.maxWidth });
-        if (r && r.ok && r.images && r.images.length) {
-          shots.push(...r.images);
-          notes.push("studio window: " + (r.text || "captured"));
-        } else {
-          notes.push("studio window: " + String((r && r.error) || "capture failed").slice(0, 300));
-        }
-      } catch (e) {
-        notes.push("studio window: " + String((e && e.message) || e).slice(0, 200));
-      }
-    }
-    if (wantTab || (target === "auto" && !shots.length)) {
-      // Chrome's tab capture photographs whatever is in FRONT, so say so BEFORE
-      // taking it - a shot of another tab is worse than no shot, because the
-      // model describes it as if it were the user's screen.
-      try {
-        const front = await bg({ type: "tab_front" });
-        if (front && front.ok && front.is_sender_tab === false) {
-          const what = front.title || front.url || "another tab";
-          notes.push("front tab is '" + String(what).slice(0, 80) + "', not this chat");
-          try { ui.toast("Capturing the tab in FRONT (" + String(what).slice(0, 40) + "), not this chat — bring this tab forward for a shot of the conversation.", 6000); } catch {}
-        }
-      } catch {}
-      try {
-        const r = await bg({ type: "capture_tab" });
-        if (r && r.ok && r.images && r.images.length) {
-          shots.push(...r.images);
-          // "this is the tab in FRONT, not this chat" - the model must not
-          // describe an unrelated screen as if it were Studio.
-          notes.push("tab: " + r.images.length + " image(s)" + (r.warning ? " - " + r.warning : ""));
-        } else if (r && !r.ok) notes.push("tab: " + String(r.error || "failed").slice(0, 320));
-      } catch (e) {
-        notes.push("tab: " + String((e && e.message) || e).slice(0, 160));
-      }
-    }
-    // Nothing worked: find out WHY in a way the model can act on. The single most
-    // common cause by far is an outdated or-agent.exe: it keeps only text blocks,
-    // so Studio's screenshot arrives as an empty string and every image path fails
-    // - including the file readback the Blender-style fallbacks depend on.
-    if (!shots.length) {
-      try {
-        const info = await bg({ type: "agent_info" });
-        if (info && info.has_base64 === false) {
-          notes.push("AGENT OUTDATED: or-agent.exe lists " + info.tools + " tools and cannot hand the browser a file " +
-            "(read_file_base64 is missing), so NO screenshot can reach you from any target. Rebuild it: cd agent && cargo build --release, " +
-            "copy target/release/or-agent.exe over the old one, restart it, then retry. Until then ask for text output instead.");
-        } else if (info && info.ok === false) {
-          notes.push("AGENT OFFLINE: or-agent.exe is not running (" + (info.reason || "no answer") + "), so the OS-side Studio window capture and file readback are unavailable.");
-        }
-      } catch {}
-    }
-    return { shots, notes };
-  }
-
   // ── Virtual animation tools ──────────────────────────────────────────
     // Create/edit Roblox animation KEYFRAME DATA (KeyframeSequence/Keyframe/
     // Pose, per-bone transforms) via execute_luau + the RSAnim Luau library.
