@@ -682,6 +682,15 @@ const call = async (c, tool, args, ms = 9000) => {
       ok("...and names the text tunnel as the delivery route", /text tunnel/i.test(shot), shot.slice(0, 300));
       const imgs = recent();
       ok("...and image bytes were really attached (not just a claim)", imgs.length > 0 && String(imgs[0].data || "").length > 1000, JSON.stringify({ n: imgs.length, bytes: String((imgs[0] || {}).data || "").length }));
+      // THE USER'S OWN QUESTION: Studio sits in the background while another app is in
+      // front (Blender, say). A plain Studio-window capture must therefore NOT ask
+      // Windows to raise or focus Studio - if it did, the user's foreground app would be
+      // ripped away on every screenshot.
+      ok("...and it never stole focus from whatever is in front (no -Focus in the command)",
+         agent.commands.some((cm) => /-Out/.test(cm)) && !agent.commands.some((cm) => /-Focus(?!Only)/.test(cm)),
+         agent.commands.slice(-1)[0] || "(no command)");
+      ok("...and Studio being behind the browser changes nothing (no FocusOnly either)",
+         !agent.commands.some((cm) => /-FocusOnly/.test(cm)), agent.commands.join(" | ").slice(0, 160));
       const expected = fs.readFileSync(path.join(root, "or-agent.exe")); // any 90KB payload: compare hashes below instead
       if (imgs.length) {
         const got = Buffer.from(String(imgs[0].data || ""), "base64");
