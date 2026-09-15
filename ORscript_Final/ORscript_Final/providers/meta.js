@@ -534,11 +534,18 @@ const RSProvider = (() => {
     // retries via the _attachedImages identity guard.
     if (images && images.length && images !== _attachedImages) {
       if (hasPendingAttachment()) clearAttachments();
+      let ok = false;
       try {
-        const ok = await attachImages(images);
+        ok = await attachImages(images);
         if (ok) _attachedImages = images;
         diag("meta.tas.attached", { ok, imgId: images.__rsId });
       } catch (e) { diag("meta.tas.attachErr", { msg: String((e && e.message) || e) }); }
+      if (!ok) {
+        // One retry (uploads are timing-sensitive), then refuse to send the text alone:
+        // a message claiming a picture the model cannot see is worse than an error.
+        try { ok = await attachImages(images); if (ok) _attachedImages = images; } catch { ok = false; }
+      }
+      if (!ok && !hasPendingAttachment()) { throw new Error("OR_IMAGE_ATTACH_FAILED: the screenshot did not reach this chat's composer, so nothing was sent (the picture IS the message). Retry, or use attach_feedback {action:\"copy\"} and paste it with Ctrl+V."); }
     }
     // Write via the mirror textarea (the controlled input that drives Lexical).
     const editor = writeEl();

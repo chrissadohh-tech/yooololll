@@ -682,7 +682,14 @@ const RSProvider = (() => {
       diag("copilot.retrySetAfter", { after: editorText().length });
     }
     if (images && images.length) {
-      try { await attachImages(images); } catch (e) { diag("attach.err", { msg: String(e && e.message || e).slice(0, 120) }); }
+      // A picture-less send would leave the model describing nothing, so make sure it
+      // landed: retry once, then refuse instead of pretending.
+      let orAttached = false;
+      for (let orTry = 0; orTry < 2 && !orAttached; orTry++) {
+        try { orAttached = (await attachImages(images)) !== false; }
+        catch (e) { orAttached = false; diag("attach.err", { msg: String((e && e.message) || e).slice(0, 120) }); }
+      }
+      if (!orAttached) { throw new Error("OR_IMAGE_ATTACH_FAILED: the screenshot did not reach this chat's composer, so nothing was sent (the picture IS the message). Retry, or use attach_feedback {action:\"copy\"} and paste it with Ctrl+V."); }
     }
     diag("copilot.send", { editorLen: editorText().length, textLen: text.length, hasImages: !!(images && images.length), id: editor.id || editor.getAttribute("data-testid") || "?" });
     // Microsoft Copilot PRIMARY send is Enter key (send button hydrates async and

@@ -753,6 +753,21 @@ const WIKI_JSON = JSON.stringify({ query: { search: [{ title: "Roblox" }, { titl
     ok("a one-tool-old agent is described as usable, not broken", /AGENT IS ONE TOOL OLD/.test(mainSrc) && /WINDOW route still works without a rebuild/.test(mainSrc));
     ok("...and the rebuild is still spelled out for the no-tunnel case", /cargo build --release/.test(mainSrc) && /read_file\/run_command missing/.test(mainSrc));
     ok("the tunnel needs read_file + run_command, reported by the worker", /has_read_file/.test(bgSrc) && /has_run_command/.test(bgSrc));
+    // A screenshot message must never be SENT without its picture: every provider
+    // that attaches an image has to act on the result instead of swallowing it,
+    // otherwise the model is told to look at something it cannot see.
+    {
+      const provDir = path.join(root, "providers");
+      const files = fs.readdirSync(provDir).filter((f) => f.endsWith(".js"));
+      const src = (f) => fs.readFileSync(path.join(provDir, f), "utf8");
+      const silent = files.filter((f) => /attachImages\(images\)[^\n]*catch\s*\{\s*\}/.test(src(f)));
+      ok("no provider swallows a failed image attach", silent.length === 0, silent.join(","));
+      const attachers = files.filter((f) => /attachImages\(/.test(src(f)));
+      const guarded = attachers.filter((f) => /OR_IMAGE_ATTACH_FAILED/.test(src(f)));
+      ok("...and each one refuses to send a picture-less message",
+         attachers.length > 10 && guarded.length === attachers.length,
+         "unguarded: " + attachers.filter((f) => !guarded.includes(f)).join(","));
+    }
     ok("the text tunnel reads numbered read_file pages", /name: "read_file"/.test(bgSrc) && /output truncated at/.test(bgSrc));
     // The capture is written as a BARE filename, so it lands in the agent's own
     // working directory - the same place read_file resolves - and the text twin sits

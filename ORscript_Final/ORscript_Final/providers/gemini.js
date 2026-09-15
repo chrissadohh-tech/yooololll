@@ -429,8 +429,15 @@ const RSProvider = (() => {
       };
       if (images && images.length && !hasPendingAttachment()) {
         diag("attach.beforeCall", { count: images.length });
-        try { const ok = await attachImages(images); diag("attach.afterCall", { ok }); }
-        catch (e) { diag("attach.threw", { msg: String((e && e.message) || e) }); }
+        // If the picture never reaches the composer, sending anyway tells the model to
+        // look at an image it cannot see. Retry once, then refuse - unless the site is
+        // already showing a staged preview, which is proof enough that it worked.
+        let orAttached = false;
+        for (let orTry = 0; orTry < 2 && !orAttached; orTry++) {
+          try { orAttached = (await attachImages(images)) !== false; diag("attach.afterCall", { ok: orAttached }); }
+          catch (e) { orAttached = false; diag("attach.threw", { msg: String((e && e.message) || e) }); }
+        }
+        if (!orAttached && !hasPendingAttachment()) { throw new Error("OR_IMAGE_ATTACH_FAILED: the screenshot did not reach this chat's composer, so nothing was sent (the picture IS the message). Retry, or use attach_feedback {action:\"copy\"} and paste it with Ctrl+V."); }
       }
       // A generation that just ended can leave the action button WEDGED on the
       // stop icon (see unwedgeStop), so arrow_upward never appears and the send
