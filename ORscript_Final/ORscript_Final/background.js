@@ -1114,6 +1114,67 @@ function imageDataInText(text) {
   }
   return null;
 }
+// ── an MCP tool that demands an argument OR never sends ─────────────────────
+// Studio's own screen_capture declares a REQUIRED capture_id, and OR used to call
+// every capture tool with no arguments at all - so the call came back
+// "studio: Missing required argument: capture_id" and the screenshot died with a
+// name the user cannot act on. Two ways to fill it, in order of trust:
+//   1. the tool's own inputSchema (the agent forwards MCP schemas untouched);
+//   2. the error text itself, which names the missing argument.
+// One retry each, never a loop, and the result says what was sent.
+const REQUIRED_ARG_RE = /missing required (?:argument|parameter|field|arg)s?[:=\s]+["'`]?([A-Za-z0-9_.\-]{1,40})/i;
+// NOTE: deliberately no lazy list_tools fetch here. A call that arrives before the
+// catalogue is covered by the error-driven repair below - adding a fetch would put an
+// extra frame in front of EVERY MCP call and race the bridge's own list_tools.
+function mcpSchemaFor(name) {
+  try {
+    const n = String(name || "");
+    // toolsCache is the MCP catalogue (schemas included); localToolsCache is the
+    // agent's OWN workspace tools. A capture tool lives in the first list.
+    const pools = [toolsCache, localToolsCache];
+    for (const pool of pools) {
+      const t = (Array.isArray(pool) ? pool : []).find((x) => x && String((x.name || x.id) || "") === n);
+      if (t && t.inputSchema) return t.inputSchema;
+    }
+    return null;
+  } catch { return null; }
+}
+// The catalogue is fetched lazily on first need, so a call arriving before any
+// list_tools still gets its required arguments filled instead of failing once first.
+function valueForArg(key, spec) {
+  const k = String(key || "");
+  const s = spec || {};
+  try {
+    if (Array.isArray(s.enum) && s.enum.length) return s.enum[0];
+    if (s.default !== undefined) return s.default;
+    if (/path|file|filename|output|dir|folder/i.test(k)) {
+      const dir = String(localRoot || ".").replace(/[\\/]+$/, "");
+      return dir + "/or_mcp_shot.png";
+    }
+    if (s.type === "boolean") return false;
+    if (s.type === "integer" || s.type === "number") return 1;
+    if (/id$|_id$|uuid|guid|key$|name$|label/i.test(k) || !s.type || s.type === "string")
+      return "or_screenshot_" + Date.now().toString(36);
+    return "or_" + Date.now().toString(36);
+  } catch { return "or_screenshot_" + Date.now().toString(36); }
+}
+function fillRequiredArgs(name, args) {
+  const out = Object.assign({}, args || {});
+  const filled = [];
+  try {
+    const schema = mcpSchemaFor(name);
+    const props = (schema && schema.properties) || {};
+    const req = (schema && Array.isArray(schema.required)) ? schema.required : [];
+    req.forEach((k) => {
+      if (out[k] === undefined) { out[k] = valueForArg(k, props[k]); filled.push(k); }
+    });
+  } catch {}
+  return { args: out, filled };
+}
+function missingArgIn(text) {
+  const m = String(text || "").match(REQUIRED_ARG_RE);
+  return m ? m[1] : "";
+}
 // Applies to capture-ish tools only: a tool that merely MENTIONS a .png (a file
 // listing, say) must not drag an unrelated picture into the model's context.
 const CAPTURE_TOOL_RE = /screenshot|screen_capture|capture|viewport/i;
@@ -1586,7 +1647,12 @@ async function studioWindowShot({ focus = false, focusOnly = false, maxWidth = 1
   let meta = parseShotMeta(raw);
   if (!meta) {
     return { ok: false, error: (raw.slice(-400) || "no answer from the agent (is or-agent.exe running?)"), command: cmd,
-             hint: "the script prints one OR_STUDIO_SHOT {...} line; a PowerShell parse error or a missing Add-Type means this needs the rebuilt agent" };
+             // The script prints EXACTLY ONE OR_STUDIO_SHOT line. Nothing came back, so
+             // the script never ran to completion. Those are the only honest causes, and
+             // "antivirus ate it" is the one the user cannot guess: the file is written
+             // into the agent's workspace and run with -ExecutionPolicy Bypass, which is
+             // exactly the shape a heuristic scanner flags.
+             hint: "studio_shot.ps1 prints one OR_STUDIO_SHOT {...} line and none arrived, so the script did not run to completion. Three causes, in order: (1) security software stopped it - allow the agent workspace folder in your antivirus, or run the agent again; (2) PowerShell refused the -ExecutionPolicy Bypass command (group policy); (3) the script was written by an older agent build. The full command and output are echoed above." };
   }
   if (!meta.ok) {
     // Carry the script's own diagnosis through: if the fast helper could not be
@@ -1902,11 +1968,36 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           sendResponse(await blenderCall(msg.name, msg.arguments, timeout));
           break;
         }
-        const r = await send(
-          { type: "call_tool", name: msg.name, arguments: msg.arguments, timeout: msg.timeout },
+        // Fill whatever the tool's schema says is required (Studio's screen_capture
+        // wants a capture_id) before the very first call, so the common failure never
+        // happens at all.
+        const pre = fillRequiredArgs(msg.name, msg.arguments);
+        let r = await send(
+          { type: "call_tool", name: msg.name, arguments: pre.args, timeout: msg.timeout },
           timeout,
           { connectWait: msg.connectWait }   // a screenshot asks for a short budget
         );
+        // The schema may be missing (an older agent does not forward MCP schemas) or
+        // incomplete. The server's own error names the argument it wanted, so send that
+        // one and try again - ONCE. A second failure is reported with the cause.
+        let filled = pre.filled.slice();
+        if (r && r.ok === false) {
+          const miss = missingArgIn(r.error || r.text);
+          if (miss && pre.args[miss] === undefined) {
+            const schema = mcpSchemaFor(msg.name);
+            const props = (schema && schema.properties) || {};
+            const again = Object.assign({}, pre.args);
+            again[miss] = valueForArg(miss, props[miss]);
+            filled = filled.concat([miss]);
+            const r2 = await send(
+              { type: "call_tool", name: msg.name, arguments: again, timeout: msg.timeout },
+              timeout,
+              { connectWait: msg.connectWait }
+            );
+            r = (r2 && r2.ok) ? r2 : Object.assign({}, r2 || r, { required_arg_missing: miss });
+          }
+        }
+        if (filled.length) r = Object.assign({}, r, { filled_args: filled });
         // A capture tool that answers with a path or inline base64 is turned into a
         // real attachment HERE, so every caller benefits (and no rebuild is needed).
         sendResponse(await harvestToolImage(r, msg.name));

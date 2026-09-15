@@ -685,7 +685,10 @@ const WIKI_JSON = JSON.stringify({ query: { search: [{ title: "Roblox" }, { titl
     ok("bg exposes the window-shot message", bgSrc.includes('case "studio_window_shot"'));
     ok("bg has the studioWindowShot helper", /async function studioWindowShot/.test(bgSrc));
     ok("the PS script is written into the workspace first", /async function ensureStudioShotScript/.test(bgSrc) && bgSrc.includes('extText("studio_shot.ps1")'));
-    ok("the PNG is read back through the bridge", /studioWindowShot[\s\S]{0,2600}localReadBase64\(file\)/.test(bgSrc));
+    // The window grows with the user-facing text inside the function (the "script never
+    // ran" hint is long on purpose): what matters is that the readback is IN this
+    // function, not how many characters of prose sit in between.
+    ok("the PNG is read back through the bridge", /studioWindowShot[\s\S]{0,5000}localReadBase64\(file\)/.test(bgSrc));
     ok("a missing agent is reported as such", /is or-agent\.exe running\?/.test(bgSrc));
     ok("bg answers tab_front before a capture", bgSrc.includes('case "tab_front"'));
 
@@ -931,6 +934,28 @@ const WIKI_JSON = JSON.stringify({ query: { search: [{ title: "Roblox" }, { titl
       ok("...and the table is what the command prints (no hardcoded second copy)",
          /PROVIDER_ATTACH_MATRIX/.test(mainSrc) && !/images: true, vision/.test(mainSrc));
     }
+
+    // ── a required MCP argument must never be a dead end ───────────────────────
+    // Studio's screen_capture declares a required capture_id, and OR called it with no
+    // arguments at all: every in-Studio capture failed with a parameter name the user
+    // could not act on. Two fills, one retry each, and the answer says what was sent.
+    ok("required MCP arguments are filled from the tool's own schema",
+       /function fillRequiredArgs/.test(bgSrc) && /function mcpSchemaFor/.test(bgSrc) &&
+       /Array\.isArray\(schema\.required\)/.test(bgSrc) && /function valueForArg/.test(bgSrc));
+    ok("...and the server's own error text is enough for one repair retry",
+       /function missingArgIn/.test(bgSrc) && /REQUIRED_ARG_RE/.test(bgSrc) &&
+       /missing required \(\?:argument\|parameter/.test(bgSrc) && /const miss = missingArgIn\(r\.error \|\| r\.text\)/.test(bgSrc));
+    ok("...a value is always produced, never an empty string",
+       /"or_screenshot_" \+ Date\.now\(\)\.toString\(36\)/.test(bgSrc) && /s\.enum\[0\]/.test(bgSrc));
+    ok("...and the page tells the user which argument was sent",
+       /OR sent a usable value/.test(mainSrc) && /filled_args/.test(bgSrc) && /required_arg_missing/.test(mainSrc));
+    ok("screen_capture is no longer called with no arguments at all",
+       /const pre = fillRequiredArgs\(msg\.name, msg\.arguments\)/.test(bgSrc) &&
+       /arguments: pre\.args, timeout: msg\.timeout/.test(bgSrc) &&
+       !/arguments: msg\.arguments, timeout: msg\.timeout/.test(bgSrc));
+    ok("a capture that produced no result line names security software, not a mystery",
+       /did not run to completion/.test(bgSrc) && /antivirus/i.test(bgSrc) &&
+       /ExecutionPolicy Bypass/.test(bgSrc) && /group policy/i.test(bgSrc));
 
   // ── 10. No stale code paths left behind ────────────────────────────────────
   ok("old ddgSearch helper is gone", !bgSrc.includes("ddgSearch"));

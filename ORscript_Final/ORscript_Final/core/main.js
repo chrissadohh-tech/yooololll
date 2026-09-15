@@ -2012,6 +2012,11 @@
         // there. Short wait, so trying is always cheap and we never skip a route that
         // would have worked (the status frame can predate the connection).
         const r = await bg({ type: "call_tool", name: toolName, arguments: {}, timeout: 20000, connectWait: 3000 });
+        // The MCP may demand an argument Studio's capture tools declare as required
+        // (capture_id). The worker fills it - say so, so the user knows what was sent
+        // rather than seeing a bare "capture_id" error they cannot act on.
+        if (r && r.filled_args && r.filled_args.length) notes.push(label + ": the tool requires " + r.filled_args.join(", ") + " - OR sent a usable value");
+        if (r && r.required_arg_missing) notes.push(label + ": the tool still insists on '" + r.required_arg_missing + "' (it rejected the value OR sent) - its schema needs a real " + r.required_arg_missing + ", so fill it in by hand via call_tool");
         if (takeMcpAnswer(r, label, toolName)) return true;
         // ONE bounded retry, and only when the tool's own schema offers a place to write
         // the picture. This is the last chance for a server whose only answer is an image
@@ -2137,7 +2142,11 @@
           shots.push(...r.images);
           notes.push("studio window: " + (r.text || "captured"));
         } else {
-          notes.push("studio window: " + String((r && r.error) || "capture failed").slice(0, 300));
+          // The worker's `hint` carries the one thing the user cannot see for himself
+          // (the script produced NO result line, so security software, a group policy or
+          // a parse failure stopped it). Dropping it left a bare PowerShell wall.
+          notes.push("studio window: " + String((r && r.error) || "capture failed").slice(0, 300) +
+            (r && r.hint ? " [" + String(r.hint).slice(0, 400) + "]" : ""));
         }
       } catch (e) {
         notes.push("studio window: " + String((e && e.message) || e).slice(0, 200));

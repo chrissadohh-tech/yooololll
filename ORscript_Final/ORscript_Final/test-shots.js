@@ -148,6 +148,8 @@ function makeFakeAgent(opts) {
   state.mcpSavePath = false;               // the MCP can WRITE the picture where its schema says
   state.noCompile = false;                 // the fast helper could not be compiled on this PC
   state.captureFails = false;              // the capture step itself threw
+  state.requireCaptureId = false;          // "schema" | "error": the MCP demands a capture_id
+  state.noResultLine = false;              // the script ran but printed nothing (blocked / refused)
   state.trailingNoise = false;             // PowerShell printed something after the result line
   state.selftestBroken = false;            // PowerShell/GDI failure
   state.selftestBadRoundtrip = false;      // the script cannot decode its own tunnel text
@@ -163,9 +165,12 @@ function makeFakeAgent(opts) {
   // list_tools would pass them through. Some capture tools can WRITE the picture
   // instead of returning it, and OR only retries that way when the schema says so.
   const toolList = () => (state.mcpImages || state.mcpSavePath ? OLD_TOOLS.concat(["screen_capture", "get_studio_state"]) : OLD_TOOLS)
-    .map((n) => (n === "screen_capture" && state.mcpSavePath
-      ? { name: n, inputSchema: { type: "object", properties: { save_path: { type: "string", description: "where to write the PNG" } } } }
-      : { name: n }));
+    .map((n) => {
+      if (n !== "screen_capture") return { name: n };
+      if (state.mcpSavePath) return { name: n, inputSchema: { type: "object", properties: { save_path: { type: "string", description: "where to write the PNG" } } } };
+      if (state.requireCaptureId === "schema") return { name: n, inputSchema: { type: "object", properties: { capture_id: { type: "string", description: "identifier for this capture" } }, required: ["capture_id"] } };
+      return { name: n };
+    });
   const handle = (sock, msg) => {
     if (!msg || typeof msg !== "object") return;
     const { id, type, name, arguments: a } = msg;
@@ -175,6 +180,12 @@ function makeFakeAgent(opts) {
     if (name === "run_command") state.commands.push(String((a && a.command) || ""));
     if (hang.indexOf(String(name)) >= 0) return;   // a stuck server: accepts the call, never answers
     const okText = (text) => reply(sock, { type: "tool_result", id, ok: true, text });
+    if (name === "run_command" && state.noResultLine && /studio_shot\.ps1/.test(String(a.command || ""))) {
+      // Security software, a group policy, or a parse failure: PowerShell returns
+      // something that never contains the script's result line.
+      okText("At line:1 char:1\r\n+ powershell -NoProfile -ExecutionPolicy Bypass -File studio_shot.ps1 -Out or_studio_window.png\r\n+ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\r\nThis script contains malicious content and has been blocked by your antivirus software.\r\n    + CategoryInfo          : ParserError: (:) [], ParentContainsErrorRecordException");
+      return;
+    }
     const fail = (error) => reply(sock, { type: "tool_result", id, ok: false, error });
     if (name === "read_file_base64") { fail("unknown tool: read_file_base64"); return; }   // THE OLD EXE
     if (name === "write_file") { files[a.path] = Buffer.from(String(a.content || ""), "utf8"); okText("wrote " + a.path); return; }
@@ -273,6 +284,13 @@ function makeFakeAgent(opts) {
       if (end < arr.length) body += "\n... lines " + (end + 1) + "-" + arr.length + " continue (use offset=" + (end + 1) + ")";
       if (body.length > clipChars) body = body.slice(0, clipChars) + "\n... [output truncated at " + clipChars + " characters]";
       okText(body);
+      return;
+    }
+    if (name === "screen_capture" && state.requireCaptureId && !(a && a.capture_id)) {
+      // Studio's own MCP answers exactly this when OR calls it with no arguments:
+      // a required-argument error that names a parameter the user cannot guess.
+      state.requiredArgErrors = (state.requiredArgErrors || 0) + 1;
+      fail("Missing required argument: capture_id");
       return;
     }
     if (name === "screen_capture") {
@@ -694,6 +712,19 @@ const call = async (c, tool, args, ms = 9000) => {
       // front (Blender, say). A plain Studio-window capture must therefore NOT ask
       // Windows to raise or focus Studio - if it did, the user's foreground app would be
       // ripped away on every screenshot.
+      {
+        // The script printed NOTHING (the shape antivirus blocking or a group policy
+        // produces). The answer must name that possibility - it is the one cause the
+        // user cannot guess from the code, and it is exactly what the report said.
+        const av = makeFakeAgent({}); av.noResultLine = true;
+        const cAv = build({}, { fakeAgent: av, engine: "local" }).ctx;
+        await waitConnected(cAv);
+        const out = String(await call(cAv, "or_screenshot", { target: "window" }, 40000));
+        ok("a capture script that never ran names security software as a cause",
+           /did not run to completion/.test(out) && /antivirus/i.test(out) && /ExecutionPolicy Bypass/.test(out), out.slice(0, 620));
+        ok("...and it does NOT pretend the window route worked",
+           !/attached to THIS message/i.test(out), out.slice(-200));
+      }
       ok("...and it never stole focus from whatever is in front (no -Focus in the command)",
          agent.commands.some((cm) => /-Out/.test(cm)) && !agent.commands.some((cm) => /-Focus(?!Only)/.test(cm)),
          agent.commands.slice(-1)[0] || "(no command)");
@@ -1003,6 +1034,36 @@ const call = async (c, tool, args, ms = 9000) => {
            /the name is read back as text/.test(shot) && /target:"window"/.test(shot), shot.slice(0, 520));
         ok("...and the window route still delivers the picture in that case (goodbye until a rebuild)",
            /attached to THIS message/i.test(shot), shot.slice(0, 300));
+      }
+      {
+        // Studio's own screen_capture declares a REQUIRED capture_id, and OR used to call
+        // every capture tool with NO arguments - so a perfectly good in-Studio capture
+        // died with "studio: Missing required argument: capture_id". That is the error
+        // the user pasted. The schema says what to send, so send it.
+        const req = makeFakeAgent({}); req.mcpImages = true; req.requireCaptureId = "schema";
+        const cRq = build({}, { fakeAgent: req, engine: "local" }).ctx;
+        await waitConnected(cRq);
+        const shot = String(await call(cRq, "or_screenshot", { target: "studio" }, 40000));
+        const imgs = vm.runInContext("window.__rsRecentImages()", cRq);
+        ok("a capture tool that requires capture_id is called WITH one (from its own schema)",
+           imgs.length > 0 && String(imgs[0].data || "").length > 50 && /capture_id/.test(shot) && !/Missing required argument/i.test(shot),
+           shot.slice(0, 320));
+        ok("...and the doomed zero-argument call is never made at all",
+           (req.requiredArgErrors || 0) === 0, "required-argument errors: " + (req.requiredArgErrors || 0));
+      }
+      {
+        // The same demand from an agent that does NOT forward MCP schemas: the only
+        // signal is the server's own error text. One repair retry, not a loop.
+        const req2 = makeFakeAgent({}); req2.mcpImages = true; req2.requireCaptureId = "error";
+        const cRq2 = build({}, { fakeAgent: req2, engine: "local" }).ctx;
+        await waitConnected(cRq2);
+        const shot2 = String(await call(cRq2, "or_screenshot", { target: "studio" }, 40000));
+        const imgs2 = vm.runInContext("window.__rsRecentImages()", cRq2);
+        ok("an MCP that only SAYS 'Missing required argument: capture_id' is repaired too",
+           imgs2.length > 0 && String(imgs2[0].data || "").length > 50 && /capture_id/.test(shot2) && !/Missing required argument/i.test(shot2),
+           shot2.slice(0, 320));
+        ok("...with exactly one retry, never a loop",
+           (req2.requiredArgErrors || 0) === 1, "required-argument errors: " + (req2.requiredArgErrors || 0));
       }
 
       // ── the PC where the fast helper cannot be compiled: the script must fall back to
