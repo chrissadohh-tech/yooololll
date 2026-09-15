@@ -45,7 +45,7 @@ try {
 
 if (RS) {
   const notes = RS.TOOL_NOTES || {};
-  for (const key of ["or_screenshot", "attach_feedback", "read_file_base64", "blender_material_create",
+  for (const key of ["ViewportScreenshotRoblox", "ViewportScreenshotBlender", "ViewportScreenshot", "attach_feedback", "read_file_base64", "blender_material_create",
                      "blender_material_set", "blender_material_assign", "blender_material_noise",
                      "blender_material_image", "blender_material_pbr", "blender_material_preset",
                      "blender_material_inspect"]) {
@@ -58,23 +58,30 @@ if (RS) {
     /read_file_base64/.test(RS.buildSystemPrompt({ engine: "local" })) && /attach_feedback/.test(RS.buildSystemPrompt({ engine: "local" })));
   ok("the live roster appends TOOL_NOTES by bare name", /RS\.TOOL_NOTES\[bareToolName\(t\.name\)\]/.test(mainSrc));
   ok("prompt no longer claims web_search is DuckDuckGo-only", !/web_search\\?`? {query, limit\?} DuckDuckGo/.test(prompt));
-  ok("prompt names exactly three screenshot targets and nothing else",
-     /ONE command, exactly THREE targets, no aliases/.test(prompt) &&
-     /INSIDE Roblox Studio/.test(prompt) && /inside Blender/.test(prompt) && /the WHOLE PC/.test(prompt) &&
-     /There is no screenshot \/ take_screenshot \/ send_screenshot/.test(prompt));
+  ok("prompt names exactly three SEPARATE screenshot commands and nothing else",
+     /THREE separate commands, no aliases/.test(prompt) &&
+     /ViewportScreenshotRoblox/.test(prompt) && /ViewportScreenshotBlender/.test(prompt) &&
+     /ViewportScreenshot/.test(prompt) && /There is no or_screenshot \/ screenshot \/ take_screenshot/.test(prompt));
+  ok("...and says each command photographs one app and never substitutes another",
+     /each one photographs ONE thing/.test(prompt) && /substitutes another app/.test(prompt));
   // The three the user actually asks for must be spelled out, including that the
   // whole-PC one is the desktop itself and needs no window in front.
-  ok("...and the Studio one is described as needing only Studio open, no window involved",
-     /needs only Studio to be open - no window, no focus/.test(prompt));
+  ok("...and the Studio one is described as needing only Studio RUNNING, no window involved",
+     /needs only Studio to be RUNNING - no window, no focus/.test(prompt));
   ok("the notes tell the model the old names are not commands",
-     /Never call screenshot \/ take_screenshot \/ send_screenshot/.test(RS.TOOL_NOTES.or_screenshot));
+     /Never call or_screenshot \/ screenshot \/ take_screenshot/.test(RS.TOOL_NOTES.ViewportScreenshotRoblox) &&
+     /Never call or_screenshot \/ screenshot \/ take_screenshot/.test(RS.TOOL_NOTES.ViewportScreenshotBlender) &&
+     /Never call or_screenshot \/ screenshot \/ take_screenshot/.test(RS.TOOL_NOTES.ViewportScreenshot));
   ok("prompt points at the reason a capture gives, instead of retrying",
-     /reports NOTHING it names the reason/.test(prompt) && /than retrying the same target/.test(prompt));
+     /reports NOTHING it names the reason/.test(prompt) && /than retrying the same command/.test(prompt));
   ok("tool notes survive into the roster text", typeof RS.compactTools === "function");
   ok("attach_feedback is a screen-category tool", RS.toolCategory("attach_feedback") === "screen");
-  ok("the real screenshot names stay screen-themed, the dead aliases are gone",
-     RS.toolCategory("or_screenshot") === "screen" && RS.toolCategory("shot_test") === "screen" &&
-     RS.toolCategory("screenshot") !== "screen" && RS.toolCategory("take_screenshot") !== "screen");
+  ok("the three commands are screen-themed however they are spelled, dead aliases are not",
+     RS.toolCategory("ViewportScreenshotRoblox") === "screen" &&
+     RS.toolCategory("viewport_screenshot_blender") === "screen" &&
+     RS.toolCategory("VIEWPORTSCREENSHOT") === "screen" && RS.toolCategory("shot_test") === "screen" &&
+     RS.toolCategory("or_screenshot") !== "screen" && RS.toolCategory("screenshot") !== "screen" &&
+     RS.toolCategory("take_screenshot") !== "screen");
   ok("read_file_base64 is a read-category tool", RS.toolCategory("read_file_base64") === "read");
 }
 
@@ -150,9 +157,12 @@ ok("capture_tab still exists for tab targets", bgSrc.includes('case "capture_tab
 // ── 6. core/main.js: screenshots + attach_feedback ───────────────────────────
 ok("main has one shared capture routine", (mainSrc.match(/async function captureShots\(target, opts\)/g) || []).length === 1);
 ok("the tab note carries the front-tab warning", /r\.warning \? " - " \+ r\.warning/.test(mainSrc));
-ok("the capture failure explains both causes", /old one drops image blocks/.test(mainSrc) && /whichever tab is in FRONT/.test(mainSrc));
+ok("the capture failure explains the agent cause AND names the app each command needs",
+   /An out-of-date or-agent\.exe drops image blocks/.test(mainSrc) &&
+   /Roblox Studio must be RUNNING/.test(mainSrc) && /Blender must be RUNNING and connected/.test(mainSrc));
 ok("the failure tells the model not to retry blindly", /do NOT retry blindly/i.test(mainSrc));
-ok("or_screenshot uses the shared routine", /captureShots\(target, \{ maxWidth: args\.max_width \}\)/.test(mainSrc));
+ok("the commands use the shared routine, with their app guard",
+   /captureShots\(target, \{ only, maxWidth: args\.max_width \}\)/.test(mainSrc));
 ok("captureShots is the only screen_capture caller", (mainSrc.match(/tryMcp\("screen_capture"/g) || []).length === 1);
 ok("recent captures are remembered", mainSrc.includes("function rememberImages(") && mainSrc.includes("RECENT_IMAGES_MAX"));
 ok("image payloads become reusable blobs", mainSrc.includes("function imageToBlob(") && mainSrc.includes("function imageToPngBlob("));
@@ -387,7 +397,7 @@ const WIKI_JSON = JSON.stringify({ query: { search: [{ title: "Roblox" }, { titl
     ok("web_fetch refuses non-http schemes", r.ok === false && /http/.test(r.error), r.error);
   }
 
-  // ── 8. read_file_base64 plumbing (what or_screenshot / attach_feedback use) ─
+  // ── 8. read_file_base64 plumbing (what the screenshot commands / attach use) ─
   {
     const payload = { path: "C:/Users/Chris/ORWorkspace/or_blender_shot.png", mimeType: "image/png", bytes: 68, data: "iVBORw0KGgoAAAANSUhEUg==" };
     let asked = null;
@@ -415,7 +425,7 @@ const WIKI_JSON = JSON.stringify({ query: { search: [{ title: "Roblox" }, { titl
     ok("local_read_base64 treats empty data as a failure", r.ok === false, JSON.stringify(r));
   }
 
-  // ── 9. capture_tab (the tab target of or_screenshot / attach_feedback) ─────
+  // ── 9. capture_tab (the tab route of the fallbacks / attach_feedback) ─────
   {
     const { listeners } = makeWorker(async () => ({}));
     const r = await ask(listeners, { type: "capture_tab" });
@@ -700,37 +710,51 @@ const WIKI_JSON = JSON.stringify({ query: { search: [{ title: "Roblox" }, { titl
 
     // main wiring
     ok("main routes the window target", /studio_window|"window"/.test(mainSrc) && /wantWindow/.test(mainSrc));
-    ok("auto falls back to the WINDOW before the tab", /if \(wantWindow && !shots\.length\)/.test(mainSrc) &&
-      mainSrc.indexOf("studio_window_shot") < mainSrc.indexOf('case "tab"') + 1e9 && mainSrc.indexOf("if (wantWindow && !shots.length)") < mainSrc.indexOf("if (wantTab || (target === \"auto\""));
+    ok("the overall command's last resort is the whole screen, and the tab route is never automatic",
+       /if \(!only && target === "auto" && !shots\.length\) await screenGrab\("whole screen"\)/.test(mainSrc) &&
+       /const wantTab = !only && \(target === "tab"/.test(mainSrc) &&
+       !/wantTab \|\| \(target === "auto"/.test(mainSrc), "see screenGrab + wantTab");
     ok("focus cannot be asked for at all - the picture is taken inside Studio",
        !/args\.focus/.test(mainSrc) && /focus: false/.test(mainSrc) && /never matters/.test(mainSrc));
     ok("the pre-capture focus check warns before shooting", /tab_front/.test(mainSrc) && /before taking it|BEFORE a capture/.test(mainSrc) || /tab_front/.test(bgSrc));
     ok("the front-tab warning is also a user toast", /Capturing the tab in FRONT/.test(mainSrc));
     ok("the model is told when a shot is not this chat", /not this chat/.test(mainSrc));
-    // ── ONE screenshot command, exactly three targets, no duplicates ──────────
-    // The surface was six names for one action (screenshot, take_screenshot,
-    // screenshot_send, send_screenshot, capture_screenshot, or_screen_shot) plus a
-    // 19-spelling target table. That is how "which command do I call?" became a
-    // question, so the surface is now pinned here.
-    ok("exactly one screenshot command is dispatched",
-       (mainSrc.match(/if \(name === "or_screenshot"/g) || []).length === 1 &&
+    // ── THREE separate screenshot commands, no duplicates ─────────────────────
+    // The surface used to be one command with a target table (and before that, six names
+    // for one action). It is now what the user asked for: three commands, each naming the
+    // ONE app it may photograph, and each refusing rather than substituting another.
+    ok("exactly three screenshot commands are dispatched, through one normalizer",
+       (mainSrc.match(/function viewportShotKind/g) || []).length === 1 &&
+       /k === "viewportscreenshotroblox"\) return "roblox"/.test(mainSrc) &&
+       /k === "viewportscreenshotblender"\) return "blender"/.test(mainSrc) &&
+       /k === "viewportscreenshot"\) return "any"/.test(mainSrc) &&
        !/name === "take_screenshot"/.test(mainSrc) && !/name === "send_screenshot"/.test(mainSrc) &&
        !/name === "screenshot"/.test(mainSrc) && !/name === "capture_screenshot"/.test(mainSrc));
     ok("no screenshot alias survives in the rename table",
        !/screenshot: "or_screenshot"/.test(mainSrc) && !/or_screen_shot: /.test(mainSrc) &&
        !/take_screenshot: /.test(mainSrc) && !/send_screenshot: /.test(mainSrc) &&
-       !/capture_screenshot: /.test(mainSrc) && !/screenshot_send: /.test(mainSrc));
-    ok("the target table is exactly studio | blender | desktop",
-       /rawTarget === "studio"\) target = "studio"/.test(mainSrc) &&
-       /rawTarget === "blender"\) target = "blender"/.test(mainSrc) &&
-       /rawTarget === "desktop"\) target = "desktop"/.test(mainSrc) &&
-       !/\^\(auto\|studio\|roblox\|viewport/.test(mainSrc));
-    ok("...and anything else is refused with the three named",
-       /is not a screenshot target/.test(mainSrc) && /There are exactly three/.test(mainSrc) &&
-       /whole PC\)/.test(mainSrc) && /there are no other screenshot commands/.test(mainSrc));
+       !/capture_screenshot: /.test(mainSrc) && !/screenshot_send: /.test(mainSrc) &&
+       !/or_screenshot: /.test(mainSrc));
+    ok("there is no target table any more - the command IS the target",
+       !/rawTarget === "/.test(mainSrc) && !/is not a screenshot target/.test(mainSrc) &&
+       mainSrc.includes("String(args._route") && mainSrc.includes("/^(window|tab|auto)$/"));
+    ok("the app guard reaches the capture routine, and the overall one asks for nothing specific",
+       mainSrc.includes('const only = internalRoute ? "" : (vpKind === "roblox" ? "studio" : vpKind === "blender" ? "blender" : "")') &&
+       mainSrc.includes("captureShots(target, { only, maxWidth: args.max_width })") &&
+       mainSrc.includes('const modeStudio = !only || only === "studio"') &&
+       mainSrc.includes('const modeBlend = !only || only === "blender"') &&
+       mainSrc.includes('if (!only && target === "auto" && !shots.length) await screenGrab'));
+    ok("a removed name is refused by name, with all three commands spelled out",
+       /is not a command/.test(mainSrc) && /There are exactly three screenshot commands/.test(mainSrc) &&
+       /ViewportScreenshotRoblox \{\}/.test(mainSrc) && /ViewportScreenshotBlender \{\}/.test(mainSrc) &&
+       /This call did NOT take a picture/.test(mainSrc));
+    ok("the refusal is answered under the canonical name, whatever spelling was used",
+       mainSrc.includes('const vpName = vpKind === "roblox" ? "ViewportScreenshotRoblox"') &&
+       mainSrc.includes('"ERROR: " + vpName + " captured nothing. "') &&
+       mainSrc.includes('"Output of \'" + vpName + "\':'));
     ok("the model is told, in the prompt and the notes, that no other name exists",
-       /There is no screenshot \/ take_screenshot \/ send_screenshot/.test(cfgSrc) &&
-       /Never call screenshot \/ take_screenshot \/ send_screenshot/.test(cfgSrc));
+       /There is no or_screenshot \/ screenshot \/ take_screenshot/.test(cfgSrc) &&
+       /Never call or_screenshot \/ screenshot \/ take_screenshot/.test(cfgSrc));
     ok("shot_test is documented as a diagnostic with no aliases",
        (mainSrc.match(/name === "shot_test"/g) || []).length === 1 &&
        !/or_shot_test/.test(mainSrc) && !/screenshot_test/.test(mainSrc) && !/test_screenshot/.test(mainSrc) &&
@@ -742,7 +766,7 @@ const WIKI_JSON = JSON.stringify({ query: { search: [{ title: "Roblox" }, { titl
   }
 
   // ── 17. No empty results, no retry loops, and the agent version is named ───
-  // Live report: "or_screenshot just loops" with "(tool returned an empty result)".
+  // Live report: "the screenshot just loops" with "(tool returned an empty result)".
   // An empty result is what an MCP IMAGE block looks like once an outdated agent
   // drops it, and the loop is what a model does when the result explains nothing.
   {
@@ -850,9 +874,16 @@ const WIKI_JSON = JSON.stringify({ query: { search: [{ title: "Roblox" }, { titl
     ok("...and the worker can ask for it", bgSrc.includes("wholeScreen") && bgSrc.includes("msg.whole_screen === true"));
     ok("...and a desktop shot is saved under a screen name, not a Studio one",
        bgSrc.includes("function wholeScreenOut") && bgSrc.includes("replace(/studio_window/i, \"screen\")"));
-    ok("...and desktop/screen/pc/os are the whole screen, not the Studio window",
-       /const wantScreen = target === "desktop"/.test(mainSrc) && /target === "os";/.test(mainSrc) &&
-       /const wantWindow = target === "auto" \|\| target === "window" \|\| target === "studio_window" \|\|/.test(mainSrc));
+    ok("the overall command prefers Studio's window to a desktop grab, desktop last",
+       /const wantWindow = modeStudio && \(only \? true : target === "auto"/.test(mainSrc) &&
+       mainSrc.indexOf("if (wantWindow && !shots.length)") <
+         mainSrc.indexOf('if (!only && target === "auto" && !shots.length) await screenGrab("whole screen")') &&
+       mainSrc.indexOf('if (!only && target === "auto" && !shots.length) await screenGrab("whole screen")') >
+         mainSrc.indexOf("if (wantBlend && !shots.length)"));
+    ok("...and the whole screen is the desktop grab, never the Studio window",
+       mainSrc.includes('const wantScreen = !only && (target === "desktop"') && /target === "os"\)/.test(mainSrc) &&
+       mainSrc.includes('const wantWindow = modeStudio && (only ? true : target === "auto" || target === "window"') &&
+       !/wantScreen = !only && \(target === "desktop"[^;]*wantWindow/.test(mainSrc));
     ok("the capture lands where the agent can read it back",
        ps1Src.includes('[string]$Out = "or_studio_window.png"') && ps1Src.includes('$B64Only + ".b64"'));
     // Integrity: a short/partial/clipped readback must be an ERROR, never a silently
@@ -894,8 +925,9 @@ const WIKI_JSON = JSON.stringify({ query: { search: [{ title: "Roblox" }, { titl
     ok("the startup storage read is deferred, so it cannot hit a temporal dead zone", /Promise\.resolve\(\)\.then\(\(\) => chrome\.storage\?\.local\.get\(ENGINE_KEY/.test(bgSrc));
     ok("...and it is advertised in the tool list", /Agent check: agent_info \{\}/.test(mainSrc));
     ok("an offline agent is named too", /AGENT OFFLINE/.test(mainSrc));
-    ok("the no-MCP fallback is described without offering a window target",
-       /no-MCP fallback writes the capture to a PNG file/.test(mainSrc) && !/target:\\"window\\"/.test(mainSrc));
+    ok("the rescue route is described without offering a window target",
+       /rescue route writes the PNG next to the agent/.test(mainSrc) &&
+       !/target:\\"window\\"/.test(mainSrc) && !/target:"window"/.test(mainSrc));
 
     // auto-debug noise
     ok("benign Studio warnings are filtered from AUTO DEBUG", /BENIGN/.test(mainSrc) && /unable to load plugin icon/.test(mainSrc));
@@ -980,7 +1012,7 @@ const WIKI_JSON = JSON.stringify({ query: { search: [{ title: "Roblox" }, { titl
        /function missingArgIn/.test(bgSrc) && /REQUIRED_ARG_RE/.test(bgSrc) &&
        /missing required \(\?:argument\|parameter/.test(bgSrc) && /const miss = missingArgIn\(r\.error \|\| r\.text\)/.test(bgSrc));
     ok("...a value is always produced, never an empty string",
-       /"or_screenshot_" \+ Date\.now\(\)\.toString\(36\)/.test(bgSrc) && /s\.enum\[0\]/.test(bgSrc));
+       /"or_capture_" \+ Date\.now\(\)\.toString\(36\)/.test(bgSrc) && /s\.enum\[0\]/.test(bgSrc));
     ok("...and the page tells the user which argument was sent",
        /OR sent a usable value/.test(mainSrc) && /filled_args/.test(bgSrc) && /required_arg_missing/.test(mainSrc));
     ok("screen_capture is no longer called with no arguments at all",

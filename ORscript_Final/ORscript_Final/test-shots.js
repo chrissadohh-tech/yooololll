@@ -2,7 +2,7 @@
 //
 // WHY THIS EXISTS: a grep-based test cannot see SCOPE. The 2026-09 regression
 // ("Cannot access 'RECENT_IMAGES_MAX' before initialization" killing every
-// or_screenshot / attach_feedback call) was invisible to every static check in
+// ViewportScreenshot* / attach_feedback call) was invisible to every static check in
 // test-v118.js, because the helper block had been inserted INSIDE runTool() where
 // its `const` was in the temporal dead zone for the branches declared above it.
 // So this file LOADS the real core/main.js in a VM (with a fake DOM and the real
@@ -150,6 +150,7 @@ function makeFakeAgent(opts) {
   state.captureFails = false;              // the capture step itself threw
   state.requireCaptureId = false;          // "schema" | "error": the MCP demands a capture_id
   state.noResultLine = false;              // the script ran but printed nothing (blocked / refused)
+  state.studioWindowMissing = false;       // no Studio window open: the real ps1 says so and exits
   state.trailingNoise = false;             // PowerShell printed something after the result line
   state.selftestBroken = false;            // PowerShell/GDI failure
   state.selftestBadRoundtrip = false;      // the script cannot decode its own tunnel text
@@ -184,6 +185,14 @@ function makeFakeAgent(opts) {
       // Security software, a group policy, or a parse failure: PowerShell returns
       // something that never contains the script's result line.
       okText("At line:1 char:1\r\n+ powershell -NoProfile -ExecutionPolicy Bypass -File studio_shot.ps1 -Out or_studio_window.png\r\n+ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\r\nThis script contains malicious content and has been blocked by your antivirus software.\r\n    + CategoryInfo          : ParserError: (:) [], ParentContainsErrorRecordException");
+      return;
+    }
+    if (name === "run_command" && state.studioWindowMissing && /studio_shot\.ps1/.test(String(a.command || "")) &&
+        !/-WholeScreen/.test(String(a.command || ""))) {
+      // Studio is not open (or has no visible window): the script's own words, and NOT a
+      // capture of anything else. The whole-screen grab would still work - that is the point
+      // of the ordering test.
+      okText("OR_STUDIO_SHOT " + JSON.stringify({ ok: false, error: "no visible Roblox Studio window found - open Studio (and un-minimize it) first" }));
       return;
     }
     const fail = (error) => reply(sock, { type: "tool_result", id, ok: false, error });
@@ -623,13 +632,14 @@ const call = async (c, tool, args, ms = 9000) => {
 
   // ── 2. every screenshot command must return SOMETHING usable (never a throw,
   //       never a bare empty string, never a TDZ/reference error) ──
-  const targets = ["auto", "studio", "roblox", "viewport", "blender", "window", "studio_window", "os",
-                   "desktop", "tab", "chat", "page", "self", "bogus-typo", ""];
-  for (const t of targets) {
-    const out = await call(c, "or_screenshot", t === "" ? {} : { target: t });
-    const s = String(out);
-    const bad = /before initialization|is not defined|Cannot read prop|\bundefined\b.*undefined|__no_seam__|__timeout__/.test(s);
-    ok(`or_screenshot target:"${t}" answers cleanly`, !bad && s.length > 20, s.slice(0, 160));
+  // Names, not targets: the surface is three separate commands, each spelling-tolerant
+  // (case and underscores) and each gated on the app it names.
+  const names = ["ViewportScreenshotRoblox", "ViewportScreenshotBlender", "ViewportScreenshot",
+                 "viewport_screenshot_roblox", "VIEWPORTSCREENSHOTROBLOX", "viewport_screenshot"];
+  for (const n of names) {
+    const s = String(await call(c, n, {}));
+    const bad = /before initialization|is not defined|Cannot read prop|undefined.*undefined|__no_seam__|__timeout__/.test(s);
+    ok(`"${n}" answers cleanly`, !bad && s.length > 20, s.slice(0, 160));
   }
   // The old spellings must not RUN anything - and must not hang either. Each one is
   // refused by name and pointed at the real command; a dead name that falls through to
@@ -637,7 +647,8 @@ const call = async (c, tool, args, ms = 9000) => {
   for (const gone of ["screenshot", "take_screenshot", "send_screenshot"]) {
     const s = String(await call(c, gone, { target: "studio" }));
     ok(`the removed name ${gone} is refused, not run as a screenshot`,
-       /is not a command/.test(s) && /or_screenshot/.test(s) && !/Output of/.test(s), s.slice(0, 140));
+       /is not a command/.test(s) && /ViewportScreenshotRoblox/.test(s) && /ViewportScreenshotBlender/.test(s) &&
+       !/Output of/.test(s), s.slice(0, 200));
   }
   for (const args of [{}, { source: "recent" }, { index: 0 }, { path: "nope.png" }, { copy: true, send: false }, { paste: true }, { send: false, paste: false }, { source: "studio" }]) {
     const s = String(await call(c, "attach_feedback", args));
@@ -676,30 +687,40 @@ const call = async (c, tool, args, ms = 9000) => {
     // prove by asking whether the seam's closure resolves them (it does, since the
     // screenshot path above used them without a ReferenceError).
     {
-      // THE SURFACE, pinned: one screenshot command, exactly three targets, no aliases.
-      // Anything else must be REFUSED with the three named - never quietly turned into a
-      // different picture, and never accepted under a second name.
-      const cS = build({}, { engine: "local" }).ctx;
-      const noTarget = String(await call(cS, "or_screenshot", {}, 40000));
-      ok("or_screenshot with no target takes the Studio picture (the default)",
-         !/is not a screenshot target/.test(noTarget), noTarget.slice(0, 240));
-      for (const bad of ["window", "tab", "auto", "screen", "pc", "os", "viewport", "chat"]) {
-        const refused = String(await call(cS, "or_screenshot", { target: bad }, 40000));
-        ok('or_screenshot {target:"' + bad + '"} is refused, and the three real targets are named',
-           /is not a screenshot target/.test(refused) && /"studio"/.test(refused) &&
-           /"blender"/.test(refused) && /"desktop"/.test(refused), refused.slice(0, 220));
+      // THE SURFACE, pinned: three separate commands, no aliases, and each one is gated on
+      // the app it names. A command that names an app must never answer with a picture of
+      // something else - it refuses and names what is missing.
+      const cS = build({}, { engine: "local" }).ctx;   // nothing connected, nothing running
+      const rRef = String(await call(cS, "ViewportScreenshotRoblox", {}, 40000));
+      ok("ViewportScreenshotRoblox refuses when Studio is not there, and never substitutes",
+         /^ERROR: ViewportScreenshotRoblox captured nothing/.test(rRef) && /Roblox Studio must be RUNNING/.test(rRef),
+         rRef.slice(0, 280));
+      const bRef = String(await call(cS, "ViewportScreenshotBlender", {}, 40000));
+      ok("ViewportScreenshotBlender refuses when Blender is not connected",
+         /^ERROR: ViewportScreenshotBlender captured nothing/.test(bRef) && /Blender must be RUNNING and connected/.test(bRef),
+         bRef.slice(0, 280));
+      const aRef = String(await call(cS, "ViewportScreenshot", {}, 40000));
+      ok("ViewportScreenshot names everything it could not photograph",
+         /^ERROR: ViewportScreenshot captured nothing/.test(aRef) && /Studio is not running/.test(aRef) &&
+         /Blender is not connected/.test(aRef), aRef.slice(0, 320));
+      for (const goneName of ["or_screenshot", "screenshot", "take_screenshot", "screenshot_roblox", "or_focus_studio"]) {
+        const refused = String(await call(cS, goneName, {}, 40000));
+        ok(`the removed name ${goneName} is refused, with all three commands named`,
+           /is not a command/.test(refused) && /ViewportScreenshotRoblox/.test(refused) &&
+           /ViewportScreenshotBlender/.test(refused) && /ViewportScreenshot \{\}/.test(refused) &&
+           !/^Output of/.test(refused), refused.slice(0, 240));
       }
-      const aliasGone = String(await call(cS, "take_screenshot", {}, 40000));
-      ok("the old alias take_screenshot is not a command any more",
-         !/Output of 'or_screenshot'/.test(aliasGone), aliasGone.slice(0, 160));
+      const spelling = String(await call(cS, "viewport_screenshot", {}, 40000));
+      ok("the overall command tolerates its spelling (viewport_screenshot === ViewportScreenshot)",
+         /^ERROR: ViewportScreenshot captured nothing/.test(spelling), spelling.slice(0, 200));
     }
-    const used = String(await call(c, "or_screenshot", { _route: "tab" }));
-    ok("the shared capture path actually ran (helpers resolved)", /Output of 'or_screenshot'|ERROR: or_screenshot/.test(used), used.slice(0, 160));
+    const used = String(await call(c, "ViewportScreenshot", { _route: "tab" }));
+    ok("the shared capture path actually ran (helpers resolved)", /Output of 'ViewportScreenshot'|ERROR: ViewportScreenshot/.test(used), used.slice(0, 160));
   }
 
   // ── 4. no screenshot path may report success with zero images ──
   {
-    const s = String(await call(c, "or_screenshot", { _route: "auto" }));
+    const s = String(await call(c, "ViewportScreenshot", { _route: "auto" }));
     const claimsImage = /attached to THIS message/i.test(s);
     const hasError = /^ERROR/.test(s);
     ok("a capture claim always comes with an image or an error", hasError || claimsImage, s.slice(0, 200));
@@ -727,8 +748,8 @@ const call = async (c, tool, args, ms = 9000) => {
       ok("...and says screenshots DO work without a rebuild (text tunnel)", /TEXT TUNNEL/i.test(info) && /Screenshots DO work/i.test(info), info.slice(0, 300));
       ok("...and scopes the rebuild as optional, not required", /Rebuilding is optional/i.test(info), info.slice(0, 220));
 
-      const shot = String(await call(cAgent, "or_screenshot", { _route: "window" }, 40000));
-      ok("or_screenshot {target:window} answers on the OLD agent", !/THREW|__timeout__/.test(shot), shot.slice(0, 200));
+      const shot = String(await call(cAgent, "ViewportScreenshotRoblox", { _route: "window" }, 40000));
+      ok("the Studio-window route answers on the OLD agent", !/THREW|__timeout__/.test(shot), shot.slice(0, 200));
       ok("...it claims the picture arrived", /attached to THIS message/i.test(shot), shot.slice(0, 300));
       ok("...and names the text tunnel as the delivery route", /text tunnel/i.test(shot), shot.slice(0, 300));
       const imgs = recent();
@@ -744,7 +765,7 @@ const call = async (c, tool, args, ms = 9000) => {
         const av = makeFakeAgent({}); av.noResultLine = true;
         const cAv = build({}, { fakeAgent: av, engine: "local" }).ctx;
         await waitConnected(cAv);
-        const out = String(await call(cAv, "or_screenshot", { _route: "window" }, 40000));
+        const out = String(await call(cAv, "ViewportScreenshotRoblox", { _route: "window" }, 40000));
         ok("a capture script that never ran names security software as a cause",
            /did not run to completion/.test(out) && /antivirus/i.test(out) && /ExecutionPolicy Bypass/.test(out), out.slice(0, 620));
         ok("...and it does NOT pretend the window route worked",
@@ -769,16 +790,16 @@ const call = async (c, tool, args, ms = 9000) => {
 
       // target "studio" with an old agent: the MCP cannot hand over its image blocks,
       // so the WINDOW route must take over - that is the case that used to fail.
-      const viaStudio = String(await call(cAgent, "or_screenshot", { target: "studio" }, 40000));
-      ok("or_screenshot {target:studio} still delivers on the OLD agent (window fallback)", /attached to THIS message/i.test(viaStudio), viaStudio.slice(0, 260));
-      const viaAuto = String(await call(cAgent, "or_screenshot", {}, 40000));
-      ok("or_screenshot {target:auto} delivers on the OLD agent", /attached to THIS message/i.test(viaAuto), viaAuto.slice(0, 200));
+      const viaStudio = String(await call(cAgent, "ViewportScreenshotRoblox", {}, 40000));
+      ok("ViewportScreenshotRoblox still delivers on the OLD agent (window rescue)", /attached to THIS message/i.test(viaStudio), viaStudio.slice(0, 260));
+      const viaAuto = String(await call(cAgent, "ViewportScreenshotRoblox", {}, 40000));
+      ok("ViewportScreenshotRoblox delivers on the OLD agent with no arguments", /attached to THIS message/i.test(viaAuto), viaAuto.slice(0, 200));
 
       // ── and it must REFUSE to attach a damaged picture ──
       const bad = makeFakeAgent({ clipChars: 20000 });
       bad.corruptOnRead();
       const cBad = build({}, { fakeAgent: bad, engine: "local" }).ctx;
-      const badShot = String(await call(cBad, "or_screenshot", { _route: "window" }, 40000));
+      const badShot = String(await call(cBad, "ViewportScreenshotRoblox", { _route: "window" }, 40000));
       const badImgs = vm.runInContext("window.__rsRecentImages()", cBad);
       ok("a corrupted capture is NOT attached as if it were the screenshot", badImgs.length === 0 && /^ERROR/.test(badShot), badShot.slice(0, 240));
       ok("...and the failure says the capture itself worked, only the hand-over did not", /could not be read back|damaged|incomplete|checksum/i.test(badShot), badShot.slice(0, 300));
@@ -790,9 +811,9 @@ const call = async (c, tool, args, ms = 9000) => {
         const cBl = build({}, { fakeAgent: bl, engine: "local" }).ctx;
         // teach the worker that Blender is connected, exactly like the UI's Connect Blender
         await call(cBl, "blender_connect", {}, 20000);
-        const bshot = String(await call(cBl, "or_screenshot", { target: "blender" }, 40000));
+        const bshot = String(await call(cBl, "ViewportScreenshotBlender", {}, 40000));
         const bimgs = vm.runInContext("window.__rsRecentImages()", cBl);
-        ok("or_screenshot {target:blender} delivers on the OLD agent (PNG via the tunnel)",
+        ok("ViewportScreenshotBlender delivers on the OLD agent (PNG via the tunnel)",
            /attached to THIS message/i.test(bshot) && bimgs.length === 1, bshot.slice(0, 260));
         if (bimgs.length) {
           const got = Buffer.from(String(bimgs[0].data || ""), "base64");
@@ -834,25 +855,37 @@ const call = async (c, tool, args, ms = 9000) => {
       //    monitors) - not the Studio window - and must not need Studio at all. ──
       {
         const desk = makeFakeAgent({});
+        desk.studioWindowMissing = true;      // Studio is not open in this one
         const cDesk = build({}, { fakeAgent: desk, engine: "local" }).ctx;
         await waitConnected(cDesk);
-        const shotRuns = [];
-        for (const t of ["desktop"]) {
-          const out = String(await call(cDesk, "or_screenshot", { target: t }, 40000));
-          shotRuns.push({ t, out, imgs: vm.runInContext("window.__rsRecentImages()", cDesk).length });
-        }
-        ok("a whole-PC screenshot really captures the desktop (the one spelling: desktop)",
-           shotRuns.every((r) => /attached to THIS message/i.test(r.out) && r.imgs >= 1),
-           JSON.stringify(shotRuns.map((r) => [r.t, r.imgs, r.out.slice(0, 40)])).slice(0, 400));
-        ok("...and it says it was the whole screen, not the Studio window",
-           shotRuns.every((r) => /whole screen/i.test(r.out)) && !/Roblox Studio WINDOW/i.test(shotRuns[0].out),
-           shotRuns[0].out.slice(0, 220));
+        // The OVERALL command falls back to the whole screen only when no app can answer:
+        // this agent cannot hand over MCP image blocks, so Studio cannot deliver, and
+        // Blender is not connected - the desktop grab is the last resort.
+        const out = String(await call(cDesk, "ViewportScreenshot", {}, 40000));
+        const imgs = vm.runInContext("window.__rsRecentImages()", cDesk).length;
+        ok("ViewportScreenshot really captures the whole desktop when nothing else can",
+           /attached to THIS message/i.test(out) && imgs >= 1, out.slice(0, 300));
+        ok("...and it says the picture is the whole screen, not a window", /whole screen/i.test(out), out.slice(0, 240));
         ok("...and it asked the script for the whole desktop, with no focus stealing",
-           desk.commands.some((c) => /-WholeScreen/.test(c)) &&
-           !desk.commands.some((c) => /-WholeScreen/.test(c) && /-Focus/.test(c)),
+           desk.commands.some((cm) => /-WholeScreen/.test(cm)) &&
+           !desk.commands.some((cm) => /-WholeScreen/.test(cm) && /-Focus/.test(cm)),
            desk.commands.slice(-1)[0] || "(no command)");
         ok("...and the file it saved is named for the screen, not for Studio",
-           /saved as or_screen\.jpg/i.test(shotRuns[0].out), shotRuns[0].out.slice(0, 260));
+           /saved as or_screen\.jpg/i.test(out), out.slice(0, 260));
+        // The ordering is the whole point: with a Studio window to photograph, the same
+        // command takes THAT and never the desktop - and naming an app is a promise that no
+        // other app will be photographed.
+        const desk2 = makeFakeAgent({});
+        const cDesk2 = build({}, { fakeAgent: desk2, engine: "local" }).ctx;
+        await waitConnected(cDesk2);
+        const win = String(await call(cDesk2, "ViewportScreenshot", {}, 40000));
+        ok("...and with a Studio window open it takes that, not a desktop grab",
+           /attached to THIS message/i.test(win) && /studio window/i.test(win) && !/whole screen/i.test(win),
+           win.slice(0, 280));
+        const rWin = String(await call(cDesk2, "ViewportScreenshotRoblox", {}, 40000));
+        ok("ViewportScreenshotRoblox takes the Studio window, never the desktop",
+           /attached to THIS message/i.test(rWin) && /studio window/i.test(rWin) && !/whole screen/i.test(rWin),
+           rWin.slice(0, 280));
       }
       {
         // A capture tool that never answers must not become the loop the user kept
@@ -880,7 +913,7 @@ const call = async (c, tool, args, ms = 9000) => {
         ok("attach_check answers in plain words and names the site",
            /Attachment compatibility for/.test(check) && /OR_ATTACH_CHECK \{/.test(check), check.slice(0, 200));
         ok("...it reports that the provider's upload path works here",
-           /Pictures: YES/i.test(check) && /Verdict: or_screenshot and attach_feedback can deliver/i.test(check), check.slice(0, 420));
+           /Pictures: YES/i.test(check) && /Verdict: the screenshot commands and attach_feedback can deliver/i.test(check), check.slice(0, 420));
         ok("...and it removed the test picture again (nothing left staged)",
            /Cleanup: composer left empty/i.test(check) && /"cleaned":true/.test(check), check.slice(-260));
         ok("...and the alias names answer too",
@@ -936,16 +969,16 @@ const call = async (c, tool, args, ms = 9000) => {
         const cMcp = build({}, { fakeAgent: mcp, engine: "local" }).ctx;
         const st = await waitConnected(cMcp);
         ok("the worker reports a live agent connection before the capture", !!(st && st.connected), JSON.stringify(st).slice(0, 160));
-        const shot = String(await call(cMcp, "or_screenshot", { target: "studio" }, 40000));
+        const shot = String(await call(cMcp, "ViewportScreenshotRoblox", {}, 40000));
         const imgs = vm.runInContext("window.__rsRecentImages()", cMcp);
-        ok("or_screenshot {target:studio} delivers Studio's own screenshot (in-Studio route)",
+        ok("ViewportScreenshotRoblox delivers Studio's own screenshot (in-Studio route)",
            /attached to THIS message/i.test(shot) && imgs.length === 1, shot.slice(0, 260));
         ok("...the picture is the MCP image, mime respected", String(imgs[0] && imgs[0].mimeType) === "image/png" && String(imgs[0].data || "").length > 50,
            JSON.stringify({ n: imgs.length, mime: (imgs[0] || {}).mimeType }));
         ok("...the Studio capture tool is what ran", mcp.calls.includes("screen_capture"), mcp.calls.join(","));
         ok("...and NO window/OS capture was involved", !/captured the Roblox Studio WINDOW/i.test(shot) && !mcp.calls.includes("run_command"), shot.slice(0, 200));
-        const auto = String(await call(cMcp, "or_screenshot", {}, 40000));
-        ok("or_screenshot {target:auto} uses Studio first, not the window",
+        const auto = String(await call(cMcp, "ViewportScreenshotRoblox", {}, 40000));
+        ok("ViewportScreenshot uses Studio first, not the window",
            /attached to THIS message/i.test(auto) && mcp.calls.filter((n) => n === "screen_capture").length >= 2 && !mcp.calls.includes("run_command"), auto.slice(0, 200));
       }
       {
@@ -954,7 +987,7 @@ const call = async (c, tool, args, ms = 9000) => {
         const cBr = build({}, { fakeBridge: br, engine: "roblox" }).ctx;
         const stb = await waitConnected(cBr);
         ok("the worker reports a live bridge connection (engine:roblox)", !!(stb && stb.connected), JSON.stringify(stb).slice(0, 160));
-        const shot = String(await call(cBr, "or_screenshot", { target: "studio" }, 40000));
+        const shot = String(await call(cBr, "ViewportScreenshotRoblox", {}, 40000));
         const imgs = vm.runInContext("window.__rsRecentImages()", cBr);
         ok("...and the same happens on the bridge engine (engine:roblox)", /attached to THIS message/i.test(shot) && imgs.length === 1 && br.calls.includes("screen_capture"), shot.slice(0, 240));
         ok("...and the MCP's picture is what arrives (mime respected, no PowerShell involved)",
@@ -971,7 +1004,7 @@ const call = async (c, tool, args, ms = 9000) => {
         const agOld = makeFakeAgent({});
         const cBrOld = build({}, { fakeBridge: brOld, fakeAgent: agOld, engine: "roblox" }).ctx;
         await waitConnected(cBrOld);
-        const shotOld = String(await call(cBrOld, "or_screenshot", { target: "studio" }, 40000));
+        const shotOld = String(await call(cBrOld, "ViewportScreenshotRoblox", {}, 40000));
         const imgsOld = vm.runInContext("window.__rsRecentImages()", cBrOld);
         ok("a bridge that drops picture data still ends with a delivered picture",
            /attached to THIS message/i.test(shotOld) && imgsOld.length === 1, shotOld.slice(0, 260));
@@ -986,7 +1019,7 @@ const call = async (c, tool, args, ms = 9000) => {
         const mp = makeFakeAgent({}); mp.mcpImages = false; mp.mcpPathAnswer = true;
         const cMp = build({}, { fakeAgent: mp, engine: "local" }).ctx;
         await waitConnected(cMp);
-        const shotP = String(await call(cMp, "or_screenshot", { target: "studio" }, 40000));
+        const shotP = String(await call(cMp, "ViewportScreenshotRoblox", {}, 40000));
         const imgsP = vm.runInContext("window.__rsRecentImages()", cMp);
         ok("a text-only Studio answer that names a saved picture still delivers it (no rebuild)",
            /attached to THIS message/i.test(shotP) && imgsP.length === 1, shotP.slice(0, 240));
@@ -999,7 +1032,7 @@ const call = async (c, tool, args, ms = 9000) => {
         const mb = makeFakeAgent({}); mb.mcpImages = false; mb.mcpBase64Answer = true;
         const cMb = build({}, { fakeAgent: mb, engine: "local" }).ctx;
         await waitConnected(cMb);
-        const shotB = String(await call(cMb, "or_screenshot", { target: "studio" }, 40000));
+        const shotB = String(await call(cMb, "ViewportScreenshotRoblox", {}, 40000));
         const imgsB = vm.runInContext("window.__rsRecentImages()", cMb);
         ok("inline base64 in the MCP's own answer becomes a real attachment",
            /attached to THIS message/i.test(shotB) && imgsB.length === 1 && imgsB[0].mimeType === "image/png",
@@ -1013,7 +1046,7 @@ const call = async (c, tool, args, ms = 9000) => {
         const md = makeFakeAgent({}); md.studioDead = true;
         const cMd = build({}, { fakeAgent: md, engine: "local" }).ctx;
         await waitConnected(cMd);
-        const shotD = String(await call(cMd, "or_screenshot", { target: "studio" }, 40000));
+        const shotD = String(await call(cMd, "ViewportScreenshotRoblox", {}, 40000));
         const imgsD = vm.runInContext("window.__rsRecentImages()", cMd);
         ok("a dead MCP is asked anyway, explained, and the picture still arrives",
            /attached to THIS message/i.test(shotD) && imgsD.length === 1 && /Roblox MCP is not alive/i.test(shotD), shotD.slice(0, 300));
@@ -1027,7 +1060,7 @@ const call = async (c, tool, args, ms = 9000) => {
         const ms = makeFakeAgent({}); ms.mcpImages = false; ms.mcpSavePath = true;
         const cMs = build({}, { fakeAgent: ms, engine: "local" }).ctx;
         await waitConnected(cMs);
-        const shotS = String(await call(cMs, "or_screenshot", { target: "studio" }, 40000));
+        const shotS = String(await call(cMs, "ViewportScreenshotRoblox", {}, 40000));
         const imgsS = vm.runInContext("window.__rsRecentImages()", cMs);
         ok("an image-blocks-only MCP still delivers when its schema offers a save path",
            /attached to THIS message/i.test(shotS) && imgsS.length === 1, shotS.slice(0, 300));
@@ -1055,7 +1088,7 @@ const call = async (c, tool, args, ms = 9000) => {
         const mcp2 = makeFakeAgent({}); mcp2.mcpImages = false;
         const cM2 = build({}, { fakeAgent: mcp2, engine: "local" }).ctx;
         await waitConnected(cM2);            // the worker is connected before a user asks
-        const shot = String(await call(cM2, "or_screenshot", { target: "studio" }, 40000));
+        const shot = String(await call(cM2, "ViewportScreenshotRoblox", {}, 40000));
         ok("when the agent drops image blocks, the answer says so instead of 'captured nothing'",
            /no picture came back/i.test(shot), shot.slice(0, 400));
         ok("...and it names the cause (this build cannot carry image data) and both ways forward",
@@ -1072,7 +1105,7 @@ const call = async (c, tool, args, ms = 9000) => {
         const req = makeFakeAgent({}); req.mcpImages = true; req.requireCaptureId = "schema";
         const cRq = build({}, { fakeAgent: req, engine: "local" }).ctx;
         await waitConnected(cRq);
-        const shot = String(await call(cRq, "or_screenshot", { target: "studio" }, 40000));
+        const shot = String(await call(cRq, "ViewportScreenshotRoblox", {}, 40000));
         const imgs = vm.runInContext("window.__rsRecentImages()", cRq);
         ok("a capture tool that requires capture_id is called WITH one (from its own schema)",
            imgs.length > 0 && String(imgs[0].data || "").length > 50 && /capture_id/.test(shot) && !/Missing required argument/i.test(shot),
@@ -1088,7 +1121,7 @@ const call = async (c, tool, args, ms = 9000) => {
         const req2 = makeFakeAgent({}); req2.mcpImages = true; req2.requireCaptureId = "error";
         const cRq2 = build({}, { fakeAgent: req2, engine: "local" }).ctx;
         await waitConnected(cRq2);
-        const shot2 = String(await call(cRq2, "or_screenshot", { target: "studio" }, 40000));
+        const shot2 = String(await call(cRq2, "ViewportScreenshotRoblox", {}, 40000));
         const imgs2 = vm.runInContext("window.__rsRecentImages()", cRq2);
         ok("an MCP that only SAYS 'Missing required argument: capture_id' is repaired too",
            imgs2.length > 0 && String(imgs2[0].data || "").length > 50 && /capture_id/.test(shot2) && !/Missing required argument/i.test(shot2),
@@ -1102,7 +1135,7 @@ const call = async (c, tool, args, ms = 9000) => {
       {
         const nc = makeFakeAgent({}); nc.noCompile = true; nc.trailingNoise = true;
         const cNc = build({}, { fakeAgent: nc, engine: "local" }).ctx;
-        const nshot = String(await call(cNc, "or_screenshot", { _route: "window" }, 40000));
+        const nshot = String(await call(cNc, "ViewportScreenshotRoblox", { _route: "window" }, 40000));
         const nimgs = vm.runInContext("window.__rsRecentImages()", cNc);
         ok("a PC that cannot compile the fast helper still gets its screenshot", /attached to THIS message/i.test(nshot) && nimgs.length === 1, nshot.slice(0, 300));
         ok("...and the result says the fallback route was used, not a silent downgrade", /fallback route/i.test(nshot), nshot.slice(0, 300));
@@ -1111,7 +1144,7 @@ const call = async (c, tool, args, ms = 9000) => {
       {
         const cf = makeFakeAgent({}); cf.captureFails = true;
         const cCf = build({}, { fakeAgent: cf, engine: "local" }).ctx;
-        const fshot = String(await call(cCf, "or_screenshot", { _route: "window" }, 40000));
+        const fshot = String(await call(cCf, "ViewportScreenshotRoblox", { _route: "window" }, 40000));
         const fimgs = vm.runInContext("window.__rsRecentImages()", cCf);
         ok("a capture-step failure is reported with the script's own reason", fimgs.length === 0 && /capture step failed/i.test(fshot), fshot.slice(0, 320));
         ok("...and the blocked-compile detail is passed on, not swallowed", /could not load file or assembly|CodeDom/i.test(fshot), fshot.slice(0, 320));
@@ -1121,7 +1154,7 @@ const call = async (c, tool, args, ms = 9000) => {
       const big = makeFakeAgent({ clipChars: 20000 });
       big.maxReadBytes = 60000;                    // the 90 KB image's base64 is ~123 KB -> refused
       const cBig = build({}, { fakeAgent: big, engine: "local" }).ctx;
-      const bigShot = String(await call(cBig, "or_screenshot", { _route: "window" }, 40000));
+      const bigShot = String(await call(cBig, "ViewportScreenshotRoblox", { _route: "window" }, 40000));
       const bigImgs = vm.runInContext("window.__rsRecentImages()", cBig);
       ok("a capture too big for the agent to read is retaken smaller, not reported as a dead end",
          /attached to THIS message/i.test(bigShot) && /retaken smaller/i.test(bigShot), bigShot.slice(0, 300));
@@ -1130,7 +1163,7 @@ const call = async (c, tool, args, ms = 9000) => {
       const gone = makeFakeAgent({ clipChars: 20000 });
       gone.hideB64OnRead();
       const cGone = build({}, { fakeAgent: gone, engine: "local" }).ctx;
-      const goneShot = String(await call(cGone, "or_screenshot", { _route: "window" }, 40000));
+      const goneShot = String(await call(cGone, "ViewportScreenshotRoblox", { _route: "window" }, 40000));
       ok("a missing tunnel file is reported plainly, never as an empty success", /^ERROR/.test(goneShot) && !/attached to THIS message/i.test(goneShot), goneShot.slice(0, 240));
     }
   }

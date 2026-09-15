@@ -64,10 +64,10 @@ cd agent && cargo test
 `test-bridges.js` is a live smoke test: start `or-agent` first.
 
 `test-shots.js` needs no browser and no Studio: it loads the real `core/main.js` with the real
-`background.js` behind a fake DOM and drives the screenshot command's three targets
-(`or_screenshot` for `studio` / `blender` / `desktop`), the internal fallback routes
-(`_route:"window"|"tab"|"auto"`), `attach_feedback` with its aliases, and `shot_test`, through the
-`window.__rsRunTool` seam. A scope bug like the one that
+`background.js` behind a fake DOM and drives the three screenshot commands
+(`ViewportScreenshotRoblox`, `ViewportScreenshotBlender`, `ViewportScreenshot`), the internal
+fallback routes (`_route:"window"|"tab"|"auto"`), `attach_feedback` with its aliases, and
+`shot_test`, through the `window.__rsRunTool` seam. A scope bug like the one that
 broke every screenshot with `Cannot access 'RECENT_IMAGES_MAX' before initialization` shows up here
 in under a second, where `node --check` cannot see it. It checks HTTP `:3000` and WS `17613` / `17615` (no Unreal port).
 
@@ -78,38 +78,44 @@ through the capture script, reads it back exactly the way a real screenshot is h
 verifies the checksum. It needs no Studio window. `agent_info {}` reports which `or-agent.exe`
 is running and which hand-over is in use.
 
-**The three screenshots — one command, three targets, no aliases:**
+**The three screenshots — three separate commands, no aliases:**
 
 ```
-or_screenshot {}  (or {"target":"studio"})   a picture taken INSIDE Roblox Studio  - Studio just has to be open
-or_screenshot {"target":"blender"}           a picture taken INSIDE Blender        - Blender just has to be open
-or_screenshot {"target":"desktop"}           a picture of the WHOLE PC             - every monitor, no Studio needed
+ViewportScreenshotRoblox {}    a picture taken INSIDE Roblox Studio  - Studio must be RUNNING
+ViewportScreenshotBlender {}   a picture taken INSIDE Blender        - Blender must be running and connected
+ViewportScreenshot {}          the OVERALL one: Studio if it is running,
+                               else Blender if it is connected, else the WHOLE screen (every monitor)
 ```
 
-That is the entire screenshot surface. There is no `screenshot`, `take_screenshot`, `send_screenshot`,
-`capture_screenshot`, `screen_capture`, `window`, `tab` or `auto` command, and `or_screenshot` has no
-aliases: ask for anything else and OR answers with the three it has instead of quietly taking a
-different picture. `shot_test {}` is a diagnostic (it takes no picture of Studio); `attach_feedback`
-re-sends or copies a picture that already exists.
+Each command photographs **one thing and nothing else**. That is the point of separate commands: a
+command that names an app never quietly hands back a picture of something else — if its app is not
+there, it says so and takes no picture. Spelling is forgiving (case and underscores are ignored, so
+`viewport_screenshot_roblox` is the same command) but no command has a second name.
 
-The removed names are not just undocumented, they are **refused by name**: calling
+That is the entire screenshot surface. There is no `or_screenshot`, `screenshot`, `take_screenshot`,
+`send_screenshot`, `capture_screenshot`, `screen_capture`, `window`, `tab` or `auto` command, and none
+of the three has an alias. `shot_test {}` is a diagnostic (it takes no picture of Studio);
+`attach_feedback` re-sends or copies a picture that already exists.
+
+Removed names are not just undocumented, they are **refused by name**: calling `or_screenshot`,
 `screenshot`, `take_screenshot`, `send_screenshot` or the old `or_focus_studio` family returns an
-instant error naming the three real targets. It never falls through to a capture, and it never
+instant error naming the three real commands. It never falls through to a capture, and it never
 hangs waiting for an answer that was never coming.
 
-| target | what it does | if it cannot |
+| command | what it does | if it cannot |
 | --- | --- | --- |
-| `studio` (default) | **Studio takes its own picture** through its MCP (`screen_capture`) — no window, no focus, no PowerShell. The browser being in front or behind makes no difference; Blender parity is the goal | falls back to photographing the Studio **window** through the agent, which also never needs a window in front |
-| `blender` | the Blender viewport, captured inside Blender by the addon | falls back to the Blender window through the agent |
-| `desktop` | the whole desktop, every monitor, grabbed from the screen itself | nothing to fall back to — it either grabs the screen or says why |
+| `ViewportScreenshotRoblox` | **Studio takes its own picture** through its MCP (`screen_capture`) — no window, no focus, no PowerShell. The browser being in front or behind makes no difference; Blender parity is the goal | first falls back to photographing the Studio **window** through the agent (still Studio, also no window in front), then reports that Studio must be running |
+| `ViewportScreenshotBlender` | the Blender viewport, captured inside Blender by the addon | reports that Blender must be running and connected (Menu → Connect Blender) |
+| `ViewportScreenshot` | the best available: Studio, else Blender, else the whole desktop (every monitor) grabbed from the screen itself | reports exactly which of the three could not answer, and why |
 
-**Which window is in front never matters.** None of the three raises or focuses a window, and
-`or_screenshot {target:"desktop"}` photographs the desktop exactly as it looks, Studio open or not.
+**Which window is in front never matters.** None of them raises or focuses a window, and
+`ViewportScreenshot {}` photographs the desktop exactly as it looks, Studio open or not.
 
-**Fallbacks are automatic and internal.** The `window` / `tab` routes still exist behind these three
-(the `tab` route photographs whatever is in front, and `chrome://` pages, the New Tab page and PDFs
-can never be captured). They are reachable for tests as `_route:"window"|"tab"|"auto"` - they are not
-commands, and the model is told not to call them.
+**Fallbacks are automatic and internal.** The `window` / `tab` routes still exist behind these
+commands (the `tab` route photographs whatever is in front, and `chrome://` pages, the New Tab page
+and PDFs can never be captured), and so does the replacement inside Blender. They are reachable for
+tests as `_route:"window"|"tab"|"auto"` — they are not commands, and the model is told not to call
+them.
 
 **How the picture gets here.** Studio's MCP may hand its capture over in any of three shapes and OR
 accepts all of them: an MCP **image block**, a **file path** (the server saved the PNG — OR reads that

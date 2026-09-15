@@ -1154,9 +1154,9 @@ function valueForArg(key, spec) {
     if (s.type === "boolean") return false;
     if (s.type === "integer" || s.type === "number") return 1;
     if (/id$|_id$|uuid|guid|key$|name$|label/i.test(k) || !s.type || s.type === "string")
-      return "or_screenshot_" + Date.now().toString(36);
+      return "or_capture_" + Date.now().toString(36);
     return "or_" + Date.now().toString(36);
-  } catch { return "or_screenshot_" + Date.now().toString(36); }
+  } catch { return "or_capture_" + Date.now().toString(36); }
 }
 function fillRequiredArgs(name, args) {
   const out = Object.assign({}, args || {});
@@ -1529,8 +1529,8 @@ async function blenderCall(name, args, timeout) {
     // ── Screenshot → real image bytes ──────────────────────────────────────
     // The blender-mcp addon WRITES the viewport capture to a PNG path and
     // answers with that path as text. A Chrome extension cannot read a local
-    // path, so this used to hand back images:[] and or_screenshot silently fell
-    // through to a tab capture (the AI got a picture of its own chat window).
+    // path, so this used to hand back images:[] and the screenshot command silently
+    // fell through to a tab capture (the AI got a picture of its own chat window).
     // The path IS inside the AgentScript workspace, so read it back as base64
     // through the bridge and return it as a real attachment.
     let images = [];
@@ -1735,7 +1735,7 @@ async function studioWindowShot({ focus = false, focusOnly = false, maxWidth = 1
 // Runs studio_shot.ps1 -SelfTest (no Studio window needed), then pulls the little
 // test picture back through the SAME hand-over a real capture uses - one-call file
 // readback on a new agent, the base64 text tunnel on an older one - and verifies the
-// checksum. Green here means a real or_screenshot is going to deliver too; a failure
+// checksum. Green here means a real screenshot is going to deliver too; a failure
 // names the step that broke instead of leaving the user guessing.
 async function shotTest() {
   const steps = [];
@@ -1771,7 +1771,7 @@ async function shotTest() {
     return { ok: true, steps, meta,
       text: "Everything a screenshot needs works on this machine: " + steps.join("; ") + ". " +
         (viaFast ? "Picture hand-over: one-call file readback." : "Picture hand-over: the BASE64 TEXT TUNNEL (your agent has no read_file_base64 - that is fine).") +
-        " So or_screenshot will deliver: {target:\"studio\"} needs only Studio open, {target:\"desktop\"} needs no Studio at all (whole PC), and {target:\"window\"} photographs the Studio window - none of them cares which window is in front." };
+        " So the screenshot commands will deliver: ViewportScreenshotRoblox {} needs Studio RUNNING, ViewportScreenshotBlender {} needs Blender connected, and ViewportScreenshot {} needs neither (the whole screen) - and none of them cares which window is in front." };
   } catch (e) {
     return fail("the capture machinery works, but the picture could not be read back: " + String((e && e.message) || e) +
       " - that is the hand-over (the tunnel), not the capture.");
