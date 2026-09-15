@@ -1963,7 +1963,12 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         break;
       }
       case "call_tool": {
-        const timeout = (msg.timeout || 120000) + 10000;
+        // The slack is the round-trip grace on top of the tool's own budget, and it
+        // has to scale: a picture tool is given a deliberately SHORT budget, and a flat
+        // +10s turned "fail fast" into a 10-second stall (measured: a 0.4s budget
+        // answered after 10.4s).
+        const slack = (msg.timeout && msg.timeout < 30000) ? 2000 : 10000;
+        const timeout = (msg.timeout || 120000) + slack;
         if (blenderAddon && isBlenderToolName(msg.name)) {
           sendResponse(await blenderCall(msg.name, msg.arguments, timeout));
           break;

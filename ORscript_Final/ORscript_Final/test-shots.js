@@ -865,8 +865,11 @@ const call = async (c, tool, args, ms = 9000) => {
         const t0 = Date.now();
         const hung = String(await call(cH, "screen_capture", {}, 20000));
         const took = Date.now() - t0;
+        // 6s, not 15s: the worker's round-trip grace must SCALE with the budget. A flat
+        // +10s grace made a deliberate 0.4s budget answer after 10.4s (measured), which
+        // is the stall the user feels as "the screenshot never comes back".
         ok("a capture tool that never answers is abandoned, not waited on forever",
-           took < 15000 && /timed out after 0s|timed out/i.test(hung) && /bridge did not respond in time/i.test(hung), took + "ms :: " + hung.slice(0, 200));
+           took < 6000 && /timed out after 0s|timed out/i.test(hung) && /bridge did not respond in time/i.test(hung), took + "ms :: " + hung.slice(0, 200));
         ok("...and the timeout message states the real budget, not a hardcoded 120s",
            /timed out after (0|1)s/.test(hung) && !/timed out after 120s/.test(hung), hung.slice(0, 120));
       }
