@@ -722,6 +722,12 @@ const WIKI_JSON = JSON.stringify({ query: { search: [{ title: "Roblox" }, { titl
     // Studio's OWN capture (Blender parity): the route must be ASKED, not skipped on a
     // cached status snapshot. Skipping is what handed a working in-Studio capture to the
     // window route; the reason may only be reported AFTER the call fails.
+    // "No picture came back" must name the likely cause on an old build, and both
+    // ways forward - otherwise it reads like Studio failed when the agent ate it.
+    ok("a picture-less capture explains the old agent and both ways forward",
+       /predates image handling/.test(bgSrc) && /cargo build --release\) \\n?/.test(bgSrc) === false ?
+         /predates image handling/.test(bgSrc) && /use \{target:\\"window\\"\} now/.test(bgSrc) :
+         /predates image handling/.test(bgSrc) && /use \{target:\\"window\\"\} now/.test(bgSrc));
     ok("the in-Studio capture is attempted, not skipped on a cached snapshot",
        /const before = shots\.length;/.test(mainSrc) && /else await tryMcp\("screen_capture", "studio"\)/.test(mainSrc));
     ok("...and the old silent skips are gone", !/the Roblox MCP is NOT alive \(bridge reports the server down\) - skipped the call/.test(mainSrc) &&

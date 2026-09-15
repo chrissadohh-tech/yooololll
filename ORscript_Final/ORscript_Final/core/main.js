@@ -1993,7 +1993,7 @@
         return true;
       }
       if (r && !r.ok) notes.push(label + ": " + String(r.error || "failed").slice(0, 160));
-      else if (r && r.ok && r.image_error) notes.push(label + ": " + String(r.image_error).slice(0, 240));
+      else if (r && r.ok && r.image_error) notes.push(label + ": " + String(r.image_error).slice(0, 400));
       return false;
     };
     const tryMcp = async (toolName, label) => {

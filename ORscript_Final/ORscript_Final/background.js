@@ -1125,7 +1125,21 @@ async function harvestToolImage(r, toolName) {
   const inline = imageDataInText(text);
   if (inline) return Object.assign({}, r, { images: [inline], image_source: "base64 TEXT in the tool's own answer" });
   const file = imagePathInText(text);
-  if (!file) return r;
+  if (!file) {
+    // Nothing convertible in the answer. "No picture" is true but useless on its own:
+    // a build without image support THROWS PICTURES AWAY, and the user cannot tell that
+    // apart from a Studio that never took one. Say which it probably is, and what to do.
+    let note = "no picture came back with the answer, and nothing in it named a file or held base64";
+    try {
+      const info = await agentInfo();
+      if (info && info.has_base64 === false) {
+        note = "no picture came back: this or-agent.exe (" + info.tools + " tools, no read_file_base64) predates image handling, " +
+          "so a picture Studio sent as IMAGE DATA was thrown away here. Either rebuild the agent (cd agent && cargo build --release) " +
+          "for in-Studio screenshots, or use {target:\"window\"} now.";
+      }
+    } catch {}
+    return Object.assign({}, r, { image_error: note });
+  }
   try {
     const t = await tunnelReadImage(file, null);
     return Object.assign({}, r, { images: [{ mimeType: t.img.mimeType, data: t.img.data }], meta: t.meta,

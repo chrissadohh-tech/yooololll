@@ -809,6 +809,26 @@ const call = async (c, tool, args, ms = 9000) => {
         const shot = String(await call(cBr, "or_screenshot", { target: "studio" }, 40000));
         const imgs = vm.runInContext("window.__rsRecentImages()", cBr);
         ok("...and the same happens on the bridge engine (engine:roblox)", /attached to THIS message/i.test(shot) && imgs.length === 1 && br.calls.includes("screen_capture"), shot.slice(0, 240));
+        ok("...and the MCP's picture is what arrives (mime respected, no PowerShell involved)",
+           String(imgs[0] && imgs[0].mimeType) === "image/png" && !br.calls.includes("run_command"),
+           JSON.stringify({ mime: (imgs[0] || {}).mimeType, calls: br.calls.join(",") }).slice(0, 200));
+      }
+      {
+        // The classic topology (engine:roblox, the picture riding the bridge socket) on an
+        // agent that throws picture data away: the answer must say the picture did not
+        // make it, not invent a success, and the window route still delivers.
+        // or-agent.exe is BOTH the bridge and the local agent, so build both fixtures:
+        // the picture rides 17613, while the window capture goes through 17615.
+        const brOld = makeFakeBridge({ sendImages: false });
+        const agOld = makeFakeAgent({});
+        const cBrOld = build({}, { fakeBridge: brOld, fakeAgent: agOld, engine: "roblox" }).ctx;
+        await waitConnected(cBrOld);
+        const shotOld = String(await call(cBrOld, "or_screenshot", { target: "studio" }, 40000));
+        const imgsOld = vm.runInContext("window.__rsRecentImages()", cBrOld);
+        ok("a bridge that drops picture data still ends with a delivered picture",
+           /attached to THIS message/i.test(shotOld) && imgsOld.length === 1, shotOld.slice(0, 260));
+        ok("...and the Studio part of the answer says the picture did not come through",
+           /no picture came back/i.test(shotOld) && brOld.calls.includes("screen_capture"), shotOld.slice(0, 340));
       }
       {
         // ── THE NO-REBUILD CASE (the user's own exe) ──────────────────────────
@@ -889,7 +909,10 @@ const call = async (c, tool, args, ms = 9000) => {
         await waitConnected(cM2);            // the worker is connected before a user asks
         const shot = String(await call(cM2, "or_screenshot", { target: "studio" }, 40000));
         ok("when the agent drops image blocks, the answer says so instead of 'captured nothing'",
-           /named no picture|returned no image data|image blocks/i.test(shot), shot.slice(0, 400));
+           /no picture came back/i.test(shot), shot.slice(0, 400));
+        ok("...and it names the cause (this build predates image handling) and both ways forward",
+           /o\u0072-agent\.exe \(\d+ tools, no read_file_base64\)/i.test(shot) && /predates image handling/i.test(shot) &&
+           /cargo build --release/.test(shot) && /target:"window"/.test(shot), shot.slice(0, 500));
         ok("...and the window route still delivers the picture in that case (goodbye until a rebuild)",
            /attached to THIS message/i.test(shot), shot.slice(0, 300));
       }
