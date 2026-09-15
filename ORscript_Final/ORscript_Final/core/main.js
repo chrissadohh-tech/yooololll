@@ -1974,7 +1974,12 @@
       const target = /^(auto|studio|roblox|viewport|blender|tab|chat|page|self)$/.test(rawTarget) ? rawTarget : "auto";
       const { shots, notes } = await captureShots(target);
       if (!shots.length) {
-        return "ERROR: or_screenshot captured nothing. " + (notes.join(" | ") || "Studio MCP screen_capture and tab capture both failed.") + " Connect Studio MCP or pass {\"target\":\"tab\"}.";
+        return "ERROR: or_screenshot captured nothing. " +
+          (notes.join(" | ") || "both the Studio capture and the tab fallback failed.") +
+          "\nRead the reasons above before retrying (do NOT retry blindly):" +
+          "\n- A STUDIO capture needs the MCP bridge AND an up-to-date or-agent.exe - the old one drops image blocks, so screen_capture comes back as text with no picture." +
+          "\n- The TAB fallback photographs whichever tab is in FRONT and only works on an ordinary http/https page; chrome:// pages, the New Tab page and PDF viewers can never be captured." +
+          "\nIf neither can work right now, use a text command instead (inspect_instance, get_studio_state, or_debug, script_analysis) rather than asking for another screenshot.";
       }
       rememberImages(shots, "or_screenshot:" + target);
       ui.showImages(shots, "or_screenshot");
@@ -2305,8 +2310,10 @@
         const r = await bg({ type: "capture_tab" });
         if (r && r.ok && r.images && r.images.length) {
           shots.push(...r.images);
-          notes.push("tab: " + r.images.length + " image(s)");
-        } else if (r && !r.ok) notes.push("tab: " + String(r.error || "failed").slice(0, 160));
+          // "this is the tab in FRONT, not this chat" - the model must not
+          // describe an unrelated screen as if it were Studio.
+          notes.push("tab: " + r.images.length + " image(s)" + (r.warning ? " - " + r.warning : ""));
+        } else if (r && !r.ok) notes.push("tab: " + String(r.error || "failed").slice(0, 320));
       } catch (e) {
         notes.push("tab: " + String((e && e.message) || e).slice(0, 160));
       }

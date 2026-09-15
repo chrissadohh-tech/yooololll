@@ -136,6 +136,9 @@ ok("capture_tab still exists for tab targets", bgSrc.includes('case "capture_tab
 
 // ── 6. core/main.js: screenshots + attach_feedback ───────────────────────────
 ok("main has one shared capture routine", (mainSrc.match(/async function captureShots\(target\)/g) || []).length === 1);
+ok("the tab note carries the front-tab warning", /r\.warning \? " - " \+ r\.warning/.test(mainSrc));
+ok("the capture failure explains both causes", /old one drops image blocks/.test(mainSrc) && /whichever tab is in FRONT/.test(mainSrc));
+ok("the failure tells the model not to retry blindly", /do NOT retry blindly/i.test(mainSrc));
 ok("or_screenshot uses the shared routine", /captureShots\(target\)/.test(mainSrc));
 ok("captureShots is the only screen_capture caller", (mainSrc.match(/tryMcp\("screen_capture"/g) || []).length === 1);
 ok("recent captures are remembered", mainSrc.includes("function rememberImages(") && mainSrc.includes("RECENT_IMAGES_MAX"));
@@ -166,8 +169,9 @@ function httpResponse(status, body, headers = {}) {
   };
 }
 
-function makeWorker(fetchImpl, bridgeImpl) {
+function makeWorker(fetchImpl, bridgeImpl, opts) {
   const listeners = {};
+  const o = opts || {};
   const sockets = [];
   class FakeWS {
     constructor(url) { this.url = String(url); this.readyState = 1; this.sent = []; sockets.push(this); }
@@ -191,17 +195,17 @@ function makeWorker(fetchImpl, bridgeImpl) {
       getURL: (p) => "chrome-extension://test/" + p,
       getPlatformInfo: () => Promise.resolve({ os: "win", arch: "x86-64" }),
       sendMessage: () => Promise.resolve(),
-      lastError: null,
+      lastError: o.lastError || null,
     },
     tabs: {
-      query: () => Promise.resolve([{ id: 7, url: "https://example.test/", windowId: 1 }]),
+      query: o.query || (() => Promise.resolve([{ id: 7, url: "https://example.test/", title: "Example", windowId: 1 }])),
       sendMessage: () => Promise.resolve(),
-      captureVisibleTab: (_a, b, c) => {
-        const url = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==";
+      captureVisibleTab: o.captureTab || ((_a, b, c) => {
+        const url = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8AAAwAB/AF+7E1mAAAAAElFTkSuQmCC";
         const cb = typeof b === "function" ? b : c;
         if (typeof cb === "function") { cb(url); return; }
         return Promise.resolve(url);
-      },
+      }),
     },
   };
   const sandbox = {
@@ -404,6 +408,35 @@ const WIKI_JSON = JSON.stringify({ query: { search: [{ title: "Roblox" }, { titl
     const r = await ask(listeners, { type: "capture_tab" });
     ok("capture_tab returns an image block", r.ok === true && Array.isArray(r.images) && r.images.length === 1, JSON.stringify(r).slice(0, 160));
     ok("capture_tab tags the mime type", r.ok && r.images[0].mimeType === "image/png");
+    ok("capture_tab says which tab it photographed", r.ok && r.captured && r.captured.url === "https://example.test/");
+  }
+
+  // ── 9b. The tab fallback must explain a Chrome permission block ───────────
+  // Live error: captureVisibleTab refusing with "Either the '<all_urls>' or
+  // 'activeTab' permission is required" while the tab in FRONT was not the chat.
+  // The reply has to name the front tab and the way out.
+  {
+    const { listeners } = makeWorker(async () => ({}), null, {
+      lastError: { message: "Either the '<all_urls>' or 'activeTab' permission is required." },
+      query: () => Promise.resolve([{ id: 99, url: "chrome://extensions/", title: "Extensions", windowId: 1 }]),
+    });
+    const r = await ask(listeners, { type: "capture_tab" });
+    ok("a permission block stays a failure", r.ok === false);
+    ok("the error quotes Chrome", /all_urls|activeTab/.test(r.error), r.error);
+    ok("the error names the tab that blocked it", /chrome:\/\/extensions/.test(r.error), r.error);
+    ok("the error says how to make it work", /bring the chat tab/i.test(r.error) && /never be captured/i.test(r.error), r.error);
+    ok("the blocked tab is reported structurally", r.front_url === "chrome://extensions/");
+  }
+  {
+    // Capture SUCCEEDS but the front tab is somebody else's page: the model must
+    // be warned, otherwise it describes that screen as if it were Studio.
+    const { listeners } = makeWorker(async () => ({}), null, {
+      query: () => Promise.resolve([{ id: 42, url: "https://youtube.com/watch", title: "YouTube", windowId: 1 }]),
+    });
+    const r = await ask(listeners, { type: "capture_tab" });
+    ok("a capture of another tab still returns the image", r.ok === true && r.images.length === 1);
+    ok("…with a warning naming what was photographed", /YouTube/.test(r.warning || "") && /NOT of this chat/.test(r.warning || ""), r.warning);
+    ok("…and it is not flagged as this chat", r.captured.is_sender_tab === false);
   }
 
   // ── 11. A Studio screenshot must survive the whole bridge round trip ────────
@@ -471,6 +504,9 @@ const WIKI_JSON = JSON.stringify({ query: { search: [{ title: "Roblox" }, { titl
     ok("CSP keeps ollama reachable", /ollama\.com/.test(connect));
     ok("CSP does not open script-src to the world", !/script-src[^;]*https?:\/\//.test(csp));
     ok("host permissions cover https", manifest.host_permissions.includes("https://*/*"));
+    // captureVisibleTab needs <all_urls> when the extension is invoked from the
+    // page (activeTab is only granted by clicking the toolbar icon).
+    ok("host permissions include <all_urls> for tab capture", manifest.host_permissions.includes("<all_urls>"));
     ok("host permissions cover http", manifest.host_permissions.includes("http://*/*"));
     ok("popup title matches the version", manifest.action.default_title.includes(manifest.version));
   }

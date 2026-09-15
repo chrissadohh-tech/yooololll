@@ -8,7 +8,9 @@
     "storage",
     "activeTab"
   ],
+
   "host_permissions": [
+    "<all_urls>",
     "https://chat.deepseek.com/*",
     "https://deepseek.com/*",
     "https://chatgpt.com/*",

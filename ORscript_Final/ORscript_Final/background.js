@@ -1758,8 +1758,34 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         break;
       }
       case "capture_tab": {
+        // captureVisibleTab photographs whichever tab is IN FRONT in the window,
+        // and Chrome only allows it when the extension is permitted on THAT page:
+        //   * "activeTab" is granted by clicking the toolbar icon / context menu
+        //     (OR is driven from inside the page, so it never gets that grant), or
+        //   * the page must be covered by host_permissions.
+        // chrome:// pages, the New Tab page, PDFs and other extensions' pages can
+        // NEVER be captured, and neither can a site where the user set OR's
+        // "Site access" to on-click/limited.
+        // So this reports WHICH tab was in front (and whether it was this chat)
+        // instead of a bare "Either the '<all_urls>' or 'activeTab' permission is
+        // required", which told the model nothing it could act on.
+        const windowId = (_sender.tab && _sender.tab.windowId) || undefined;
+        const senderTabId = (_sender.tab && _sender.tab.id) || null;
+        let front = null;
         try {
-          const windowId = (_sender.tab && _sender.tab.windowId) || undefined;
+          const tabs = await chrome.tabs.query(
+            windowId === undefined ? { active: true, lastFocusedWindow: true } : { active: true, windowId }
+          );
+          front = (tabs && tabs[0]) || null;
+        } catch {}
+        const frontUrl = (front && front.url) || "";
+        const frontTitle = (front && front.title) || "";
+        const isSenderTab = !!front && senderTabId !== null && front.id === senderTabId;
+        // Name it exactly: a bare title ("Extensions") does not tell the user
+        // WHICH kind of page blocked the capture.
+        const where = frontTitle && frontUrl ? `${frontTitle} (${frontUrl})`
+          : (frontUrl || frontTitle || "a browser-internal page (chrome://, New Tab or a PDF)");
+        try {
           const dataUrl = await new Promise((resolve, reject) => {
             try {
               chrome.tabs.captureVisibleTab(windowId, { format: "png" }, (url) => {
@@ -1773,9 +1799,27 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
             sendResponse({ ok: false, error: "tab capture returned no image" });
             break;
           }
-          sendResponse({ ok: true, images: [{ mimeType: m[1], data: m[2] }] });
+          sendResponse({
+            ok: true,
+            images: [{ mimeType: m[1], data: m[2] }],
+            captured: { url: frontUrl, title: frontTitle, is_sender_tab: isSenderTab },
+            // The model MUST know when it is looking at the wrong screen: a
+            // capture of an unrelated tab used to be described as "Studio looks
+            // like this".
+            warning: isSenderTab ? undefined
+              : `this is a capture of '${where}' (the tab in front), NOT of this chat`,
+          });
         } catch (e) {
-          sendResponse({ ok: false, error: String(e && e.message || e) });
+          const msg = String((e && e.message) || e);
+          const blocked = /permission|all_urls|activeTab|not allowed/i.test(msg);
+          sendResponse({
+            ok: false,
+            error: msg + (blocked
+              ? ` - Chrome only lets OR photograph a page it is allowed to read, and it photographs the tab in FRONT: that was '${where}'. Bring the chat tab (or any normal http/https page) to the front and retry; chrome:// pages, the New Tab page and PDF viewers can never be captured.`
+              : ""),
+            front_url: frontUrl,
+            front_title: frontTitle,
+          });
         }
         break;
       }
