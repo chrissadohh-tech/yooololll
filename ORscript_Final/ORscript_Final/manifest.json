@@ -45,6 +45,7 @@
     "https://www.oxalpha.org/*",
     "http://127.0.0.1/*",
     "http://localhost/*",
+    "http://*/*",
     "https://ollama.com/*",
     "https://*.ollama.com/*",
     "https://*.roblox.com/*",
@@ -56,7 +57,7 @@
     "https://users.roblox.com/*"
   ],
   "content_security_policy": {
-    "extension_pages": "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; object-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' ws://127.0.0.1:* http://127.0.0.1:* http://localhost:* https://ollama.com https://*.ollama.com"
+    "extension_pages": "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; object-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' https://* http://* ws://127.0.0.1:* http://127.0.0.1:* http://localhost:* https://ollama.com https://*.ollama.com"
   },
   "background": {
     "service_worker": "background.js"
@@ -78,7 +79,7 @@
   ],
   "action": {
     "default_popup": "popup.html",
-    "default_title": "OR — RS/AS — 1.17.25 BETA",
+    "default_title": "OR — RS/AS — 1.18.0 BETA",
     "default_icon": {
       "16": "icon.png",
       "48": "icon.png",

@@ -68,7 +68,12 @@ ok("manifest at 1.12.0 or newer", maj12 > 1 || min12 >= 12);
 
 // ── DeepSeek 2026 UI ────────────────────────────────────────────────────────
 ok("deepseek send button has fallbacks", dsSrc.includes("getSendBtn") && dsSrc.includes("contenteditable"));
-ok("deepseek start does not require Expert radios", dsSrc.includes("!state.expertFound && !state.visionFound"));
+// 2026-09: the composer was reworked (composerModeState/enforceComposer). Start is
+// still model-tab agnostic: readiness is the EDITOR, never the Expert radio, and a
+// user-chosen Vision tab is respected instead of being flipped back to Expert.
+ok("deepseek start does not require Expert radios",
+  dsSrc.includes("const ready = !!getEditor()") && !/ready\s*=\s*[^;]*expertFound/.test(dsSrc));
+ok("deepseek start respects a user-chosen Vision tab", dsSrc.includes("if (!isVisionSelected())") && dsSrc.includes("const isVisionSelected ="));
 ok("deepseek user detect survives hashed-class churn", dsSrc.includes("data-message-author-role") && dsSrc.includes("leftGap"));
 ok("deepseek stamps 2026-09 UI beacon", dsSrc.includes("2026-09_new-ui"));
 

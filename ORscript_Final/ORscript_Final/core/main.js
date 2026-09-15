@@ -568,6 +568,11 @@
     // upcoming submitAndGetBase/typeAndSend call to attach as the LAST step
     // before sending (see the comment in runTool's r.images branch).
     pendingImages: null,
+    // Ring buffer of the last few captures (newest first) so attach_feedback
+    // can re-send a screenshot that has already scrolled away, and the popup's
+    // Copy / Attach buttons always have something to work with.
+    recentImages: [],
+    lastShot: null,
     // BARE names of tools observed to return images at least once this session.
     // For the KNOWN Roblox vision tool (screen_capture) toolCategory already
     // gives the "screen" chip optimistically at run time; a custom MCP tool's
@@ -1959,50 +1964,111 @@
     // Virtual command: list available commands with full details. Defaults to
     // the primary server for the *current* engine — Roblox when RS/AN, AgentScript when AS.
     // A DIFFERENT server's tools only show up if the model asks via {"server": "<id>"}.
-        if (name === "or_screenshot" || name === "screenshot") {
+    if (name === "or_screenshot" || name === "screenshot" || name === "take_screenshot" || name === "send_screenshot") {
       if (!P.supportsVision) {
         return "ERROR: this assistant cannot see images, so or_screenshot cannot send a shot back to you. Open a vision-capable chat (DeepSeek, Gemini, GLM, Qwen, Meta AI, Freebuff, Ox Alpha, Use AI) and call or_screenshot again.";
       }
-      const target = String(args.target || args.source || "auto").toLowerCase();
-      const shots = [];
-      const notes = [];
-      const tryMcp = async (toolName, label) => {
-        try {
-          const r = await bg({ type: "call_tool", name: toolName, arguments: args, timeout: 45000 });
-          if (r && r.ok && r.images && r.images.length) {
-            shots.push(...r.images);
-            notes.push(label + ": " + r.images.length + " image(s)");
-            return true;
-          }
-          if (r && !r.ok) notes.push(label + ": " + String(r.error || "failed").slice(0, 160));
-        } catch (e) {
-          notes.push(label + ": " + String(e && e.message || e).slice(0, 160));
-        }
-        return false;
-      };
-      const wantStudio = target === "auto" || target === "studio" || target === "roblox" || target === "viewport";
-      const wantBlend = target === "auto" || target === "blender";
-      const wantTab = target === "tab" || target === "chat" || target === "page" || target === "self";
-      if (wantStudio) await tryMcp("screen_capture", "studio");
-      if (wantBlend && !shots.length) await tryMcp("get_viewport_screenshot", "blender");
-      if (wantTab || (target === "auto" && !shots.length)) {
-        try {
-          const r = await bg({ type: "capture_tab" });
-          if (r && r.ok && r.images && r.images.length) {
-            shots.push(...r.images);
-            notes.push("tab: " + r.images.length + " image(s)");
-          } else if (r && !r.ok) notes.push("tab: " + String(r.error || "failed").slice(0, 160));
-        } catch (e) {
-          notes.push("tab: " + String(e && e.message || e).slice(0, 160));
-        }
-      }
+      // Unknown target names fall back to "auto" instead of silently capturing
+      // nothing (a typo used to read as "Studio MCP + tab capture both failed").
+      const rawTarget = String(args.target || args.source || "auto").toLowerCase();
+      const target = /^(auto|studio|roblox|viewport|blender|tab|chat|page|self)$/.test(rawTarget) ? rawTarget : "auto";
+      const { shots, notes } = await captureShots(target);
       if (!shots.length) {
         return "ERROR: or_screenshot captured nothing. " + (notes.join(" | ") || "Studio MCP screen_capture and tab capture both failed.") + " Connect Studio MCP or pass {\"target\":\"tab\"}.";
       }
+      rememberImages(shots, "or_screenshot:" + target);
       ui.showImages(shots, "or_screenshot");
       A.pendingImages = shots;
       const caption = notes.join("; ") || (shots.length + " image(s) captured");
       return "Output of 'or_screenshot':\n" + caption + "\n(The image is attached to THIS message — you can see it directly. Analyse it and continue.)";
+    }
+    // ── attach_feedback: copy / paste / RE-SEND a screenshot or file ────────
+    // Three jobs in one command, because they are the same image pipeline:
+    //   1. copy  - put the most recent capture on the system clipboard, so the
+    //              user can paste it into any app themselves;
+    //   2. paste - stage it in THIS chat's composer right now;
+    //   3. send  - carry it out with the next message (the tool result), which
+    //              is what "pasted in the AI and sent" means in practice.
+    // source:recent (default) re-uses the last capture, so a screenshot taken
+    // earlier in the conversation can be re-sent without re-taking it; pass
+    // path:"<workspace file>" to attach a file from disk instead.
+    if (name === "attach_feedback" || name === "attachfeedbackor" || name === "attach_feedback_or" ||
+        name === "or_attach_feedback" || name === "attach_image" || name === "attach_screenshot" ||
+        name === "attach_last_screenshot" || name === "attach_recent_image" || name === "or_attach" ||
+        name === "attach_file" || name === "copy_screenshot" || name === "paste_screenshot") {
+      if (!P.supportsVision) {
+        return "ERROR: this assistant cannot see images, so attaching one would be pointless. Open a vision-capable chat (DeepSeek Vision tab, Gemini, GLM, Qwen, Meta AI, Freebuff, Ox Alpha, Use AI).";
+      }
+      const wantPath = String(args.path || args.file || "").trim();
+      const idx = Math.max(0, Number(args.index) || 0);
+      const wantCopy = args.copy !== false && args.copy !== "false";
+      const wantSend = args.send !== false && args.send !== "false";
+      const wantPaste = wantSend ? args.paste === true : args.paste !== false; // "send" already implies the paste
+      let img = null;
+      let where = "";
+
+      if (wantPath) {
+        const r = await bg({ type: "local_read_base64", path: wantPath });
+        if (!r || !r.ok) {
+          return `ERROR: could not read '${wantPath}' to attach it: ${(r && r.error) || "unknown error"}. In Sandbox mode the path must be inside the AgentScript workspace; images work best, but any file type is accepted.`;
+        }
+        img = { mimeType: r.mimeType || "application/octet-stream", data: r.data };
+        where = r.path || wantPath;
+        rememberImages([img], "file:" + where);
+      } else {
+        const source = String(args.source || args.target || "recent").toLowerCase();
+        if (source && source !== "recent" && source !== "last") {
+          const { shots, notes } = await captureShots(source);
+          if (shots.length) { rememberImages(shots, "attach_feedback:" + source); where = "fresh " + source + " capture"; }
+          else if (!A.recentImages.length) {
+            return "ERROR: nothing to attach — the fresh capture failed (" + (notes.join(" | ") || "no image") + ") and no earlier capture is remembered.";
+          }
+          img = A.recentImages[0] || null;
+        } else {
+          img = A.recentImages[idx] || null;
+          where = "recent capture #" + (idx + 1);
+        }
+      }
+      if (!img || !img.data) {
+        return "ERROR: no image to attach yet. Take one first (or_screenshot {target:\"studio\"|\"tab\"|\"blender\"}), or pass a workspace file path.";
+      }
+      const ageS = img.at ? Math.max(0, Math.round((Date.now() - img.at) / 1000)) : null;
+      const sizeKb = kb(img.data);
+      const isImage = /^image\//.test(String(img.mimeType || ""));
+      const lines = [];
+
+      if (wantCopy && !isImage) {
+        lines.push("- Clipboard: skipped — only images can go on the clipboard; this is " + (img.mimeType || "a file") + " and was attached as-is.");
+      } else if (wantCopy) {
+        const c = await copyImageToClipboard(img);
+        lines.push(c.ok
+          ? "- Clipboard: COPIED (image/png) — the user can Ctrl+V it anywhere."
+          : `- Clipboard: NOT copied (${c.error}). The image is visible in OR's popup on the left; use its Copy button (a background copy needs the tab focused) or take a fresh shot with or_screenshot.`);
+      }
+      if (wantSend) {
+        // The loop attaches pendingImages to the NEXT outgoing message, which is
+        // this tool's own result — i.e. it reaches the model in the same turn.
+        A.pendingImages = [img];
+        lines.push("- Composer: attached to THIS message (sending now, nothing to confirm).");
+      } else if (wantPaste) {
+        let staged = false;
+        try { staged = !!(await P.attachImages([img])); } catch (e) { staged = false; }
+        lines.push(staged
+          ? "- Composer: staged — the image is sitting in the chat input; the user just types and sends."
+          : "- Composer: could not stage the file automatically (this site refused the upload). The image is in OR's popup — the user can drag it in or paste it after Copy.");
+      } else {
+        lines.push("- Composer: not attached (send:false, paste:false).");
+      }
+      if (args.note) lines.push("- Note: " + String(args.note).slice(0, 300));
+      rememberImages([img], "attach_feedback");
+      // Only images get the picture popup; anything else would render as a
+      // broken <img>, so it is announced instead.
+      if (isImage) ui.showImages([img], "attach_feedback");
+      else try { ui.toast("Attached " + (img.mimeType || "file") + " to the message (" + sizeKb + " KB)", 5000); } catch {}
+      return "Output of 'attach_feedback':\n" +
+        `Attached 1 image (${img.mimeType || "image/png"}, ~${sizeKb} KB${ageS !== null ? ", captured " + ageS + "s ago" : ""}) from ${where || "the last capture"}.\n` +
+        lines.join("\n") +
+        "\n(The image is attached to THIS message — you can see it directly. Analyse it and continue.)";
     }
     if (name === "or_debug" || name === "debug_run" || name === "debug_console") {
       const code = [
@@ -2144,11 +2210,111 @@
       const animLines = requested === "roblox" ? RSAnim.describeCommands() : [];
       const skillLines = (requested === "roblox" && typeof RobloxScriptSkills !== "undefined") ? RobloxScriptSkills.describeCommands() : [];
       const agentLines = (requested === "local" && typeof AgentScriptSkills !== "undefined") ? AgentScriptSkills.describeCommands() : [];
-      const webLines = [`— OR Status: or_status {} — live engine, work mode, extra thinking, bridge, blender. Call this if you are unsure which mode you are in.`, `— Web Tools (bridge-level, no Studio needed): web_fetch {url?, query?, max_chars?} — fetch a URL, OR pass query to search the web then fetch the top result; web_search {query, limit?} — DuckDuckGo titles+URLs`, `— Screenshot: or_screenshot {target?: auto|studio|tab|blender} — take a screenshot of Studio, this chat tab, or Blender and attach it to your next message so you can see it. Aliases: screenshot, take_screenshot, send_screenshot.`, `— Debugger: or_debug {} — Studio LogService errors/warnings. Automatic Debugger (Settings) appends new errors after mutating commands.`, `— Multi-Agent: or_agent {role: planner|builder|reviewer|debugger, task?} — hand off to a specialist. Enable Multi-Agent in Settings.`, `— Developer Products: developer_product_create {name, price, description?, reward?} — create a real Roblox Developer Product on this published universe (sign into roblox.com in Chrome). developer_product_list {} lists them. Aliases: create_developer_product, create_dev_product.`];
+      const webLines = [`— OR Status: or_status {} — live engine, work mode, extra thinking, bridge, blender. Call this if you are unsure which mode you are in.`, `— Web Tools (bridge-level, no Studio needed): web_fetch {url?, query?, max_chars?} — fetch a URL, OR pass query to search the web then fetch the top result; web_search {query, limit?} — DuckDuckGo titles+URLs`, `— Screenshot: or_screenshot {target?: auto|studio|tab|blender} — take a screenshot of Studio, this chat tab, or Blender and attach it to your next message so you can see it. Aliases: screenshot, take_screenshot, send_screenshot.`, `— Attach images: attach_feedback {index?, path?, source?, copy?, paste?, send?} — re-send the most recent screenshot (or any workspace file via path) as an attachment on this message and copy it to the clipboard so the user can paste it. Aliases: attachfeedbackor, attach_image, attach_file, attach_screenshot, attach_last_screenshot, attach_recent_image, copy_screenshot, paste_screenshot.`, `— Debugger: or_debug {} — Studio LogService errors/warnings. Automatic Debugger (Settings) appends new errors after mutating commands.`, `— Multi-Agent: or_agent {role: planner|builder|reviewer|debugger, task?} — hand off to a specialist. Enable Multi-Agent in Settings.`, `— Developer Products: developer_product_create {name, price, description?, reward?} — create a real Roblox Developer Product on this published universe (sign into roblox.com in Chrome). developer_product_list {} lists them. Aliases: create_developer_product, create_dev_product.`];
       const virtualCount = animLines.length + skillLines.length + agentLines.length + webLines.length;
       return `Output of '${name}':\n${requested} commands (${scoped.length}${virtualCount ?  ` + ${virtualCount} OR virtual tools` : ""}):\n\n${lines.join("\n\n")}${animLines.length ?  "\n\n" + animLines.join("\n\n") : ""}${skillLines.length ?  "\n\n" + skillLines.join("\n\n") : ""}${agentLines.length ?  "\n\n" + agentLines.join("\n\n") : ""}\n\n${webLines.join("\n")}`;
     }
-    // ── Virtual animation tools ──────────────────────────────────────────
+    // ── Image attach plumbing (or_screenshot / attach_feedback) ───────────
+  // One place that turns a tool's base64 images into (a) a remembered recent
+  // capture, (b) a real Blob/File, (c) a clipboard item, and (d) a composer
+  // attachment. Every provider's attachImages() already accepts {mimeType,data}
+  // payloads, so nothing here is provider-specific.
+  const RECENT_IMAGES_MAX = 8;
+  function rememberImages(images, source) {
+    if (!images || !images.length) return;
+    const at = Date.now();
+    for (const img of images) {
+      if (!img || !img.data) continue;
+      A.recentImages.unshift({ mimeType: img.mimeType || "image/png", data: img.data, at, source: source || "capture" });
+    }
+    if (A.recentImages.length > RECENT_IMAGES_MAX) A.recentImages.length = RECENT_IMAGES_MAX;
+    A.lastShot = A.recentImages[0] || null;
+  }
+  function imageToBlob(img) {
+    const mime = (img && img.mimeType) || "image/png";
+    const bin = atob(String((img && img.data) || ""));
+    const arr = new Uint8Array(bin.length);
+    for (let j = 0; j < bin.length; j++) arr[j] = bin.charCodeAt(j);
+    return new Blob([arr], { type: mime });
+  }
+  // Chrome's async clipboard only accepts image/png, so a jpeg/webp capture is
+  // re-encoded through a canvas (which also gives us the pixel size we report).
+  async function imageToPngBlob(img) {
+    const blob = imageToBlob(img);
+    const mime = (img && img.mimeType) || "";
+    if (mime.includes("png")) {
+      try {
+        const bmp = await createImageBitmap(blob);
+        return { blob, width: bmp.width, height: bmp.height };
+      } catch { return { blob, width: 0, height: 0 }; }
+    }
+    try {
+      const bmp = await createImageBitmap(blob);
+      const c = document.createElement("canvas");
+      c.width = bmp.width; c.height = bmp.height;
+      c.getContext("2d").drawImage(bmp, 0, 0);
+      const png = await new Promise((res) => { try { c.toBlob((b) => res(b), "image/png"); } catch { res(null); } });
+      return { blob: png || blob, width: bmp.width, height: bmp.height };
+    } catch {
+      return { blob, width: 0, height: 0 };
+    }
+  }
+  async function copyImageToClipboard(img) {
+    if (!navigator.clipboard || typeof ClipboardItem === "undefined") {
+      return { ok: false, error: "this browser exposes no image clipboard API" };
+    }
+    try {
+      const { blob } = await imageToPngBlob(img);
+      await navigator.clipboard.write([new ClipboardItem({ [blob.type || "image/png"]: blob })]);
+      return { ok: true };
+    } catch (e) {
+      // Chrome demands the tab be focused (and may want a real user gesture) —
+      // report it plainly instead of pretending the copy happened.
+      return { ok: false, error: String((e && e.message) || e).slice(0, 140) };
+    }
+  }
+  const kb = (b64) => Math.round((String(b64 || "").length * 3) / 4 / 102.4) / 10;
+
+  // Shared capture routine: used by or_screenshot AND attach_feedback so both
+  // agree on what "studio", "tab" and "blender" mean.
+  async function captureShots(target) {
+    const shots = [];
+    const notes = [];
+    const tryMcp = async (toolName, label) => {
+      try {
+        const r = await bg({ type: "call_tool", name: toolName, arguments: {}, timeout: 45000 });
+        if (r && r.ok && r.images && r.images.length) {
+          shots.push(...r.images);
+          notes.push(label + ": " + r.images.length + " image(s)");
+          return true;
+        }
+        if (r && !r.ok) notes.push(label + ": " + String(r.error || "failed").slice(0, 160));
+        else if (r && r.ok) notes.push(label + ": returned no image data");
+      } catch (e) {
+        notes.push(label + ": " + String((e && e.message) || e).slice(0, 160));
+      }
+      return false;
+    };
+    const wantStudio = target === "auto" || target === "studio" || target === "roblox" || target === "viewport";
+    const wantBlend = target === "auto" || target === "blender";
+    const wantTab = target === "tab" || target === "chat" || target === "page" || target === "self";
+    if (wantStudio) await tryMcp("screen_capture", "studio");
+    if (wantBlend && !shots.length) await tryMcp("get_viewport_screenshot", "blender");
+    if (wantTab || (target === "auto" && !shots.length)) {
+      try {
+        const r = await bg({ type: "capture_tab" });
+        if (r && r.ok && r.images && r.images.length) {
+          shots.push(...r.images);
+          notes.push("tab: " + r.images.length + " image(s)");
+        } else if (r && !r.ok) notes.push("tab: " + String(r.error || "failed").slice(0, 160));
+      } catch (e) {
+        notes.push("tab: " + String((e && e.message) || e).slice(0, 160));
+      }
+    }
+    return { shots, notes };
+  }
+
+  // ── Virtual animation tools ──────────────────────────────────────────
     // Create/edit Roblox animation KEYFRAME DATA (KeyframeSequence/Keyframe/
     // Pose, per-bone transforms) via execute_luau + the RSAnim Luau library.
     // The catalogue above (list_commands) advertises them; the Roblox MCP
@@ -2227,6 +2393,7 @@
           return `ERROR: '${bareName}' returned an image, but this assistant cannot see images. Do NOT call it again.`;
         }
         if (r.images && r.images.length) {
+          rememberImages(r.images, name);
           ui.showImages(r.images, name);
           A.pendingImages = r.images;
           const caption = r.text && r.text.trim() ? r.text.trim() : `${r.images.length} image(s) captured.`;
@@ -2324,6 +2491,7 @@
       if (r.images && r.images.length) {
         // Show the capture in a left-hand OR popup (from the in-memory
         // base64 - simple and reliable on every site; no DOM-embedded preview).
+        rememberImages(r.images, name);
         ui.showImages(r.images, name);
         // Do NOT attach the image here: submitAndGetBase/typeAndSend types the
         // feedback text into the editor LATER, and on providers whose editor is
@@ -7160,6 +7328,33 @@ function renderCards(panel) {
         body.appendChild(el);
       }
       wrap.appendChild(body);
+      // Manual fallbacks for attach_feedback: copying to the system clipboard
+      // needs a user gesture on some builds, and pasting into the composer by
+      // hand is the escape hatch when a site refuses the synthetic upload.
+      const bar = document.createElement("div");
+      bar.className = "rs-shot-bar";
+      const mk = (label, title, fn) => {
+        const b = document.createElement("button");
+        b.className = "rs-shot-btn";
+        b.type = "button";
+        b.textContent = label;
+        b.title = title;
+        b.addEventListener("click", fn);
+        return b;
+      };
+      bar.appendChild(mk("Copy", "Copy to the system clipboard (guaranteed by the click gesture)", async (e) => {
+        e.target.textContent = "…";
+        const r = await copyImageToClipboard(images[0]);
+        e.target.textContent = r.ok ? "Copied ✓" : "Copy ✗";
+        e.target.title = r.ok ? "Paste it anywhere with Ctrl+V" : r.error;
+        if (r.ok) ui.toast("Screenshot copied — paste it into the AI chat with Ctrl+V", 6000);
+      }));
+      bar.appendChild(mk("Use as feedback", "Attach this shot to the next message OR sends to the AI", () => {
+        A.pendingImages = images.slice();
+        rememberImages(images, "popup");
+        ui.toast("Latest capture will be attached to the next message.", 4000);
+      }));
+      wrap.appendChild(bar);
       root.appendChild(wrap);
     }
 

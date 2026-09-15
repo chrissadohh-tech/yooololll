@@ -162,6 +162,17 @@ const BLENDER_TOOLS = [
   btool("blender_set_origin", "Set object origin (ORIGIN_GEOMETRY, ORIGIN_CURSOR, ORIGIN_CENTER_OF_MASS).", { name: { type: "string" }, type: { type: "string" } }, []),
   btool("blender_shade_smooth", "Shade smooth.", { name: { type: "string" }, objects: { type: "array" } }, []),
   btool("blender_set_material", "Assign a Principled BSDF material. color = [r,g,b] or [r,g,b,a] 0–1.", { name: { type: "string" }, material: { type: "string" }, color: { type: "array" } }, []),
+  // ── Material toolkit ──
+  btool("blender_material_create", "Create a node-based material (optionally assigning it). Either a preset, explicit PBR values, or both. color = [r,g,b(,a)] 0–1, [r,g,b] 0–255, or '#rrggbb'.", { material: { type: "string" }, preset: { type: "string", description: "metal, steel, iron, chrome, gold, silver, copper, bronze, brass, plastic, rubber, ceramic, concrete, asphalt, wood, marble, fabric, leather, glass, frosted_glass, water, ice, emissive, neon, lava, hologram, ghost, toon, roblox_plastic, roblox_metal, roblox_glass" }, color: { type: "array" }, metallic: { type: "number" }, roughness: { type: "number" }, ior: { type: "number" }, transmission: { type: "number" }, alpha: { type: "number" }, emission: { type: "array" }, emission_strength: { type: "number" }, coat: { type: "number" }, sheen: { type: "number" }, blend: { type: "string", description: "BLEND / HASHED / OPAQUE" }, name: { type: "string", description: "object to assign to" }, objects: { type: "array" }, append_slot: { type: "boolean" } }, ["material"]),
+  btool("blender_material_preset", "Create a material from a named preset in one call (see blender_material_create for the list) and assign it.", { material: { type: "string" }, preset: { type: "string" }, name: { type: "string" }, objects: { type: "array" }, color: { type: "array" } }, ["preset"]),
+  btool("blender_material_set", "Change values on an EXISTING material (color, metallic, roughness, emission, alpha, ior, transmission, coat, sheen, blend).", { material: { type: "string" }, color: { type: "array" }, metallic: { type: "number" }, roughness: { type: "number" }, emission: { type: "array" }, emission_strength: { type: "number" }, alpha: { type: "number" }, transmission: { type: "number" }, ior: { type: "number" }, coat: { type: "number" }, sheen: { type: "number" }, blend: { type: "string" } }, ["material"]),
+  btool("blender_material_assign", "Assign an existing material to objects (all slots, one slot, or append a new slot).", { material: { type: "string" }, name: { type: "string" }, objects: { type: "array" }, slot: { type: "integer" }, append: { type: "boolean" } }, ["material"]),
+  btool("blender_material_list", "List every material: users, Principled values, plus the known preset names.", {}, []),
+  btool("blender_material_inspect", "Dump one material completely: Principled BSDF inputs, linked inputs, node graph, users.", { material: { type: "string" }, name: { type: "string" } }, []),
+  btool("blender_material_remove", "Delete a material from the file.", { material: { type: "string" } }, ["material"]),
+  btool("blender_material_noise", "Add a procedural texture to a material (noise, voronoi, wave, checker, brick, gradient) driving bump, base color, roughness or emission.", { material: { type: "string" }, type: { type: "string" }, affect: { type: "string", description: "bump | base_color | roughness | emission" }, scale: { type: "number" }, detail: { type: "number" }, roughness: { type: "number" }, distortion: { type: "number" }, strength: { type: "number" }, color_a: { type: "array" }, color_b: { type: "array" }, replace: { type: "boolean" } }, ["material"]),
+  btool("blender_material_image", "Wire an image file into a material slot (base_color, roughness, metallic, normal, emission).", { material: { type: "string" }, path: { type: "string" }, slot: { type: "string" }, strength: { type: "number" }, alpha_to_alpha: { type: "boolean" }, colorspace: { type: "string" } }, ["material", "path"]),
+  btool("blender_material_pbr", "Build a full PBR graph from map files (base_color/albedo + optional orm, roughness, metallic, normal, emission) with correct Non-Color colorspaces.", { material: { type: "string" }, base_color: { type: "string" }, albedo: { type: "string" }, orm: { type: "string" }, roughness: { type: "string" }, metallic: { type: "string" }, normal: { type: "string" }, emission: { type: "string" } }, ["material"]),
   btool("blender_add_modifier", "Add a modifier: SUBSURF, BEVEL, SOLIDIFY, MIRROR, ARRAY, BOOLEAN, DECIMATE. apply=true to apply.", { name: { type: "string" }, type: { type: "string" }, levels: { type: "integer" }, apply: { type: "boolean" }, target: { type: "string" } }, []),
   btool("blender_boolean", "Boolean one mesh with another (DIFFERENCE/UNION/INTERSECT) and apply.", { name: { type: "string" }, target: { type: "string" }, operation: { type: "string" } }, ["target"]),
   btool("blender_clear_scene", "Delete objects. keep = names to leave.", { keep: { type: "array", items: { type: "string" } } }, []),
@@ -585,25 +596,198 @@ function broadcastStatus() {
 }
 
 
-async function ddgSearch(query, limit) {
+// ── Web tools (search + fetch) ──────────────────────────────────────────────
+// Health notes (why this is not one DDG call anymore):
+//  * html.duckduckgo.com/html/ is the endpoint OR used to scrape with a
+//    "OR/1.0" UA. DDG now treats that as an anomaly: it answers 202/403 with a
+//    challenge page that contains ZERO .result__a anchors, so the old parser
+//    returned [] and the tool reported "no results" on every query.
+//  * A browser UA + Accept-Language + Referer is required for the same URL to
+//    serve real results, and even then DDG rate-limits datacenter IPs.
+//  * So: try several independent backends in order, use a REAL browser UA, and
+//    fall back to a generic anchor parser per backend (markup drifts; a
+//    changed class name must not zero out the whole tool).
+// Every backend failure is collected and reported, so "it doesn't work" is
+// always accompanied by WHY (status codes included) instead of a bare "no
+// results for X".
+const BROWSER_UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36";
+const WEB_FETCH_TIMEOUT = 20000;
+const WEB_SEARCH_TIMEOUT = 12000;
+
+function webHeaders(extra, referer) {
+  const h = {
+    "User-Agent": BROWSER_UA,
+    Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,text/plain;q=0.8,*/*;q=0.7",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Cache-Control": "no-cache",
+  };
+  if (referer) h.Referer = referer;
+  return Object.assign(h, extra || {});
+}
+
+// A hung fetch is worse than a failed one: the content script's bg() has no
+// timeout of its own, so an endpoint that never answers used to spin the tool
+// forever. AbortController gives every request a hard deadline.
+async function fetchWithTimeout(url, opts, ms) {
+  const ctrl = typeof AbortController === "function" ? new AbortController() : null;
+  const timer = ctrl ? setTimeout(() => { try { ctrl.abort(); } catch {} }, ms || WEB_FETCH_TIMEOUT) : null;
+  try {
+    return await fetch(url, Object.assign({ redirect: "follow" }, opts || {}, ctrl ? { signal: ctrl.signal } : {}));
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+const ENTITIES = {
+  nbsp: " ", amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", "#39": "'", "#x27": "'",
+  mdash: "—", ndash: "–", hellip: "…", rsquo: "’", lsquo: "‘", ldquo: "“", rdquo: "”",
+  middot: "·", times: "×", deg: "°", copy: "©", reg: "®", trade: "™", euro: "€", pound: "£",
+};
+function decodeEntities(s) {
+  // Numeric forms first, then named. &amp; is decoded LAST via a single pass so
+  // a literal "&amp;lt;" does not turn into "<" (double-decoding).
+  return String(s || "")
+    .replace(/&#x([0-9a-f]+);/gi, (_, h) => { try { return String.fromCodePoint(parseInt(h, 16)); } catch { return " "; } })
+    .replace(/&#(\d+);/g, (_, d) => { try { return String.fromCodePoint(Number(d)); } catch { return " "; } })
+    .replace(/&([a-z#0-9x]+);/gi, (m, name) => {
+      const key = String(name).toLowerCase();
+      if (key === "amp") return "&";
+      return Object.prototype.hasOwnProperty.call(ENTITIES, key) ? ENTITIES[key] : m;
+    });
+}
+
+function stripTags(html) {
+  return decodeEntities(String(html || "").replace(/<[^>]*>/g, " ")).replace(/\s+/g, " ").trim();
+}
+
+// DDG wraps every result link as /l/?uddg=<urlencoded>&rut=…
+function unwrapDdg(href) {
+  let h = String(href || "").trim();
+  if (h.startsWith("//")) h = "https:" + h;
+  const m = h.match(/[?&]uddg=([^&]+)/);
+  if (m) { try { return decodeURIComponent(m[1]); } catch { return h; } }
+  const m2 = h.match(/[?&]url=([^&]+)/);
+  if (m2 && /duckduckgo\.com\/l\//.test(h)) { try { return decodeURIComponent(m2[1]); } catch {} }
+  return h;
+}
+
+function cleanHits(list, n, engineHost) {
+  const out = [];
+  const seen = new Set();
+  for (const r of list) {
+    let url = String((r && r.url) || "").trim();
+    const title = stripTags((r && r.title) || "");
+    if (!/^https?:\/\//i.test(url)) continue;
+    if (engineHost && url.includes(engineHost)) continue;
+    if (!title || title.length < 3) continue;
+    const key = url.replace(/[#?].*$/, "").replace(/\/+$/, "");
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ title: title.slice(0, 180), url });
+    if (out.length >= n) break;
+  }
+  return out;
+}
+
+// Last-resort parser: ANY anchor with an http(s) href and real text. Used when
+// a backend's markup changed (or is unknown) so the tool still returns hits.
+function parseGenericAnchors(html, n, engineHost) {
+  const hits = [];
+  const re = /<a\b[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
+  let m;
+  while ((m = re.exec(String(html || ""))) !== null) {
+    const url = unwrapDdg(m[1]);
+    const title = stripTags(m[2]);
+    if (!title || title.length < 12 || title.length > 180) continue;
+    hits.push({ url, title });
+  }
+  return cleanHits(hits, n, engineHost);
+}
+
+function parseDdgHtml(html, n) {
+  const hits = [];
+  const re = /<a\b[^>]*class="[^"]*result__a[^"]*"[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
+  let m;
+  while ((m = re.exec(String(html || ""))) !== null) hits.push({ url: unwrapDdg(m[1]), title: m[2] });
+  // class before href (older markup) — attribute order is not guaranteed.
+  if (!hits.length) {
+    const re2 = /<a\b[^>]*href=["']([^"']+)["'][^>]*class="[^"]*result__a[^"]*"[^>]*>([\s\S]*?)<\/a>/gi;
+    while ((m = re2.exec(String(html || ""))) !== null) hits.push({ url: unwrapDdg(m[1]), title: m[2] });
+  }
+  const clean = cleanHits(hits, n, "duckduckgo.com");
+  return clean.length ? clean : parseGenericAnchors(html, n, "duckduckgo.com");
+}
+
+function parseDdgLite(html, n) {
+  const hits = [];
+  const re = /<a\b[^>]*class="[^"]*result-link[^"]*"[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
+  let m;
+  while ((m = re.exec(String(html || ""))) !== null) hits.push({ url: unwrapDdg(m[1]), title: m[2] });
+  const clean = cleanHits(hits, n, "duckduckgo.com");
+  return clean.length ? clean : parseGenericAnchors(html, n, "duckduckgo.com");
+}
+
+function parseMojeek(html, n) {
+  const hits = [];
+  const re = /<a\b[^>]*class="[^"]*\bob\b[^"]*"[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
+  let m;
+  while ((m = re.exec(String(html || ""))) !== null) hits.push({ url: m[1], title: m[2] });
+  if (!hits.length) {
+    const re2 = /<h2>\s*<a\b[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
+    while ((m = re2.exec(String(html || ""))) !== null) hits.push({ url: m[1], title: m[2] });
+  }
+  const clean = cleanHits(hits, n, "mojeek.com");
+  return clean.length ? clean : parseGenericAnchors(html, n, "mojeek.com");
+}
+
+// Wikipedia has a real JSON API with CORS — not scraped, so it never breaks.
+// Not a general web search, but an excellent last resort for API/property
+// questions and it keeps the tool useful when every scraper is blocked.
+function parseWikipedia(json, n) {
+  const out = [];
+  try {
+    const rows = (JSON.parse(json).query || {}).search || [];
+    for (const r of rows) {
+      out.push({
+        title: r.title + " — Wikipedia",
+        url: "https://en.wikipedia.org/wiki/" + encodeURIComponent(String(r.title).replace(/ /g, "_")),
+      });
+      if (out.length >= n) break;
+    }
+  } catch {}
+  return out;
+}
+
+const SEARCH_BACKENDS = [
+  { id: "duckduckgo", url: (q) => "https://html.duckduckgo.com/html/?q=" + encodeURIComponent(q), parse: parseDdgHtml, referer: "https://duckduckgo.com/" },
+  { id: "ddg-lite", url: (q) => "https://lite.duckduckgo.com/lite/?q=" + encodeURIComponent(q), parse: parseDdgLite, referer: "https://lite.duckduckgo.com/" },
+  { id: "mojeek", url: (q) => "https://www.mojeek.com/search?q=" + encodeURIComponent(q), parse: parseMojeek, referer: "https://www.mojeek.com/" },
+  { id: "wikipedia", url: (q) => "https://en.wikipedia.org/w/api.php?action=query&list=search&format=json&srlimit=5&srsearch=" + encodeURIComponent(q), parse: parseWikipedia, json: true, referer: "https://en.wikipedia.org/" },
+];
+
+// Try every backend until one yields hits. Returns { hits, backend, notes }.
+async function webSearch(query, limit) {
   const q = String(query || "").trim();
   const n = Math.max(1, Math.min(8, Number(limit) || 3));
-  if (!q) return [];
-  const url = "https://html.duckduckgo.com/html/?q=" + encodeURIComponent(q);
-  const res = await fetch(url, { headers: { "User-Agent": "OR/1.0" } });
-  if (!res.ok) throw new Error("search HTTP " + res.status);
-  const html = await res.text();
-  const results = [];
-  const re = /<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>([^<]+)<\/a>/g;
-  let m;
-  while ((m = re.exec(html)) !== null && results.length < n) {
-    let href = m[1]; const title = m[2].trim();
-    const um = href.match(/uddg=([^&]+)/);
-    if (um) try { href = decodeURIComponent(um[1]); } catch {}
-    if (title && href) results.push({ title, url: href });
+  if (!q) return { hits: [], backend: null, notes: ["empty query"] };
+  const notes = [];
+  for (const b of SEARCH_BACKENDS) {
+    try {
+      const extra = b.json ? { Accept: "application/json,text/plain,*/*" } : null;
+      const res = await fetchWithTimeout(b.url(q), { headers: webHeaders(extra, b.referer) }, WEB_SEARCH_TIMEOUT);
+      if (!res.ok) { notes.push(`${b.id}: HTTP ${res.status}`); continue; }
+      const body = await res.text();
+      const hits = b.parse(body, n);
+      if (hits.length) return { hits, backend: b.id, notes };
+      notes.push(`${b.id}: no results parsed${/anomaly|captcha|unusual traffic/i.test(body) ? " (bot challenge page)" : ""}`);
+    } catch (e) {
+      notes.push(`${b.id}: ${String((e && e.message) || e).slice(0, 90)}`);
+    }
   }
-  return results;
+  return { hits: [], backend: null, notes };
 }
+
 function htmlToText(html) {
   let s = String(html || "");
   s = s.replace(/<script[\s\S]*?<\/script>/gi, " ");
@@ -612,11 +796,28 @@ function htmlToText(html) {
   s = s.replace(/<!--[\s\S]*?-->/g, " ");
   s = s.replace(/<br\s*\/?>/gi, "\n");
   s = s.replace(/<\/(p|div|h[1-6]|li|tr|section|article|header|footer|blockquote|pre|ul|ol|table)>/gi, "\n");
+  s = s.replace(/<(p|div|h[1-6]|li|tr|section|article|header|footer|blockquote|pre|ul|ol|table)\b[^>]*>/gi, "\n");
   s = s.replace(/<[^>]+>/g, " ");
-  s = s.replace(/&nbsp;/gi, " ").replace(/&amp;/gi, "&").replace(/&lt;/gi, "<").replace(/&gt;/gi, ">").replace(/&quot;/gi, '"').replace(/&#39;/g, "'");
-  s = s.replace(/&#(\d+);/g, (_, n) => { try { return String.fromCharCode(Number(n)); } catch { return " "; } });
+  s = decodeEntities(s);
   s = s.replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").replace(/[ \t]{2,}/g, " ").trim();
   return s;
+}
+
+// A JS-only shell ("enable JavaScript", a few hundred chars) is not a page we
+// can read; the reader proxy renders it server-side and returns Markdown.
+function looksLikeShell(text) {
+  const t = String(text || "");
+  if (t.length < 400) return true;
+  return /enable javascript|javascript is (required|disabled)|checking your browser|just a moment|cf-browser-verification/i.test(t.slice(0, 600));
+}
+async function readerFallback(url, maxChars) {
+  const res = await fetchWithTimeout("https://r.jina.ai/" + url, { headers: webHeaders() }, WEB_FETCH_TIMEOUT);
+  if (!res.ok) throw new Error("reader HTTP " + res.status);
+  let text = await res.text();
+  if (!text || text.length < 40) throw new Error("reader returned nothing");
+  const orig = text.length;
+  if (orig > maxChars) text = text.slice(0, maxChars) + `\n\n…[truncated ${orig - maxChars} chars]`;
+  return text;
 }
 
 
@@ -729,6 +930,18 @@ async function localReadAll(path) {
   return chunks.join("\n");
 }
 
+// Read ANY workspace file as base64 (images/binaries included) through the
+// native AgentScript engine. This is the ONLY way browser-side code can get at
+// bytes on disk, so it backs every "attach this file / screenshot" feature.
+async function localReadBase64(path) {
+  const r = await sendLocalEngine({ type: "call_tool", name: "read_file_base64", arguments: { path } }, 30000);
+  if (!r || !r.ok) throw new Error((r && r.error) || ("could not read " + path));
+  let parsed = null;
+  try { parsed = JSON.parse(String(r.text || "")); } catch {}
+  if (!parsed || !parsed.data) throw new Error("the bridge returned no file data for " + path);
+  return parsed;
+}
+
 async function localRun(command, timeoutSeconds = 12) {
   return sendLocalEngine({
     type: "call_tool", name: "run_command",
@@ -823,6 +1036,18 @@ const BLENDER_CMD = {
   blender_select: "select", blender_transform: "transform",
   blender_apply_transforms: "apply_transforms", blender_set_origin: "set_origin",
   blender_shade_smooth: "shade_smooth", blender_set_material: "set_material",
+  // ── Material toolkit (node-based; version-safe across Blender 3.x/4.x) ──
+  blender_material_create: "material_create", blender_material_new: "material_create",
+  blender_make_material: "material_create", blender_material_preset: "material_preset",
+  blender_material_apply_preset: "material_preset", blender_material_set: "material_set",
+  blender_material_edit: "material_set", blender_material_assign: "material_assign",
+  blender_material_apply: "material_assign", blender_material_list: "material_list",
+  blender_materials: "material_list", blender_material_inspect: "material_inspect",
+  blender_material_info: "material_inspect", blender_material_remove: "material_remove",
+  blender_material_delete: "material_remove", blender_material_noise: "material_noise",
+  blender_material_texture: "material_noise", blender_material_image: "material_image",
+  blender_material_texture_image: "material_image", blender_material_pbr: "material_pbr",
+  blender_material_maps: "material_pbr",
   blender_add_modifier: "add_modifier", blender_boolean: "boolean",
   blender_add_cube: "add_cube", blender_add_sphere: "add_sphere",
   blender_add_cylinder: "add_cylinder", blender_add_cone: "add_cone",
@@ -907,7 +1132,9 @@ async function blenderPayload(name, args) {
     let shot = "or_blender_shot.png";
     const root = await agentWorkspaceRoot();
     if (root) shot = root.replace(/[\\/]+$/, "") + "/or_blender_shot.png";
-    return { type: "get_viewport_screenshot", params: { max_size: Number(a.max_size) || 1000, filepath: shot, format: "png" } };
+    // _orShot: the exact path we asked Blender to write, so blenderCall can read
+    // the pixels back (see the screenshot branch there) without guessing.
+    return { type: "get_viewport_screenshot", params: { max_size: Number(a.max_size) || 1000, filepath: shot, format: "png" }, _orShot: shot };
   }
   const mapped = BLENDER_CMD[bare];
   if (mapped) {
@@ -1012,8 +1239,36 @@ async function blenderCall(name, args, timeout) {
       }
     }
     if (meshes && meshes.length && result && typeof result === "object") result.meshes = meshes;
+    // ── Screenshot → real image bytes ──────────────────────────────────────
+    // The blender-mcp addon WRITES the viewport capture to a PNG path and
+    // answers with that path as text. A Chrome extension cannot read a local
+    // path, so this used to hand back images:[] and or_screenshot silently fell
+    // through to a tab capture (the AI got a picture of its own chat window).
+    // The path IS inside the AgentScript workspace, so read it back as base64
+    // through the bridge and return it as a real attachment.
+    let images = [];
+    const shotPath = payload._orShot ||
+      (result && typeof result === "object" && (result.filepath || result.file_path || result.path)) ||
+      (payload.type === "get_viewport_screenshot" ? "or_blender_shot.png" : "");
+    if (shotPath && payload.type === "get_viewport_screenshot") {
+      try {
+        const parsed = await localReadBase64(shotPath);
+        images = [{ mimeType: parsed.mimeType || "image/png", data: parsed.data }];
+        if (result && typeof result === "object") result.bytes = parsed.bytes;
+      } catch (e) {
+        // Keep the path in the text so the model/user can still open the file;
+        // report the reason rather than pretending a capture happened.
+        result = typeof result === "object" && result
+          ? Object.assign({}, result, { image_error: String((e && e.message) || e).slice(0, 200) })
+          : result;
+      }
+    }
     let textOut = typeof result === "string" ? result : JSON.stringify(result, null, 2);
-    return { ok: true, text: textOut, images: [], meshFile: mf, filepath: result && result.filepath, meshes: meshes || undefined };
+    if (payload.type === "get_viewport_screenshot" && !images.length) {
+      textOut += "\n\n[OR: the viewport image could not be read back from disk" +
+        (shotPath ? ` (${shotPath})` : "") + " — the capture file may be missing or unreadable.]";
+    }
+    return { ok: true, text: textOut, images, meshFile: mf, filepath: result && result.filepath, meshes: meshes || undefined };
   };
   const prev = blenderCallLock;
   let release;
@@ -1239,6 +1494,18 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         }
         break;
       }
+      // Base64 read (any file: images, PDFs, binaries) — powers attach_feedback
+      // ({"path": ...}), which puts a workspace file into the chat as an
+      // attachment instead of pasting its text.
+      case "local_read_base64": {
+        try {
+          const data = await localReadBase64(String(msg.path || ""));
+          sendResponse({ ok: true, path: data.path, mimeType: data.mimeType, bytes: data.bytes, data: data.data });
+        } catch (e) {
+          sendResponse({ ok: false, error: String(e && e.message || e) });
+        }
+        break;
+      }
       case "blender_connect": {
         sendResponse(await connectBlender());
         break;
@@ -1320,24 +1587,65 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           if (!url) {
             const q = query || String(msg.q || "").trim();
             if (!q) { sendResponse({ ok: false, error: "url or query is required" }); break; }
-            const hits = await ddgSearch(q, 3);
-            if (!hits.length) { sendResponse({ ok: false, error: "no search results for: " + q }); break; }
-            url = hits[0].url;
-            searchNote = "Searched \"" + q + "\". Top result: " + url + "\n" +
-              hits.map((h, i) => (i+1) + ". " + h.title + " — " + h.url).join("\n") + "\n\n";
+            const found = await webSearch(q, 3);
+            if (!found.hits.length) {
+              sendResponse({ ok: false, error: `no search results for: ${q} (tried ${found.notes.join("; ") || "all backends"})` });
+              break;
+            }
+            url = found.hits[0].url;
+            searchNote = `Searched "${q}" [${found.backend}]. Top result: ${url}\n` +
+              found.hits.map((h, i) => (i + 1) + ". " + h.title + " — " + h.url).join("\n") + "\n\n";
           }
           if (!/^https?:\/\//i.test(url)) { sendResponse({ ok: false, error: "url must start with http:// or https://" }); break; }
           const maxChars = Math.max(500, Math.min(50000, Number(msg.max_chars) || 12000));
-          const res = await fetch(url, { headers: { "User-Agent": "OR/1.0 (web_fetch)", "Accept": "text/html,application/xhtml+xml,application/xml,text/plain,*/*" } });
-          if (!res.ok) { sendResponse({ ok: false, error: `fetch failed HTTP ${res.status}` }); break; }
-          let text = await res.text();
-          const ctype = (res.headers.get("content-type") || "").toLowerCase();
-          const looksHtml = /html|xml/.test(ctype) || /^\s*</.test(text);
-          if (looksHtml) text = htmlToText(text);
+          let text = "";
+          let directWasHtml = false;
+          let status = 0;
+          let ctype = "";
+          let via = "direct";
+          const notes = [];
+          try {
+            const res = await fetchWithTimeout(url, { headers: webHeaders({}, (() => { try { return new URL(url).origin + "/"; } catch { return undefined; } })()) }, WEB_FETCH_TIMEOUT);
+            status = res.status;
+            ctype = (res.headers.get("content-type") || "").toLowerCase();
+            if (!res.ok) {
+              notes.push(`direct HTTP ${res.status}`);
+            } else {
+              let raw = await res.text();
+              const looksHtml = /html|xml/.test(ctype) || /^\s*</.test(raw);
+              directWasHtml = looksHtml;
+              text = looksHtml ? htmlToText(raw) : raw.trim();
+            }
+          } catch (e) {
+            notes.push("direct: " + String((e && e.message) || e).slice(0, 90));
+          }
+          // Reader proxy when the direct fetch failed, was blocked, or returned
+          // a JavaScript shell we cannot read.
+          // Short pages are only suspicious when they were HTML: a 200-char
+          // plain-text/JSON answer is a complete document, and re-reading it
+          // through a proxy would be wasted time.
+          const wasShell = !text || (directWasHtml && looksLikeShell(text));
+          if (wasShell) {
+            try {
+              const viaReader = await readerFallback(url, maxChars);
+              if (viaReader) { text = viaReader; via = "reader"; }
+            } catch (e) {
+              notes.push("reader: " + String((e && e.message) || e).slice(0, 90));
+            }
+          }
+          if (!text) {
+            sendResponse({ ok: false, error: `fetch failed for ${url}${notes.length ? " (" + notes.join("; ") + ")" : ""}` });
+            break;
+          }
           const origLen = text.length;
           const truncated = origLen > maxChars;
           if (truncated) text = text.slice(0, maxChars) + `\n\n…[truncated ${origLen - maxChars} chars]`;
-          sendResponse({ ok: true, text: searchNote + text, truncated, status: res.status, url, content_type: ctype });
+          const suffix = via === "reader"
+            ? `\n\n[OR: the page served no readable text directly (${notes.join("; ") || "blocked"}), so it was read through a rendering proxy — layout/menus may be missing.]`
+            : (wasShell
+              ? `\n\n[OR: this page returned almost no readable text${notes.length ? " (" + notes.join("; ") + ")" : ""} — it is served by JavaScript or blocks non-browser readers, so the text above is all there is. Use web_search for a text source instead of relying on this page.]`
+              : "");
+          sendResponse({ ok: true, text: searchNote + text + suffix, truncated, status, url, content_type: ctype, via });
         } catch (e) { sendResponse({ ok: false, error: String(e && e.message || e) }); }
         break;
       }
@@ -1346,26 +1654,14 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           const q = String(msg.query || msg.q || "").trim();
           if (!q) { sendResponse({ ok: false, error: "query is required" }); break; }
           const limit = Math.max(1, Math.min(8, Number(msg.limit) || 3));
-          const url = "https://html.duckduckgo.com/html/?q=" + encodeURIComponent(q);
-          const res = await fetch(url, { headers: { "User-Agent": "OR/1.0" } });
-          if (!res.ok) { sendResponse({ ok: false, error: `search HTTP ${res.status}` }); break; }
-          const html = await res.text();
-          const results = [];
-          const re = /<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>([^<]+)<\/a>/g;
-          let m;
-          while ((m = re.exec(html)) !== null && results.length < limit) {
-            let href = m[1]; const title = m[2].trim();
-            const um = href.match(/uddg=([^&]+)/);
-            if (um) try { href = decodeURIComponent(um[1]); } catch {}
-            if (title && href) results.push({ title, url: href });
+          const found = await webSearch(q, limit);
+          if (!found.hits.length) {
+            sendResponse({ ok: false, error: `no results for '${q}' (tried ${found.notes.join("; ") || "all backends"})`, notes: found.notes });
+            break;
           }
-          if (!results.length) {
-            const re2 = /class="result__url"[^>]+href="([^"]+)"/g;
-            while ((m = re2.exec(html)) !== null && results.length < limit) results.push({ title: m[1], url: m[1] });
-          }
-          if (!results.length) { sendResponse({ ok: false, error: `no results for '${q}'` }); break; }
-          const txt = results.map((r,i)=> `${i+1}. ${r.title}\n   ${r.url}`).join("\n");
-          sendResponse({ ok: true, text: txt, results, query: q });
+          const results = found.hits;
+          const txt = results.map((r, i) => `${i + 1}. ${r.title}\n   ${r.url}`).join("\n");
+          sendResponse({ ok: true, text: `Searched "${q}" [${found.backend}]\n${txt}`, results, query: q, backend: found.backend, notes: found.notes });
         } catch (e) { sendResponse({ ok: false, error: String(e && e.message || e) }); }
         break;
       }
