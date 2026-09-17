@@ -159,6 +159,10 @@ function makeFakeAgent(opts) {
   state.lastArgs = {};                     // the arguments the last capture tool was called with
   state.studioIdCalls = 0;                 // how often the connected id was looked up
   state.ps1Runs = 0;                       // how often the (blocked) script was actually started
+  state.helperShot = false;                // OR's own Python MCP client (the ZeroScript route) delivers
+  state.helperTooLarge = false;            // it captures, but the picture is bigger than the text tunnel
+  state.noPython = false;                  // this PC has no Python on PATH
+  state.helperRuns = 0;                    // how often the Python helper was started
   state.studioWindowMissing = false;       // no Studio window open: the real ps1 says so and exits
   state.trailingNoise = false;             // PowerShell printed something after the result line
   state.selftestBroken = false;            // PowerShell/GDI failure
@@ -257,6 +261,38 @@ function makeFakeAgent(opts) {
       const b64 = data.toString("base64");
       files[dst] = Buffer.from(b64.match(/.{1,64}/g).join("\n") + "\n", "utf8");
       okText("Input Length = " + data.length + "\nOutput Length = " + b64.length + "\nCertUtil: -encode command completed successfully.\n");
+      return;
+    }
+    if (name === "run_command" && /OR_PY_OK/.test(String(a.command || ""))) {
+      if (state.noPython) {
+        okText("'python' is not recognized as an internal or external command,\r\noperable program or batch file.");
+        return;
+      }
+      okText("OR_PY_OK");
+      return;
+    }
+    if (name === "run_command" && /or_mcp_shot\.py/.test(String(a.command || ""))) {
+      // OR's own MCP client, which is a plain Python program talking to StudioMCP.exe:
+      // no PowerShell anywhere, so an antivirus that blocks .ps1 files cannot stop it.
+      state.helperRuns = (state.helperRuns || 0) + 1;
+      if (!state.helperShot) {
+        okText("StudioMCP: (no answer yet)\nOR_STUDIO_SHOT " + JSON.stringify({ ok: false, stage: "no-tools", method: "mcp-stdio",
+          error: "StudioMCP answered but advertised no tools",
+          hint: "Roblox Studio is not connected to the MCP server: open Studio, load a place, and enable MCP." }));
+        return;
+      }
+      const png = Buffer.alloc(3200);
+      for (let i = 0; i < png.length; i++) png[i] = (i * 11 + 5) & 0xff;
+      files["or_mcp_shot.png"] = png;
+      const b64 = png.toString("base64");
+      files["or_mcp_shot.png.b64"] = Buffer.from(b64.match(/.{1,400}/g).join("\n") + "\n", "utf8");
+      okText("calling screen_capture {\"capture_id\": \"or_capture_1\", \"studio_id\": \"st_fake42\"}\nOR_STUDIO_SHOT " + JSON.stringify({
+        ok: true, method: "mcp-stdio", tool: "screen_capture", file: "or_mcp_shot.png",
+        bytes: png.length, mime: "image/png", studio_id: "st_fake42",
+        base64_file: "or_mcp_shot.png.b64", base64_chars: b64.length, base64_lines: b64.length / 400,
+        sha256: crypto.createHash("sha256").update(png).digest("hex"),
+        too_large: !!state.helperTooLarge, takeover: "",
+      }));
       return;
     }
     if (name === "run_command" && /-B64Only/.test(String(a.command || ""))) {
@@ -1033,6 +1069,55 @@ const call = async (c, tool, args, ms = 9000) => {
         ok("ViewportScreenshotRoblox takes the Studio window, never the desktop",
            /attached to THIS message/i.test(rWin) && /studio window/i.test(rWin) && !/whole screen/i.test(rWin),
            rWin.slice(0, 280));
+        // ── ZERO-SCRIPT ROUTE: OR's own Python MCP client ─────────────────────
+        // A Python program launches Roblox's signed StudioMCP.exe, looks the connected
+        // studio id up, calls Studio's capture tool and writes the PNG. No PowerShell,
+        // no .ps1, nothing for a scanner to quarantine - and the picture reaches the
+        // browser as TEXT, so the old 18-tool agent needs no rebuild.
+        const hz = makeFakeAgent({}); hz.helperShot = true;
+        const cHz = build({}, { fakeAgent: hz, engine: "local" }).ctx;
+        await waitConnected(cHz);
+        const hzShot = String(await call(cHz, "ViewportScreenshotRoblox", {}, 40000));
+        const hzImgs = vm.runInContext("window.__rsRecentImages()", cHz);
+        ok("OR's own MCP client delivers a Studio picture on the OLD agent (no rebuild)",
+           hzImgs.length > 0 && /attached to THIS message/i.test(hzShot), hzShot.slice(0, 320));
+        ok("...and it says where the picture came from",
+           /OR's own MCP client/i.test(hzShot) && /screen_capture/i.test(hzShot) && /st_fake42/.test(hzShot), hzShot.slice(0, 420));
+        ok("...and NO PowerShell script was involved (nothing for an antivirus to block)",
+           !hz.commands.some((cm) => /studio_shot\.ps1/.test(cm)) && hz.helperRuns > 0,
+           hz.commands.join(" | ").slice(0, 240));
+        ok("...and the picture arrived exactly as captured",
+           Buffer.from(String(hzImgs[0].data || ""), "base64").length === 3200, String(hzImgs[0].data || "").length);
+        {
+          // THE USER'S PC: the antivirus blocks studio_shot.ps1 outright. The Roblox
+          // picture must still arrive, because this route never touches that script.
+          const avz = makeFakeAgent({}); avz.helperShot = true; avz.avBlocksPs1 = true; avz.studioWindowMissing = true;
+          const cAvz = build({}, { fakeAgent: avz, engine: "local" }).ctx;
+          await waitConnected(cAvz);
+          const out = String(await call(cAvz, "ViewportScreenshotRoblox", {}, 40000));
+          ok("a BLOCKED script does not stop the Roblox picture (the ZeroScript route carries it)",
+             /attached to THIS message/i.test(out) && /OR's own MCP client/i.test(out), out.slice(0, 320));
+        }
+        {
+          // No Python on the PC: say so, name the fix, and never pretend a picture exists.
+          const np = makeFakeAgent({}); np.noPython = true; np.studioWindowMissing = true;
+          const cNp = build({}, { fakeAgent: np, engine: "local" }).ctx;
+          await waitConnected(cNp);
+          const out = String(await call(cNp, "ViewportScreenshotRoblox", {}, 40000));
+          ok("a PC without Python is told exactly that, with the fix",
+             /no Python on PATH/i.test(out) && /python\.org/i.test(out), out.slice(0, 460));
+          ok("...and it does NOT pretend the capture worked", !/attached to THIS message/i.test(out), out.slice(-200));
+        }
+        {
+          // A huge capture: attach nothing and say why, rather than grinding through
+          // hundreds of text pages.
+          const big = makeFakeAgent({}); big.helperShot = true; big.helperTooLarge = true;
+          const cBig = build({}, { fakeAgent: big, engine: "local" }).ctx;
+          await waitConnected(cBig);
+          const out = String(await call(cBig, "ViewportScreenshotRoblox", {}, 40000));
+          ok("a picture too big for the text hand-over is reported, not silently dropped",
+             /was NOT attached/i.test(out) && /carry about/i.test(out), out.slice(0, 460));
+        }
       }
       {
         // A capture tool that never answers must not become the loop the user kept

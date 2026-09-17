@@ -125,6 +125,7 @@ with image support; the other two work on the current exe with no rebuild. Which
 the answer says so.
 
 **The connected `studio_id` is looked up, never invented.** Studio's `screen_capture` declares
+
 `capture_id` *and* `studio_id` required, and it refuses a made-up id — "The requested `studio_id` is
 not connected … Call `list_roblox_studios` for the current …". So OR asks `list_roblox_studios` for
 the connected instance and sends *that* id: looked up before the first call, cached for two minutes,
@@ -132,6 +133,22 @@ refreshed once when the server says the id it was given has gone stale. A demand
 the error text (an agent that forwards no schemas) is read from the error itself and repaired the same
 way — and any capture tool that wants a studio id gets it, not just the screenshot commands. One
 repair attempt, never a loop.
+
+**The script-free carrier (the method ZeroScript uses).** `or_mcp_shot.py` ships with OR and is
+written into the workspace on demand. It is a plain Python program — **no PowerShell, no `.ps1`, no C#
+compile**, so a scanner that blocks script files has nothing to quarantine. It launches Roblox's own
+signed `StudioMCP.exe` (newest under `%LOCALAPPDATA%\Roblox\Versions\*`), speaks JSON-RPC to it over
+stdio, asks `list_roblox_studios` for the **connected** `studio_id`, calls Studio's `screen_capture`
+with it, and writes the PNG plus a `.b64` twin. OR then reads that text back and verifies the byte
+count and SHA-256 before attaching — which is why the picture arrives even on the older
+`or-agent.exe` that drops MCP image blocks: **the bytes never travel through the agent's socket.**
+
+It sits in the chain as *Studio's MCP → Blender → this client → the PowerShell window route → the
+whole desktop*, so a blocked `.ps1` is never the last word. On a PC without Python, OR says so and
+names python.org instead of failing silently. An MCP window where Studio has no place loaded, a
+capture tool that never answers, and a stale `studio_id` all end in one machine-readable line with
+the failing stage named — the helper never waits forever (a watchdog owns its deadline).
+
 
 **Antivirus: the Roblox picture needs no script.** `ViewportScreenshotRoblox` rides the Studio MCP
 only — no `studio_shot.ps1`, no PowerShell, nothing on disk for a script scanner to quarantine. When

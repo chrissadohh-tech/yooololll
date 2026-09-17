@@ -600,6 +600,8 @@ IMPORTANT: Your very first action is to write \`list_commands\` to get the full 
       "Takes a picture INSIDE Roblox Studio and ATTACHES the image to your next message so you can actually see it. " +
       "Needs Roblox Studio to be RUNNING (the picture is taken in Studio itself, and the Studio-window route is its rescue) - " +
        "Under the hood it asks Studio's own MCP with the CONNECTED studio_id (OR looks that id up itself with list_roblox_studios) - " +
+       "If the PowerShell route is blocked (antivirus) or the agent build is old, OR still delivers it through its OWN MCP client: a small Python program " +
+       "(no PowerShell, no .ps1) that talks to Roblox's StudioMCP.exe directly and hands the picture over as base64 text. " +
        "no PowerShell and no script file, so an antivirus that blocks scripts has nothing to stop. " +
       "no window, no focus, and it does not matter which window is in front. It NEVER photographs anything else: " +
       "if Studio is not there it says so, and you report that instead of pretending you have a picture. " +

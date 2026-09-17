@@ -1042,6 +1042,42 @@ const WIKI_JSON = JSON.stringify({ query: { search: [{ title: "Roblox" }, { titl
     ok("...and the Roblox command's own note says how the id is obtained",
        /looks that id up itself with list_roblox_studios/.test(cfgSrc) && /no PowerShell and no script file/.test(cfgSrc));
 
+    // ── OR's own MCP client: the route that survives an antivirus ─────────────
+    // ZeroScript's bridge works on a PC that blocks .ps1 files because it is a plain
+    // Python program talking to Roblox's signed StudioMCP.exe. OR ships the same thing
+    // as or_mcp_shot.py and runs it through the agent - so no rebuild and no PowerShell.
+    const helperSrc = fs.readFileSync(path.join(root, "or_mcp_shot.py"), "utf8");
+    ok("the script-free carrier ships with OR",
+       /StudioMCP\.exe/.test(helperSrc) && /list_roblox_studios/.test(helperSrc) && /screen_capture/.test(helperSrc));
+    ok("...and it is NOT a PowerShell script (that is the entire point)",
+       !/-ExecutionPolicy/.test(helperSrc) && !/Add-Type/.test(helperSrc) &&
+       !/subprocess\.run\(\["powershell/i.test(helperSrc), "the carrier must not invoke PowerShell");
+    ok("...and it speaks JSON-RPC over stdio, like the bridge it is modelled on",
+       /jsonrpc/.test(helperSrc) && /tools\/list/.test(helperSrc) && /tools\/call/.test(helperSrc) && /"initialize"/.test(helperSrc));
+    ok("...and its answer uses the SAME machine-readable line the window route uses",
+       /OR_STUDIO_SHOT/.test(helperSrc) && /base64_file/.test(helperSrc) && /sha256/.test(helperSrc));
+    ok("...and it names the failure stage instead of hanging",
+       /"stage"/.test(helperSrc) && /watchdog/.test(helperSrc) && /STALE_ID_RE/.test(helperSrc));
+    ok("the worker writes the carrier into the workspace and runs it",
+       /extText\("or_mcp_shot\.py"\)/.test(bgSrc) && /or_mcp_shot\.py --out/.test(bgSrc) &&
+       /case "studio_mcp_shot"/.test(bgSrc) && /async function studioMcpShot/.test(bgSrc));
+    ok("...and a PC without Python is told exactly that, with the fix",
+       /need_python: true/.test(bgSrc) && /no Python on PATH/.test(bgSrc) && /python\.org/.test(bgSrc));
+    ok("...and a picture too big for the text hand-over is reported, never silently dropped",
+       /too_large: true/.test(bgSrc) && /was NOT attached/.test(bgSrc));
+    {
+      // The chain, in order: Studio's MCP -> Blender -> OR's own MCP client -> the
+      // PowerShell window route -> the whole desktop last. A blocked .ps1 can no longer
+      // be the only thing between the user and a Studio picture.
+      const iBlend = mainSrc.indexOf('tryMcp("get_viewport_screenshot", "blender")');
+      const iOwn = mainSrc.indexOf('type: "studio_mcp_shot"');
+      const iWin = mainSrc.indexOf('type: "studio_window_shot", focus: false');
+      const iDesk = mainSrc.indexOf('if (!only && target === "auto" && !shots.length) await screenGrab("whole screen")');
+      ok("the script-free route sits between Blender and the PowerShell window route",
+         iBlend > 0 && iOwn > iBlend && iWin > iOwn, [iBlend, iOwn, iWin].join(","));
+      ok("...and the whole-desktop grab is still the LAST resort", iDesk > iOwn && iDesk > iWin, [iOwn, iWin, iDesk].join(","));
+    }
+
     // ── the antivirus-free hand-over ───────────────────────────────────────────
     // The user's scanner blocks studio_shot.ps1 OUTRIGHT ("This script contains malicious
     // content ..."), so the script may never be the automatic rescue: it is detected once,

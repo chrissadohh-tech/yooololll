@@ -1819,6 +1819,82 @@ function ps1BlockedReply() {
       ": Windows Security > Virus & threat protection > Exclusions > Add a folder. OR writes studio_shot.ps1 again on every capture, so those routes work the moment the folder is allowed - nothing to reinstall and nothing to restart.",
   };
 }
+// ── OR's OWN MCP client: the route that works when PowerShell does not ───────
+// ZeroScript's bridge works on a PC whose antivirus blocks studio_shot.ps1 for one
+// reason: it is not a script. It is a plain Python program that launches Roblox's own
+// signed StudioMCP.exe and speaks JSON-RPC to it, calls the capture tool, and writes the
+// picture to disk. This is that method, run through the agent the user already has - the
+// helper is written into the workspace and started with `run_command`, so an older
+// or-agent.exe that drops MCP image blocks still gets the shot (the bytes never travel
+// through its socket; they are read back as base64 TEXT, the tunnel that already works).
+let mcpShotScriptReady = false;
+let pythonCmd = "";
+async function ensureMcpShotScript() {
+  if (mcpShotScriptReady) return;
+  const py = await extText("or_mcp_shot.py");
+  await localWrite("or_mcp_shot.py", py);
+  mcpShotScriptReady = true;
+}
+// Which Python? Windows installs vary: `python`, the `py -3` launcher, or `python3`.
+// Each candidate is tried ONCE and the answer is remembered, so the probe costs one
+// round trip per browser session, not one per screenshot.
+async function pythonFor() {
+  if (pythonCmd) return pythonCmd;
+  const candidates = ["python", "py -3", "python3"];
+  for (const c of candidates) {
+    try {
+      const r = await localRun(`${c} -c "print('OR_PY_OK')"`, 20);
+      if (/OR_PY_OK/.test(String((r && (r.text || r.error)) || ""))) { pythonCmd = c; return c; }
+    } catch {}
+  }
+  return "";
+}
+// Returns { ok, text, images, meta } - exactly the shape the window route returns, so the
+// caller does not care which route produced the picture.
+async function studioMcpShot({ out = "or_mcp_shot.png", maxWidth } = {}) {
+  try {
+    await ensureMcpShotScript();
+  } catch (e) {
+    return { ok: false, error: "could not write or_mcp_shot.py into the agent workspace: " + String((e && e.message) || e) + " (is or-agent.exe running?)" };
+  }
+  const py = await pythonFor();
+  if (!py) {
+    return { ok: false, need_python: true,
+      error: "this PC has no Python on PATH, so OR's own MCP client cannot run (it is the route that needs no PowerShell).",
+      hint: "install Python 3 from python.org (tick \"Add python.exe to PATH\") - or allow studio_shot.ps1 in Windows Security instead." };
+  }
+  const r = await localRun(`${py} or_mcp_shot.py --out ${out}`, 45);
+  const raw = String((r && (r.text || r.error)) || "");
+  const meta = parseShotMeta(raw);
+  if (!meta) {
+    return { ok: false, text: raw.slice(-400), stage: "no-answer",
+      error: (raw.trim().split(/\r?\n/).filter(Boolean).slice(-1)[0] || "no answer from the helper (is or-agent.exe running?)").slice(0, 300),
+      hint: "the helper prints one OR_STUDIO_SHOT line; none arrived, so it did not run - check that Python runs (`python -V`) and that or-agent.exe is started." };
+  }
+  if (!meta.ok) {
+    return { ok: false, stage: meta.stage || "", error: String(meta.error || "capture failed").slice(0, 320),
+             hint: meta.hint ? String(meta.hint).slice(0, 320) : "", text: raw.slice(-300) };
+  }
+  if (meta.too_large) {
+    return { ok: false, too_large: true, bytes: meta.bytes, file: meta.file,
+      error: "Studio returned a " + Math.round((Number(meta.bytes) || 0) / 1024) + " KB picture. The text hand-over can carry about 1.3 MB "
+        + "(a bigger one would need hundreds of text pages), so it was NOT attached.",
+      hint: "the file is on disk at " + meta.file + "; rebuilding the agent gives the fast image path, and the window capture asks for a smaller frame." };
+  }
+  try {
+    const t = await tunnelReadImage(meta.file || out, meta);
+    return { ok: true, meta,
+      images: [{ mimeType: t.img.mimeType, data: t.img.data }],
+      text: "captured " + (meta.bytes ? Math.round(meta.bytes / 1024) + " KB" : "the Studio viewport") +
+        " with Studio's own " + (meta.tool || "screen_capture") + " over its MCP" +
+        (meta.studio_id ? " (studio_id " + String(meta.studio_id).slice(0, 24) + ")" : ""),
+      image_source: "Studio's MCP capture, handed over as base64 TEXT in " + t.chunks + " chunk(s)" +
+        (meta.takeover ? " [" + String(meta.takeover).slice(0, 160) + "]" : "") };
+  } catch (e) {
+    return { ok: false, stage: "readback", error: "the picture was written (" + (meta.file || out) + ") but could not be read back: " + String((e && e.message) || e).slice(0, 240) };
+  }
+}
+
 async function studioWindowShot({ focus = false, focusOnly = false, maxWidth = 1600, out = "or_studio_window.png", wholeScreen = false, force = false } = {}) {
   const ps1 = (cmd) => `powershell -NoProfile -ExecutionPolicy Bypass -File studio_shot.ps1 ${cmd}`;
   // A blocked script is not attempted again in a loop: the answer is instant and says
@@ -2276,6 +2352,11 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         });
         if (r && r.ok) ps1Block = { why: "", at: 0 };   // the script runs again
         sendResponse(r);
+        break;
+      }
+      case "studio_mcp_shot": {
+        try { sendResponse(await studioMcpShot({ maxWidth: msg.max_width })); }
+        catch (e) { sendResponse({ ok: false, error: String((e && e.message) || e) }); }
         break;
       }
       // Version/health of the agent: the extension uses this to explain WHY a

@@ -2207,6 +2207,29 @@ notes.push(label + ": " + String((r && r.error) || "capture failed").slice(0, 32
       if (A.bridge && A.bridge.blender) await tryMcp("get_viewport_screenshot", "blender");
       else notes.push("blender: not connected - skipped (Connect Blender in the OR panel first)");
     }
+    // OR's OWN MCP CLIENT - ZeroScript's method, and the one that survives an antivirus
+    // that blocks .ps1 files. A small Python program written into the workspace launches
+    // Roblox's signed StudioMCP.exe, speaks JSON-RPC to it, looks the CONNECTED studio id
+    // up and calls Studio's own capture tool; the picture is written to disk and read back
+    // as text, so nothing has to travel through the agent's image handling (no rebuild).
+    // It sits AFTER Blender and BEFORE the PowerShell window route: a broken .ps1 can no
+    // longer be the only thing standing between the user and a Studio picture.
+    if (wantStudio && !shots.length) {
+      try {
+        const r = await bg({ type: "studio_mcp_shot", max_width: o.maxWidth });
+        if (r && r.ok && r.images && r.images.length) {
+          shots.push(...r.images);
+          notes.push("studio (OR's own MCP client): " + String(r.text || "captured").slice(0, 240) +
+            (r.image_source ? " - " + String(r.image_source).slice(0, 160) : ""));
+        } else {
+          notes.push("studio (OR's own MCP client): " + String((r && r.error) || "capture failed").slice(0, 300) +
+            (r && r.hint ? " [" + String(r.hint).slice(0, 360) + "]" : ""));
+        }
+      } catch (e) {
+        notes.push("studio (OR's own MCP client): " + String((e && e.message) || e).slice(0, 200));
+      }
+    }
+
     // OS-side fallback: photograph the Studio WINDOW itself (agent + PowerShell).
     // Works while Studio is behind the browser, so it is a better fallback than a
     // tab capture - and the only path that works when the picture must be of
