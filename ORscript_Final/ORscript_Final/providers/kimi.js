@@ -425,7 +425,16 @@ const RSProvider = (() => {
       // submitAndGetBase RETRIES this function; only attach if nothing is pending
       // yet, else each retry uploads ANOTHER duplicate copy.
       if (images && images.length && !hasPendingAttachment()) {
-        try { await attachImages(images); } catch {}
+        // The picture IS the point of this message. Sending the text alone would tell the
+        // model to look at an image it cannot see, so stop rather than pretend - the caller's
+        // "message was not sent" path reports it, and the user can retry or paste manually.
+        let orAttached = false;
+        for (let orTry = 0; orTry < 2 && !orAttached; orTry++) {
+          try { orAttached = (await attachImages(images)) !== false; } catch { orAttached = false; }
+        }
+        if (!orAttached) {
+          throw new Error("OR_IMAGE_ATTACH_FAILED: the screenshot did not reach this chat's composer, so nothing was sent (the picture IS the message). Retry, or use attach_feedback {action:\"copy\"} and paste it with Ctrl+V.");
+        }
       }
       // Wait for the send control to enable (proof Lexical registered the text).
       await waitFor(() => !!sendButton(), 1500);

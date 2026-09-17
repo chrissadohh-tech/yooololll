@@ -104,7 +104,7 @@ ok("new studio daily commands", dailySrc.includes("script_set_source") && dailyS
 ok("new blender commands", opsPy.includes("def cmd_scale") && opsPy.includes("def cmd_bevel") && opsPy.includes("def cmd_keyframe_insert") && opsPy.includes("def cmd_track_to") && bg.includes("blender_subdivision") && bg.includes("blender_add_armature"));
 const fbSrc = fs.readFileSync(path.join(root, "providers/freebuff.js"), "utf8");
 ok("freebuff slow-chat not treated as hung", fbSrc.includes("PRESTART_MS: 180000") && fbSrc.includes("GEN_IDLE_MS: 14000") && fbSrc.includes("GEN_STOP_GRACE_MS: 12000") && fbSrc.includes("function busyChrome") && fbSrc.includes("return true;") && mainSrc.includes("T.PRESTART_MS") && mainSrc.includes("T.GEN_STOP_GRACE_MS") && !fbSrc.includes("unstableWarning"));
-ok("or_screenshot send-to-self", mainSrc.includes('name === "or_screenshot"') && mainSrc.includes('type: "capture_tab"') && mainSrc.includes('screenshot: "or_screenshot"') && mainSrc.includes("A.pendingImages = shots") && bg.includes('case "capture_tab"') && cfgSrc.includes("or_screenshot") && manJs.includes("1.18.0"));
+ok("screenshot commands send the picture to the model itself", mainSrc.includes("function viewportShotKind") && mainSrc.includes('type: "capture_tab"') && !mainSrc.includes('take_screenshot: "ViewportScreenshot') && mainSrc.includes("A.pendingImages = shots") && bg.includes('case "capture_tab"') && cfgSrc.includes("ViewportScreenshotRoblox") && manJs.includes("1.18.0"));
 ok("condo lock is condo-topic only", mainSrc.includes("function isCondoTopic") && mainSrc.includes("function punishCondo") && mainSrc.includes("CONDO LOCK") && mainSrc.includes("enforceCondo") && mainSrc.includes("rsCondoLock") && mainSrc.includes("condo-topic ONLY") && cfgSrc.includes("never build Roblox condo games"));
 const plusSrc = fs.readFileSync(path.join(root, "core/studio_plus.js"), "utf8");
 const claudeSrc = fs.readFileSync(path.join(root, "providers/claude.js"), "utf8");
@@ -117,7 +117,10 @@ ok("developer product create", mainSrc.includes("function createDeveloperProduct
 ok("v18 version", manifest.version === "1.18.0");
 ok("devproduct reaches game", mainSrc.includes("function studioUniverseIds") && bg.includes("function robloxResolveUniverse") && bg.includes("develop.roblox.com/v1/user/universes"));
 ok("claude sonnet5 no-refuse", claudeSrc.includes("sonnet5") && claudeSrc.includes("authorized local automation") && mainSrc.includes("function isCapabilityRefuse") && cfgSrc.includes("capabilityRefuse"));
-ok("bridge reconnect retry", bg.includes("waitForConnection(20000)") && bg.includes('r.kind === "disconnected"'));
+ok("bridge reconnect retry", bg.includes("|| 20000)") && bg.includes('r.kind === "disconnected"'));
+// A screenshot must not sit through the full 20s bridge-connect wait when other routes
+// can be tried: the caller can pass a short budget, and captureShots does.
+ok("...and a screenshot asks for a short connect budget", bg.includes("connectWait") && mainSrc.includes("connectWait: 3000"));
 ok("request understanding in prompts", cfgSrc.includes("UNDERSTAND THE REQUEST") && cfgSrc.includes("PERFECT CREATION") && cfgSrc.includes("implied systems") && cfgSrc.includes("function wrapTaskPrompt") && cfgSrc.includes("creationFocus"));
 ok("task wrap + create rider", mainSrc.includes("RS.wrapTaskPrompt") && mainSrc.includes("RS.FEEDBACK.creationFocus") && mainSrc.includes("UNDERSTAND THE REQUEST: WHAT TO BUILD"));
 

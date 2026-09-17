@@ -570,7 +570,16 @@ const RSProvider = (() => {
       // typeAndSend for why (attaching first and then retyping the text can sever
       // the site's binding between the pending upload and the message sent).
       if (images && images.length) {
-        try { await attachImages(images); } catch {}
+        // The picture IS the point of this message. Sending the text alone would tell the
+        // model to look at an image it cannot see, so stop rather than pretend - the caller's
+        // "message was not sent" path reports it, and the user can retry or paste manually.
+        let orAttached = false;
+        for (let orTry = 0; orTry < 2 && !orAttached; orTry++) {
+          try { orAttached = (await attachImages(images)) !== false; } catch { orAttached = false; }
+        }
+        if (!orAttached) {
+          throw new Error("OR_IMAGE_ATTACH_FAILED: the screenshot did not reach this chat's composer, so nothing was sent (the picture IS the message). Retry, or use attach_feedback {action:\"copy\"} and paste it with Ctrl+V.");
+        }
         // ChatGPT disables the send button while an upload is still in flight, so
         // poll the click instead of gating on a specific "upload done" node.
         const t0 = Date.now();
@@ -881,7 +890,9 @@ const RSProvider = (() => {
     // Exported for test-chatgpt.js (the Node smoke test drives it against a stub
     // DOM). The core reads replies through itemText/classifyText, not this.
     textWithout,
-    // Vision OFF, like DeepSeek's text-only Expert tab. ChatGPT's free tier caps
+    // Vision OFF, deliberately (NOT a leftover DeepSeek-style tab rule: DeepSeek
+    // unified its models in 2026-09 and its getter is capability-based now).
+    // ChatGPT's free tier caps
     // image/file input separately from messages ("les fichiers, les images et
     // l'analyse sont indisponibles jusqu'à la réinitialisation de votre quota"),
     // so screen_capture would work sometimes and fail the rest of the time - the

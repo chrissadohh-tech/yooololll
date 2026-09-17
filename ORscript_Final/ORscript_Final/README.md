@@ -55,11 +55,124 @@ node test-chatgpt.js
 node test-animlib.js
 node test-v111.js
 node test-v112.js
+node test-v115.js
+node test-shots.js
 node --check core/main.js && node --check core/config.js && node --check background.js
 cd agent && cargo test
 ```
 
-`test-bridges.js` is a live smoke test: start `or-agent` first. It checks HTTP `:3000` and WS `17613` / `17615` (no Unreal port).
+`test-bridges.js` is a live smoke test: start `or-agent` first.
+
+`test-shots.js` needs no browser and no Studio: it loads the real `core/main.js` with the real
+`background.js` behind a fake DOM and drives the three screenshot commands
+(`ViewportScreenshotRoblox`, `ViewportScreenshotBlender`, `ViewportScreenshot`), the internal
+fallback routes (`_route:"window"|"tab"|"auto"`), `attach_feedback` with its aliases, and
+`shot_test`, through the `window.__rsRunTool` seam. A scope bug like the one that
+broke every screenshot with `Cannot access 'RECENT_IMAGES_MAX' before initialization` shows up here
+in under a second, where `node --check` cannot see it. It checks HTTP `:3000` and WS `17613` / `17615` (no Unreal port).
+
+## Screenshots (and what needs what)
+
+Check the machinery before blaming a command: **`shot_test {}`** writes a small test picture
+through the capture script, reads it back exactly the way a real screenshot is handed over, and
+verifies the checksum. It needs no Studio window. `agent_info {}` reports which `or-agent.exe`
+is running and which hand-over is in use.
+
+**The three screenshots — three separate commands, no aliases:**
+
+```
+ViewportScreenshotRoblox {}    a picture taken INSIDE Roblox Studio  - Studio must be RUNNING
+ViewportScreenshotBlender {}   a picture taken INSIDE Blender        - Blender must be running and connected
+ViewportScreenshot {}          the OVERALL one: Studio if it is running,
+                               else Blender if it is connected, else the WHOLE screen (every monitor)
+```
+
+Each command photographs **one thing and nothing else**. That is the point of separate commands: a
+command that names an app never quietly hands back a picture of something else — if its app is not
+there, it says so and takes no picture. Spelling is forgiving (case and underscores are ignored, so
+`viewport_screenshot_roblox` is the same command) but no command has a second name.
+
+That is the entire screenshot surface. There is no `or_screenshot`, `screenshot`, `take_screenshot`,
+`send_screenshot`, `capture_screenshot`, `screen_capture`, `window`, `tab` or `auto` command, and none
+of the three has an alias. `shot_test {}` is a diagnostic (it takes no picture of Studio);
+`attach_feedback` re-sends or copies a picture that already exists.
+
+Removed names are not just undocumented, they are **refused by name**: calling `or_screenshot`,
+`screenshot`, `take_screenshot`, `send_screenshot` or the old `or_focus_studio` family returns an
+instant error naming the three real commands. It never falls through to a capture, and it never
+hangs waiting for an answer that was never coming.
+
+| command | what it does | if it cannot |
+| --- | --- | --- |
+| `ViewportScreenshotRoblox` | **Studio takes its own picture** through its MCP (`screen_capture`) — no window, no focus, no PowerShell. The browser being in front or behind makes no difference; Blender parity is the goal | first falls back to photographing the Studio **window** through the agent (still Studio, also no window in front), then reports that Studio must be running |
+| `ViewportScreenshotBlender` | the Blender viewport, captured inside Blender by the addon | reports that Blender must be running and connected (Menu → Connect Blender) |
+| `ViewportScreenshot` | the best available: Studio, else Blender, else the whole desktop (every monitor) grabbed from the screen itself | reports exactly which of the three could not answer, and why |
+
+**Which window is in front never matters.** None of them raises or focuses a window, and
+`ViewportScreenshot {}` photographs the desktop exactly as it looks, Studio open or not.
+
+**Fallbacks are automatic and internal.** The `window` / `tab` routes still exist behind these
+commands (the `tab` route photographs whatever is in front, and `chrome://` pages, the New Tab page
+and PDFs can never be captured), and so does the replacement inside Blender. They are reachable for
+tests as `_route:"window"|"tab"|"auto"` — they are not commands, and the model is told not to call
+them.
+
+**How the picture gets here.** Studio's MCP may hand its capture over in any of three shapes and OR
+accepts all of them: an MCP **image block**, a **file path** (the server saved the PNG — OR reads that
+file back as base64 text), or **base64 text** in the answer. If the tool's own schema offers a
+`save_path`-style argument, OR asks for the file once and reads that. Image blocks need an agent build
+with image support; the other two work on the current exe with no rebuild. Whichever way it arrived,
+the answer says so.
+
+**The connected `studio_id` is looked up, never invented.** Studio's `screen_capture` declares
+
+`capture_id` *and* `studio_id` required, and it refuses a made-up id — "The requested `studio_id` is
+not connected … Call `list_roblox_studios` for the current …". So OR asks `list_roblox_studios` for
+the connected instance and sends *that* id: looked up before the first call, cached for two minutes,
+refreshed once when the server says the id it was given has gone stale. A demand that only appears in
+the error text (an agent that forwards no schemas) is read from the error itself and repaired the same
+way — and any capture tool that wants a studio id gets it, not just the screenshot commands. One
+repair attempt, never a loop.
+
+**The script-free carrier (the method ZeroScript uses).** `or_mcp_shot.py` ships with OR and is
+written into the workspace on demand. It is a plain Python program — **no PowerShell, no `.ps1`, no C#
+compile**, so a scanner that blocks script files has nothing to quarantine. It launches Roblox's own
+signed `StudioMCP.exe` (newest under `%LOCALAPPDATA%\Roblox\Versions\*`), speaks JSON-RPC to it over
+stdio, asks `list_roblox_studios` for the **connected** `studio_id`, calls Studio's `screen_capture`
+with it, and writes the PNG plus a `.b64` twin. OR then reads that text back and verifies the byte
+count and SHA-256 before attaching — which is why the picture arrives even on the older
+`or-agent.exe` that drops MCP image blocks: **the bytes never travel through the agent's socket.**
+
+It sits in the chain as *Studio's MCP → Blender → this client → the PowerShell window route → the
+whole desktop*, so a blocked `.ps1` is never the last word. On a PC without Python, OR says so and
+names python.org instead of failing silently. An MCP window where Studio has no place loaded, a
+capture tool that never answers, and a stale `studio_id` all end in one machine-readable line with
+the failing stage named — the helper never waits forever (a watchdog owns its deadline).
+
+
+**Antivirus: the Roblox picture needs no script.** `ViewportScreenshotRoblox` rides the Studio MCP
+only — no `studio_shot.ps1`, no PowerShell, nothing on disk for a script scanner to quarantine. When
+security software *does* block the script ("This script contains malicious content and has been
+blocked by your antivirus software."), OR says so in one line and **stops starting it**: every later
+capture reports the block instantly instead of poking the scanner again. The one route that still
+needs PowerShell is the whole-desktop grab — the last resort of `ViewportScreenshot {}` — and its
+failure message says exactly that.
+
+**The base64 text tunnel.** Handing a file to the browser normally needs the agent's
+`read_file_base64` (1.18.0+). An older `or-agent.exe` — including the prebuilt one in this repo,
+which lists 18 tools and everything but that — still has `read_file` and `run_command`, so OR turns
+the capture file into text with **`certutil -encode`** (a signed Windows program — an executable, not
+a script, so no script scanner has a say; `base64` on Linux/macOS) and reads
+that text back in chunks of numbered lines. PowerShell is the second choice now, used only when
+certutil cannot answer — and never at all once the scanner has blocked the script. OR then checks the
+byte count and SHA-256 before attaching anything:
+numbered lines, then checks the byte count and SHA-256 before attaching anything. A picture that
+was cut short or damaged is refused with the reason, never attached silently. Rebuilding the agent
+(`cd agent && cargo build --release`) is therefore an optimisation, not a requirement.
+A rebuilt `or-agent.exe` has one extra tool (`read_file_base64`) and forwards the image blocks an
+MCP returns — it does **not** take screenshots by itself. The Studio-window rescue and the
+whole-desktop grab still run `studio_shot.ps1`, so a scanner that blocks that script blocks those
+two routes no matter which agent build is running.
 
 ## Privacy
 

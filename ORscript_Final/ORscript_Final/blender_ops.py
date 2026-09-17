@@ -889,6 +889,749 @@ def cmd_set_material():
     return emit({"ok": True, "objects": assigned, "material": mat.name, "color": color})
 
 
+# ── materials ───────────────────────────────────────────────────────────────
+# Node-based material toolkit (create / preset / assign / set / inspect / list /
+# remove / procedural texture / image maps / PBR maps).
+#
+# VERSION SAFETY: the Principled BSDF input NAMES were renamed in Blender 4.0
+# ("Specular" -> "Specular IOR Level", "Transmission" -> "Transmission Weight",
+# "Emission" -> "Emission Color", "Clearcoat" -> "Coat Weight", "Sheen" ->
+# "Sheen Weight", "Subsurface" -> "Subsurface Weight"), and 4.1 removed the
+# Musgrave texture while 4.2 removed blend_method/shadow_method. Every write
+# below goes through a helper that tries the modern name, then the legacy one,
+# and reports what it actually set - so the same call works on 3.x, 4.0-4.1 and
+# 4.2+, and an unsupported property is a no-op instead of an exception.
+
+_BSDF_NAMES = {
+    "base_color": ("Base Color",),
+    "metallic": ("Metallic",),
+    "roughness": ("Roughness",),
+    "specular": ("Specular IOR Level", "Specular"),
+    "specular_tint": ("Specular Tint",),
+    "ior": ("IOR",),
+    "transmission": ("Transmission Weight", "Transmission"),
+    "alpha": ("Alpha",),
+    "emission": ("Emission Color", "Emission"),
+    "emission_strength": ("Emission Strength",),
+    "coat": ("Coat Weight", "Clearcoat"),
+    "coat_roughness": ("Coat Roughness", "Clearcoat Roughness"),
+    "sheen": ("Sheen Weight", "Sheen"),
+    "anisotropic": ("Anisotropic",),
+    "subsurface": ("Subsurface Weight", "Subsurface"),
+}
+
+MATERIAL_PRESETS = {
+    "metal": {"color": [0.55, 0.56, 0.58], "metallic": 1.0, "roughness": 0.28},
+    "steel": {"color": [0.42, 0.44, 0.47], "metallic": 1.0, "roughness": 0.35},
+    "iron": {"color": [0.32, 0.31, 0.3], "metallic": 1.0, "roughness": 0.5},
+    "chrome": {"color": [0.9, 0.92, 0.95], "metallic": 1.0, "roughness": 0.05},
+    "gold": {"color": [1.0, 0.77, 0.34], "metallic": 1.0, "roughness": 0.2},
+    "silver": {"color": [0.95, 0.95, 0.96], "metallic": 1.0, "roughness": 0.15},
+    "copper": {"color": [0.95, 0.64, 0.54], "metallic": 1.0, "roughness": 0.25},
+    "bronze": {"color": [0.8, 0.55, 0.32], "metallic": 1.0, "roughness": 0.35},
+    "brass": {"color": [0.88, 0.72, 0.36], "metallic": 1.0, "roughness": 0.3},
+    "plastic": {"color": [0.8, 0.8, 0.82], "metallic": 0.0, "roughness": 0.4},
+    "rubber": {"color": [0.05, 0.05, 0.06], "metallic": 0.0, "roughness": 0.9},
+    "ceramic": {"color": [0.92, 0.92, 0.9], "metallic": 0.0, "roughness": 0.15, "coat": 0.4},
+    "concrete": {"color": [0.5, 0.5, 0.48], "roughness": 0.95, "noise": {"type": "noise", "scale": 18, "affect": "bump", "strength": 0.25}},
+    "asphalt": {"color": [0.12, 0.12, 0.13], "roughness": 0.85, "noise": {"type": "noise", "scale": 30, "affect": "bump", "strength": 0.2}},
+    "wood": {"color": [0.45, 0.28, 0.14], "roughness": 0.7,
+             "noise": {"type": "wave", "scale": 6, "affect": "bump", "strength": 0.35, "distortion": 8}},
+    "marble": {"color": [0.9, 0.9, 0.88], "roughness": 0.25,
+               "noise": {"type": "voronoi", "scale": 8, "affect": "bump", "strength": 0.15}},
+    "fabric": {"color": [0.35, 0.33, 0.4], "roughness": 0.95, "sheen": 0.5},
+    "leather": {"color": [0.22, 0.16, 0.12], "roughness": 0.75,
+                "noise": {"type": "noise", "scale": 40, "affect": "bump", "strength": 0.3}},
+    "glass": {"color": [0.95, 0.98, 1.0], "transmission": 1.0, "roughness": 0.02, "ior": 1.45, "alpha": 0.2, "blend": "BLEND"},
+    "frosted_glass": {"color": [0.94, 0.97, 1.0], "transmission": 1.0, "roughness": 0.35, "ior": 1.45, "alpha": 0.35, "blend": "BLEND"},
+    "water": {"color": [0.1, 0.35, 0.6], "transmission": 0.9, "roughness": 0.05, "ior": 1.33, "alpha": 0.4, "blend": "BLEND"},
+    "ice": {"color": [0.75, 0.9, 1.0], "transmission": 0.85, "roughness": 0.12, "ior": 1.31, "alpha": 0.45,
+            "blend": "BLEND", "noise": {"type": "voronoi", "scale": 12, "affect": "bump", "strength": 0.2}},
+    "emissive": {"color": [1.0, 0.9, 0.6], "emission": [1.0, 0.9, 0.6], "emission_strength": 5.0},
+    "neon": {"color": [0.2, 1.0, 0.9], "emission": [0.2, 1.0, 0.9], "emission_strength": 8.0},
+    "lava": {"color": [1.0, 0.25, 0.05], "emission": [1.0, 0.18, 0.02], "emission_strength": 10.0, "roughness": 0.6,
+             "noise": {"type": "voronoi", "scale": 10, "affect": "emission", "strength": 3.0}},
+    "hologram": {"color": [0.3, 0.9, 1.0], "emission": [0.3, 0.9, 1.0], "emission_strength": 3.0,
+                 "alpha": 0.35, "transmission": 0.5, "roughness": 0.1, "blend": "BLEND"},
+    "ghost": {"color": [0.85, 0.9, 1.0], "alpha": 0.35, "roughness": 0.5, "blend": "BLEND"},
+    "toon": {"color": [0.9, 0.5, 0.2], "roughness": 1.0, "specular": 0.0},
+    "roblox_plastic": {"color": [0.64, 0.64, 0.64], "metallic": 0.0, "roughness": 0.45},
+    "roblox_metal": {"color": [0.55, 0.55, 0.58], "metallic": 0.85, "roughness": 0.3},
+    "roblox_glass": {"color": [0.9, 0.95, 1.0], "alpha": 0.4, "roughness": 0.05, "blend": "BLEND", "transmission": 0.7},
+}
+
+_OR_PREFIX = "OR_"
+
+
+def _color(v, default=(0.8, 0.8, 0.8, 1.0)):
+    """Accept [r,g,b(,a)] in 0-1, [r,g,b] in 0-255, or '#rrggbb'."""
+    if v is None:
+        return list(default)
+    if isinstance(v, str):
+        s = v.strip().lstrip("#")
+        if len(s) == 6:
+            try:
+                return [int(s[0:2], 16) / 255.0, int(s[2:4], 16) / 255.0, int(s[4:6], 16) / 255.0, 1.0]
+            except Exception:
+                return list(default)
+        return list(default)
+    if isinstance(v, (list, tuple)) and len(v) >= 3:
+        c = [float(x) for x in v[:3]]
+        if max(c) > 1.0:  # 0-255 given
+            c = [x / 255.0 for x in c]
+        a = float(v[3]) if len(v) > 3 else 1.0
+        return [c[0], c[1], c[2], a]
+    return list(default)
+
+
+def _principled(mat):
+    """The material's Principled BSDF (created and wired up if missing)."""
+    tree = mat.node_tree
+    for n in tree.nodes:
+        if n.type == "BSDF_PRINCIPLED":
+            return n
+    out = None
+    for n in tree.nodes:
+        if n.type == "OUTPUT_MATERIAL":
+            out = n
+            break
+    node = tree.nodes.new("ShaderNodeBsdfPrincipled")
+    node.location = (0, 0)
+    if out is None:
+        out = tree.nodes.new("ShaderNodeOutputMaterial")
+        out.location = (320, 0)
+    try:
+        tree.links.new(node.outputs[0], out.inputs["Surface"])
+    except Exception:
+        pass
+    return node
+
+
+def _set_in(bsdf, key, value):
+    """Write a Principled input by ROLE, tolerating the 4.0 renames."""
+    if value is None:
+        return None
+    for nm in _BSDF_NAMES.get(key, ()):
+        sock = bsdf.inputs.get(nm)
+        if sock is None:
+            continue
+        attempts = [value]
+        if isinstance(value, (list, tuple)):
+            attempts = [tuple(value), value]
+        for attempt in attempts:
+            try:
+                sock.default_value = attempt
+                return nm
+            except Exception:
+                continue
+    return None
+
+
+def _set_node_input(node, name, value):
+    if value is None:
+        return False
+    sock = node.inputs.get(name)
+    if sock is None:
+        return False
+    attempts = [value]
+    if isinstance(value, (list, tuple)):
+        attempts = [tuple(value), value]
+    for attempt in attempts:
+        try:
+            sock.default_value = attempt
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def _blend_mode(mat, mode):
+    """Transparency/blend handling across 4.2+ (surface_render_method) and <=4.1."""
+    m = str(mode or "").upper()
+    applied = {}
+    if not m:
+        return applied
+    want = {"BLEND": "BLENDED", "BLENDED": "BLENDED", "ALPHA": "BLENDED", "TRANSPARENT": "BLENDED",
+            "HASHED": "DITHERED", "DITHERED": "DITHERED", "OPAQUE": "DITHERED"}.get(m)
+    if want and hasattr(mat, "surface_render_method"):
+        try:
+            mat.surface_render_method = want
+            applied["surface_render_method"] = want
+        except Exception:
+            pass
+    if hasattr(mat, "blend_method"):
+        legacy = {"BLENDED": "BLEND", "DITHERED": "OPAQUE"}.get(want, "OPAQUE")
+        if m in ("OPAQUE", "SOLID"):
+            legacy = "OPAQUE"
+        try:
+            mat.blend_method = legacy
+            applied["blend_method"] = legacy
+        except Exception:
+            pass
+        if hasattr(mat, "shadow_method"):
+            try:
+                mat.shadow_method = "NONE" if legacy == "BLEND" else "OPAQUE"
+                applied["shadow_method"] = mat.shadow_method
+            except Exception:
+                pass
+    try:
+        if m in ("BLEND", "BLENDED", "ALPHA", "TRANSPARENT", "HASHED"):
+            mat.use_backface_culling = bool(ARGS.get("backface_culling", False))
+    except Exception:
+        pass
+    return applied
+
+
+def _purge_or_nodes(mat):
+    """Remove the nodes a previous OR texture call added (idempotent restyle)."""
+    tree = mat.node_tree
+    doomed = [n for n in tree.nodes if str(n.name).startswith(_OR_PREFIX)]
+    for n in doomed:
+        try:
+            tree.nodes.remove(n)
+        except Exception:
+            pass
+    return len(doomed)
+
+
+def _find_material():
+    name = str(ARGS.get("material") or ARGS.get("material_name") or "").strip()
+    if name:
+        return bpy.data.materials.get(name)
+    obj = bpy.data.objects.get(str(ARGS.get("name") or ARGS.get("object") or "")) or active()
+    if obj is not None and getattr(obj, "data", None) is not None and getattr(obj.data, "materials", None):
+        return obj.data.materials[0] if len(obj.data.materials) else None
+    if bpy.context.object and bpy.context.object.active_material:
+        return bpy.context.object.active_material
+    return None
+
+
+def _target_objects():
+    names = ARGS.get("objects") or ARGS.get("targets")
+    if names:
+        return [o for o in resolve_objects(as_list(names)) if o is not None]
+    one = str(ARGS.get("name") or ARGS.get("object") or "").strip()
+    if one:
+        return [o for o in [bpy.data.objects.get(one)] if o is not None]
+    return [o for o in named_or_sel() if o is not None]
+
+
+def _tex_node(mat, kind, params):
+    """Create a procedural texture node of `kind` (4.x-safe; no Musgrave)."""
+    tree = mat.node_tree
+    k = str(kind or "noise").lower()
+    if k in ("musgrave", "noise", "fbm"):
+        node = tree.nodes.new("ShaderNodeTexNoise")       # Musgrave folded into Noise in 4.1
+    elif k in ("voronoi", "cells"):
+        node = tree.nodes.new("ShaderNodeTexVoronoi")
+    elif k in ("wave", "wood", "rings"):
+        node = tree.nodes.new("ShaderNodeTexWave")
+    elif k in ("checker", "checkerboard"):
+        node = tree.nodes.new("ShaderNodeTexChecker")
+    elif k in ("brick", "bricks"):
+        node = tree.nodes.new("ShaderNodeTexBrick")
+    elif k in ("gradient", "ramp"):
+        node = tree.nodes.new("ShaderNodeTexGradient")
+    else:
+        return None
+    node.name = _OR_PREFIX + k
+    node.label = "OR " + k
+    node.location = (-620, -180)
+    for key, sock in (("scale", "Scale"), ("detail", "Detail"), ("roughness", "Roughness"),
+                      ("distortion", "Distortion"), ("randomness", "Randomness"),
+                      ("size", "Scale"), ("fac", "Scale")):
+        if ARGS.get(key) is not None:
+            _set_node_input(node, sock, float(ARGS.get(key)))
+    if k in ("wave", "wood", "rings"):
+        _set_node_input(node, "Scale", float(ARGS.get("scale") or 5))
+    if k in ("checker", "checkerboard"):
+        _set_node_input(node, "Color1", _color(ARGS.get("color_a"), (0.05, 0.05, 0.05, 1)))
+        _set_node_input(node, "Color2", _color(ARGS.get("color_b"), (0.9, 0.9, 0.9, 1)))
+    if k in ("brick", "bricks"):
+        _set_node_input(node, "Color1", _color(ARGS.get("color_a"), (0.4, 0.15, 0.12, 1)))
+        _set_node_input(node, "Color2", _color(ARGS.get("color_b"), (0.75, 0.72, 0.68, 1)))
+        _set_node_input(node, "Mortar", _color(ARGS.get("mortar"), (0.75, 0.75, 0.72, 1)))
+    return node
+
+
+def _apply_material(mat, spec, report):
+    """Write a preset/args dict onto a material and record what was applied."""
+    bsdf = _principled(mat)
+    if spec.get("color") is not None or spec.get("base_color") is not None:
+        col = _color(spec.get("color") if spec.get("color") is not None else spec.get("base_color"),
+                     _color(None))
+        used = _set_in(bsdf, "base_color", col)
+        report["color"] = col
+        report["color_input"] = used
+    for key in ("metallic", "roughness", "specular", "ior", "transmission", "alpha",
+                "coat", "coat_roughness", "sheen", "anisotropic", "subsurface", "emission_strength"):
+        if spec.get(key) is None:
+            continue
+        val = float(spec.get(key))
+        if key == "emission_strength":
+            val = max(0.0, val)
+        if key in ("metallic", "roughness", "specular", "transmission", "alpha", "coat",
+                   "coat_roughness", "sheen", "anisotropic"):
+            val = min(max(val, 0.0), 1.0) if key != "roughness" else min(max(val, 0.0), 1.0)
+        used = _set_in(bsdf, key, val)
+        report[key] = val
+        if used and used != key:
+            report.setdefault("renamed_inputs", {})[key] = used
+    if spec.get("emission") is not None or spec.get("emissive") is not None:
+        em = _color(spec.get("emission") if spec.get("emission") is not None else spec.get("emissive"),
+                    _color(None))
+        used = _set_in(bsdf, "emission", em)
+        report["emission"] = em
+        if used and used != "Emission":
+            report.setdefault("renamed_inputs", {})["emission"] = used
+    # Alpha < 1 without an explicit blend mode would render OPAQUE in EEVEE.
+    blend = spec.get("blend")
+    if blend is None and spec.get("alpha") is not None and float(spec.get("alpha")) < 1.0:
+        blend = "BLEND"
+    if blend:
+        applied = _blend_mode(mat, blend)
+        if applied:
+            report["blend"] = applied
+    noise = spec.get("noise")
+    if isinstance(noise, dict) and noise:
+        saved = dict(ARGS)
+        try:
+            ARGS.clear()
+            ARGS.update(noise)
+            ARGS["material"] = mat.name
+            removed = _purge_or_nodes(mat)
+            _wire_texture(mat, report)
+            if removed:
+                report["removed_previous_nodes"] = removed
+        finally:
+            ARGS.clear()
+            ARGS.update(saved)
+    return report
+
+
+def _wire_texture(mat, report):
+    """Shared by material_create/material_set/material_noise: build the node graph."""
+    kind = ARGS.get("type") or ARGS.get("texture") or "noise"
+    affect = str(ARGS.get("affect") or ARGS.get("target") or "bump").lower()
+    node = _tex_node(mat, kind, ARGS)
+    if node is None:
+        report["texture_error"] = "unknown texture type: " + str(kind)
+        return report
+    strength = float(ARGS.get("strength") or 0.3)
+    tree = mat.node_tree
+    bsdf = _principled(mat)
+    color_a = _color(ARGS.get("color_a"), (0.05, 0.05, 0.05, 1.0))
+    color_b = _color(ARGS.get("color_b"), (0.85, 0.85, 0.85, 1.0))
+    record = {"type": str(kind), "affect": affect, "node": node.name}
+    if affect in ("bump", "normal", "height"):
+        bump = tree.nodes.new("ShaderNodeBump")
+        bump.name = _OR_PREFIX + "bump"
+        bump.location = (-300, -260)
+        _set_node_input(bump, "Strength", min(max(strength, 0.0), 1.0))
+        try:
+            tree.links.new(node.outputs["Fac"], bump.inputs["Height"])
+        except Exception:
+            try:
+                tree.links.new(node.outputs["Color"], bump.inputs["Height"])
+            except Exception:
+                pass
+        try:
+            tree.links.new(bump.outputs["Normal"], bsdf.inputs["Normal"])
+        except Exception:
+            pass
+        record["strength"] = strength
+    elif affect in ("roughness",):
+        _set_node_input(bsdf, "Roughness", None)
+        try:
+            tree.links.new(node.outputs["Fac"], bsdf.inputs["Roughness"])
+        except Exception:
+            pass
+    elif affect in ("emission", "emissive"):
+        node2 = tree.nodes.new("ShaderNodeMath")
+        node2.name = _OR_PREFIX + "emission_mul"
+        node2.operation = "MULTIPLY"
+        node2.location = (-300, -400)
+        _set_node_input(node2, "1", max(strength, 0.0) if strength else 1.0)
+        try:
+            tree.links.new(node.outputs["Fac"], node2.inputs[0])
+            tree.links.new(node2.outputs[0], bsdf.inputs["Emission Strength"])
+        except Exception:
+            pass
+        record["strength"] = strength
+    else:  # base_color / color / mix
+        ramp = tree.nodes.new("ShaderNodeValToRGB")
+        ramp.name = _OR_PREFIX + "ramp"
+        ramp.location = (-320, 20)
+        try:
+            ramp.color_ramp.elements[0].position = 0.35
+            ramp.color_ramp.elements[0].color = color_a
+            if len(ramp.color_ramp.elements) > 1:
+                ramp.color_ramp.elements[1].position = 0.65
+                ramp.color_ramp.elements[1].color = color_b
+        except Exception:
+            pass
+        try:
+            tree.links.new(node.outputs["Fac"], ramp.inputs["Fac"])
+            tree.links.new(ramp.outputs["Color"], bsdf.inputs["Base Color"])
+        except Exception:
+            pass
+        record["colors"] = [color_a, color_b]
+    report["texture"] = record
+    return report
+
+
+def cmd_material_create():
+    spec = dict(MATERIAL_PRESETS.get(str(ARGS.get("preset") or "").lower(), {}))
+    for key in ("color", "base_color", "metallic", "roughness", "specular", "ior", "transmission",
+                "alpha", "emission", "emissive", "emission_strength", "coat", "coat_roughness",
+                "sheen", "anisotropic", "subsurface", "blend", "noise"):
+        if ARGS.get(key) is not None:
+            spec[key] = ARGS.get(key)
+    name = str(ARGS.get("material") or ARGS.get("material_name") or ARGS.get("name") or "OR_Material")
+    mat = bpy.data.materials.get(name)
+    if mat is None:
+        mat = bpy.data.materials.new(name)
+    mat.use_nodes = True
+    report = {"material": mat.name, "preset": ARGS.get("preset") or None}
+    if not spec:
+        spec = {"color": [0.8, 0.8, 0.8]}
+    _purge_or_nodes(mat)
+    _apply_material(mat, spec, report)
+    assigned = []
+    objs = _target_objects()
+    if objs and ARGS.get("assign", True) is not False:
+        for obj in objs:
+            if getattr(obj, "type", "") != "MESH" or getattr(obj, "data", None) is None:
+                continue
+            try:
+                if ARGS.get("append_slot") and obj.data.materials:
+                    obj.data.materials.append(mat)
+                elif len(obj.data.materials):
+                    obj.data.materials[0] = mat
+                else:
+                    obj.data.materials.append(mat)
+                assigned.append(obj.name)
+            except Exception:
+                continue
+    report["assigned"] = assigned
+    report["ok"] = True
+    return emit(report)
+
+
+def cmd_material_preset():
+    if not ARGS.get("preset"):
+        return emit({"ok": False, "error": "preset required. Known presets: " + ", ".join(sorted(MATERIAL_PRESETS))})
+    return cmd_material_create()
+
+
+def cmd_material_set():
+    mat = _find_material()
+    if mat is None:
+        return emit({"ok": False, "error": "material required (pass material:\"<name>\")"})
+    mat.use_nodes = True
+    report = {"material": mat.name}
+    keys = ("color", "base_color", "metallic", "roughness", "specular", "ior", "transmission",
+            "alpha", "emission", "emissive", "emission_strength", "coat", "coat_roughness",
+            "sheen", "anisotropic", "subsurface", "blend")
+    spec = {k: ARGS.get(k) for k in keys if ARGS.get(k) is not None}
+    if not spec:
+        return emit({"ok": False, "error": "nothing to set - pass color/metallic/roughness/emission/alpha/blend..."})
+    _apply_material(mat, spec, report)
+    assigned = []
+    if ARGS.get("objects") or ARGS.get("name"):
+        for obj in _target_objects():
+            if getattr(obj, "type", "") != "MESH" or getattr(obj, "data", None) is None:
+                continue
+            try:
+                if len(obj.data.materials):
+                    obj.data.materials[0] = mat
+                else:
+                    obj.data.materials.append(mat)
+                assigned.append(obj.name)
+            except Exception:
+                continue
+    if assigned:
+        report["assigned"] = assigned
+    report["ok"] = True
+    return emit(report)
+
+
+def cmd_material_assign():
+    mat = _find_material()
+    if mat is None:
+        return emit({"ok": False, "error": "material not found - pass material:\"<name>\" (material_list shows what exists)"})
+    objs = _target_objects()
+    if not objs:
+        return emit({"ok": False, "error": "no objects - pass name/objects or select meshes first"})
+    slot = ARGS.get("slot")
+    assigned = []
+    for obj in objs:
+        if getattr(obj, "type", "") != "MESH" or getattr(obj, "data", None) is None:
+            continue
+        try:
+            if slot is not None and int(slot) < len(obj.data.materials):
+                obj.data.materials[int(slot)] = mat
+            elif ARGS.get("append") or len(obj.data.materials):
+                obj.data.materials.append(mat)
+            else:
+                obj.data.materials.append(mat)
+            assigned.append({"object": obj.name, "slots": len(obj.data.materials)})
+        except Exception:
+            continue
+    return emit({"ok": bool(assigned), "material": mat.name, "assigned": assigned,
+                 "error": None if assigned else "no mesh objects in the target list"})
+
+
+def cmd_material_list():
+    mats = []
+    for mat in bpy.data.materials:
+        users = [o.name for o in bpy.data.objects if getattr(o, "data", None) is not None
+                 and getattr(o.data, "materials", None) is not None and mat.name in [m.name for m in o.data.materials if m]]
+        bsdf = None
+        try:
+            for n in mat.node_tree.nodes:
+                if n.type == "BSDF_PRINCIPLED":
+                    bsdf = n
+                    break
+        except Exception:
+            bsdf = None
+        entry = {"name": mat.name, "users": users[:12], "user_count": len(users), "use_nodes": bool(mat.use_nodes)}
+        if bsdf is not None:
+            for key, sock in (("metallic", "Metallic"), ("roughness", "Roughness")):
+                s = bsdf.inputs.get(sock)
+                if s is not None:
+                    try:
+                        entry[key] = round(float(s.default_value), 4)
+                    except Exception:
+                        pass
+            for nm in ("Base Color",):
+                s = bsdf.inputs.get(nm)
+                if s is not None:
+                    try:
+                        entry["color"] = [round(float(c), 3) for c in list(s.default_value)[:4]]
+                    except Exception:
+                        pass
+            for nm in ("Emission Strength",):
+                s = bsdf.inputs.get(nm)
+                if s is not None:
+                    try:
+                        entry["emission_strength"] = round(float(s.default_value), 3)
+                    except Exception:
+                        pass
+        mats.append(entry)
+    return emit({"ok": True, "count": len(mats), "materials": mats,
+                 "presets": sorted(MATERIAL_PRESETS)})
+
+
+def cmd_material_inspect():
+    mat = _find_material()
+    if mat is None:
+        return emit({"ok": False, "error": "material required (material:\"<name>\") or target a shaded object"})
+    info = {"ok": True, "name": mat.name, "use_nodes": bool(mat.use_nodes),
+            "presets": sorted(MATERIAL_PRESETS)}
+    for attr in ("diffuse_color", "metallic", "roughness", "blend_method", "surface_render_method",
+                 "use_backface_culling", "alpha_threshold"):
+        if hasattr(mat, attr):
+            try:
+                v = getattr(mat, attr)
+                info[attr] = [round(float(x), 4) for x in list(v)] if isinstance(v, (list, tuple)) else (v if isinstance(v, (str, bool, int, float)) else str(v))
+            except Exception:
+                pass
+    bsdf = None
+    try:
+        for n in mat.node_tree.nodes:
+            if n.type == "BSDF_PRINCIPLED":
+                bsdf = n
+                break
+    except Exception:
+        pass
+    if bsdf is not None:
+        inputs = {}
+        for sock in bsdf.inputs:
+            try:
+                if hasattr(sock, "default_value"):
+                    dv = sock.default_value
+                    inputs[sock.name] = [round(float(x), 4) for x in list(dv)] if hasattr(dv, "__len__") else round(float(dv), 4)
+                elif sock.is_linked:
+                    inputs[sock.name] = "<linked>"
+            except Exception:
+                continue
+        info["principled"] = inputs
+        info["linked_inputs"] = [s.name for s in bsdf.inputs if s.is_linked]
+    try:
+        info["nodes"] = [{"name": n.name, "type": n.type, "label": n.label} for n in mat.node_tree.nodes]
+    except Exception:
+        pass
+    users = [o.name for o in bpy.data.objects if getattr(o, "data", None) is not None
+             and getattr(o.data, "materials", None) is not None and mat.name in [m.name for m in o.data.materials if m]]
+    info["users"] = users[:20]
+    return emit(info)
+
+
+def cmd_material_remove():
+    name = str(ARGS.get("material") or ARGS.get("material_name") or "").strip()
+    mat = bpy.data.materials.get(name)
+    if mat is None:
+        return emit({"ok": False, "error": "no material named " + (name or "<empty>")})
+    try:
+        mat.user_clear()
+    except Exception:
+        pass
+    bpy.data.materials.remove(mat)
+    return emit({"ok": True, "removed": name, "remaining": len(bpy.data.materials)})
+
+
+def cmd_material_noise():
+    mat = _find_material()
+    if mat is None:
+        return emit({"ok": False, "error": "material required (material:\"<name>\")"})
+    mat.use_nodes = True
+    removed = _purge_or_nodes(mat) if ARGS.get("replace", True) else 0
+    report = {"material": mat.name, "removed_previous_nodes": removed}
+    _wire_texture(mat, report)
+    if "texture" not in report:
+        return emit({"ok": False, "error": report.get("texture_error", "could not build the texture nodes"),
+                     "hint": "types: noise, voronoi, wave, checker, brick, gradient; affect: bump, base_color, roughness, emission"})
+    report["ok"] = True
+    return emit(report)
+
+
+def cmd_material_image():
+    mat = _find_material()
+    if mat is None:
+        return emit({"ok": False, "error": "material required (material:\"<name>\")"})
+    path = str(ARGS.get("path") or ARGS.get("filepath") or ARGS.get("image") or "").strip()
+    if not path:
+        return emit({"ok": False, "error": "path required (an image file Blender can read, e.g. C:/tex/brick.png)"})
+    path = os.path.expanduser(os.path.expandvars(path))
+    if not os.path.isfile(path):
+        return emit({"ok": False, "error": "no such image file: " + path})
+    slot = str(ARGS.get("slot") or ARGS.get("channel") or "base_color").lower()
+    if slot not in ("base_color", "color", "albedo", "diffuse", "roughness", "rough", "orm",
+                    "metallic", "metal", "orm_metal", "normal", "bump", "emission", "emissive"):
+        return emit({"ok": False, "error": "unknown slot: " + slot,
+                     "hint": "slot: base_color | roughness | metallic | normal | emission"})
+    mat.use_nodes = True
+    bsdf = _principled(mat)
+    tree = mat.node_tree
+    img = bpy.data.images.load(path, check_existing=True)
+    node = tree.nodes.new("ShaderNodeTexImage")
+    node.name = _OR_PREFIX + "image"
+    node.label = os.path.basename(path)
+    node.location = (-460, 120)
+    node.image = img
+    try:
+        node.image.colorspace_settings.name = str(ARGS.get("colorspace") or "sRGB")
+    except Exception:
+        pass
+    wired = []
+    try:
+        if slot in ("base_color", "color", "albedo", "diffuse"):
+            node.image.colorspace_settings.name = str(ARGS.get("colorspace") or "sRGB")
+            tree.links.new(node.outputs["Color"], bsdf.inputs["Base Color"])
+            wired.append("Base Color")
+            if ARGS.get("alpha_to_alpha") and node.outputs.get("Alpha") is not None:
+                tree.links.new(node.outputs["Alpha"], bsdf.inputs["Alpha"])
+                wired.append("Alpha")
+        elif slot in ("roughness", "rough", "orm"):
+            img.colorspace_settings.name = "Non-Color"
+            tree.links.new(node.outputs["Color"], bsdf.inputs["Roughness"])
+            wired.append("Roughness")
+        elif slot in ("metallic", "metal", "orm_metal"):
+            img.colorspace_settings.name = "Non-Color"
+            tree.links.new(node.outputs["Color"], bsdf.inputs["Metallic"])
+            wired.append("Metallic")
+        elif slot in ("normal", "bump"):
+            img.colorspace_settings.name = "Non-Color"
+            nmap = tree.nodes.new("ShaderNodeNormalMap")
+            nmap.name = _OR_PREFIX + "normal_map"
+            nmap.location = (-260, -140)
+            tree.links.new(node.outputs["Color"], nmap.inputs["Color"])
+            tree.links.new(nmap.outputs["Normal"], bsdf.inputs["Normal"])
+            wired.append("Normal")
+        elif slot in ("emission", "emissive"):
+            tree.links.new(node.outputs["Color"], bsdf.inputs["Emission Color" if bsdf.inputs.get("Emission Color") else "Emission"])
+            _set_in(bsdf, "emission_strength", float(ARGS.get("strength") or 1.0))
+            wired.append("Emission Color")
+    except Exception as exc:
+        return emit({"ok": False, "error": "could not wire the image: " + str(exc)})
+    return emit({"ok": True, "material": mat.name, "image": path, "size": list(img.size),
+                 "slot": slot, "wired": wired, "node": node.name})
+
+
+def cmd_material_pbr():
+    """Full PBR graph (albedo + ORM + normal) - the game-ready / Roblox layout."""
+    mat = _find_material()
+    if mat is None:
+        return emit({"ok": False, "error": "material required (material:\"<name>\")"})
+    files = {}
+    for key in ("base_color", "albedo", "roughness", "metallic", "orm", "normal", "emission"):
+        v = ARGS.get(key)
+        if v:
+            p = os.path.expanduser(os.path.expandvars(str(v)))
+            if not os.path.isfile(p):
+                return emit({"ok": False, "error": "no such file for " + key + ": " + p})
+            files[key] = p
+    if not files:
+        return emit({"ok": False, "error": "pass at least base_color/albedo (optional orm/roughness/metallic/normal)"})
+    mat.use_nodes = True
+    _purge_or_nodes(mat)
+    saved = dict(ARGS)
+    built = []
+    try:
+        for key, p in files.items():
+            ARGS.clear()
+            ARGS.update(saved)
+            ARGS["path"] = p
+            ARGS["slot"] = {"albedo": "base_color", "orm": "roughness"}.get(key, key)
+            sub = {}
+            _material_image_into(mat, p, ARGS["slot"], sub)
+            built.append({"channel": key, "file": p, **sub})
+    finally:
+        ARGS.clear()
+        ARGS.update(saved)
+    return emit({"ok": True, "material": mat.name, "channels": built,
+                 "note": "Non-Color colorspace is set automatically for roughness/metallic/normal maps."})
+
+
+def _material_image_into(mat, path, slot, report):
+    """Add one image node into an existing graph (used by cmd_material_pbr)."""
+    bsdf = _principled(mat)
+    tree = mat.node_tree
+    img = bpy.data.images.load(path, check_existing=True)
+    node = tree.nodes.new("ShaderNodeTexImage")
+    node.name = _OR_PREFIX + "img_" + str(slot)
+    node.label = os.path.basename(path)
+    node.location = (-520, 200 - 60 * len([n for n in tree.nodes if str(n.name).startswith(_OR_PREFIX + "img_")]))
+    node.image = img
+    if slot in ("base_color", "color", "albedo"):
+        node.image.colorspace_settings.name = "sRGB"
+        tree.links.new(node.outputs["Color"], bsdf.inputs["Base Color"])
+        report["wired"] = "Base Color"
+    elif slot in ("roughness", "orm"):
+        img.colorspace_settings.name = "Non-Color"
+        tree.links.new(node.outputs["Color"], bsdf.inputs["Roughness"])
+        report["wired"] = "Roughness"
+    elif slot == "metallic":
+        img.colorspace_settings.name = "Non-Color"
+        tree.links.new(node.outputs["Color"], bsdf.inputs["Metallic"])
+        report["wired"] = "Metallic"
+    elif slot == "normal":
+        img.colorspace_settings.name = "Non-Color"
+        nmap = tree.nodes.new("ShaderNodeNormalMap")
+        nmap.name = _OR_PREFIX + "nm_" + os.path.basename(path)
+        nmap.location = (-260, -160)
+        tree.links.new(node.outputs["Color"], nmap.inputs["Color"])
+        tree.links.new(nmap.outputs["Normal"], bsdf.inputs["Normal"])
+        report["wired"] = "Normal"
+    elif slot == "emission":
+        tree.links.new(node.outputs["Color"], bsdf.inputs["Emission Color" if bsdf.inputs.get("Emission Color") else "Emission"])
+        report["wired"] = "Emission Color"
+    report["node"] = node.name
+    report["size"] = list(img.size)
+    return report
+
+
 def cmd_add_modifier():
     obj = bpy.data.objects.get(str(ARGS.get("name") or ARGS.get("object") or "")) or active()
     if obj is None:
@@ -1644,6 +2387,16 @@ DISPATCH = {
     "shade_smooth": cmd_shade_smooth,
     "shade_flat": cmd_shade_flat,
     "set_material": cmd_set_material,
+    "material_create": cmd_material_create,
+    "material_preset": cmd_material_preset,
+    "material_set": cmd_material_set,
+    "material_assign": cmd_material_assign,
+    "material_list": cmd_material_list,
+    "material_inspect": cmd_material_inspect,
+    "material_remove": cmd_material_remove,
+    "material_noise": cmd_material_noise,
+    "material_image": cmd_material_image,
+    "material_pbr": cmd_material_pbr,
     "add_modifier": cmd_add_modifier,
     "boolean": cmd_boolean,
     "apply_modifiers": cmd_apply_modifiers,

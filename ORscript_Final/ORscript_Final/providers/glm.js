@@ -346,7 +346,18 @@ const RSProvider = (() => {
     // site's binding between the pending upload and the message being sent).
     // submitAndGetBase RETRIES this function; only attach if nothing is staged
     // yet, else each retry uploads ANOTHER duplicate copy.
-    if (images && images.length && !hasPendingAttachment()) { try { await attachImages(images); } catch {} }
+    if (images && images.length && !hasPendingAttachment()) {
+      // The picture IS the point of this message. Sending the text alone would tell the
+      // model to look at an image it cannot see, so stop rather than pretend - the caller's
+      // "message was not sent" path reports it, and the user can retry or paste manually.
+      let orAttached = false;
+      for (let orTry = 0; orTry < 2 && !orAttached; orTry++) {
+        try { orAttached = (await attachImages(images)) !== false; } catch { orAttached = false; }
+      }
+      if (!orAttached) {
+        throw new Error("OR_IMAGE_ATTACH_FAILED: the screenshot did not reach this chat's composer, so nothing was sent (the picture IS the message). Retry, or use attach_feedback {action:\"copy\"} and paste it with Ctrl+V.");
+      }
+    }
     // Wait for Svelte to re-enable the send button (proof it registered the text),
     // then click the instant it's clickable. In a LONG conversation the message
     // list is heavy, so Svelte's reactivity to the input event can take well over

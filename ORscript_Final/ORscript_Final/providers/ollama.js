@@ -282,7 +282,15 @@ const RSProvider = (() => {
       else { editor.value=text; editor.dispatchEvent(new Event("input",{bubbles:true})); }
       await sleep(200);
     }
-    if(images && images.length){ try{ await attachImages(images); }catch{} }
+    if(images && images.length){
+      // The screenshot IS the message: if it did not stage, stop rather than send text
+      // that points the model at a picture it cannot see.
+      let orAttached=false;
+      for(let orTry=0; orTry<2 && !orAttached; orTry++){
+        try{ orAttached=(await attachImages(images))!==false; }catch{ orAttached=false; }
+      }
+      if(!orAttached){ throw new Error("OR_IMAGE_ATTACH_FAILED: the screenshot did not reach this chat's composer, so nothing was sent (the picture IS the message). Retry, or use attach_feedback {action:\"copy\"} and paste it with Ctrl+V."); }
+    }
     await sleep(250);
     if(!isBusyNow()){ pressEnter(editor); if(await waitFor(()=> editorText().trim()==="" || isHardGenerating(), 1800)) return; }
     await waitFor(()=>{ for(const sel of S.sendBtn.split(", ")){ try{ const b=document.querySelector(sel); if(b && isVisibleForClick(b)) return true; }catch{} } return false; },2500);

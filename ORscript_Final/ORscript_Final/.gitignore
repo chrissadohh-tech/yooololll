@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+
+# scratch patch scripts used while editing this repo
+patch_*.py

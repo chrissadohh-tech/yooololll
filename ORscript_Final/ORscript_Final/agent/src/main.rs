@@ -260,7 +260,8 @@ impl McpRuntime {
     }
 
     async fn probe_studio(&mut self) -> anyhow::Result<()> {
-        let text = self.call_tool("get_studio_state", serde_json::json!({})).await?;
+        let out = self.call_tool("get_studio_state", serde_json::json!({})).await?;
+        let text = out.text;
         if text.is_empty() || text.contains("Unable to find an active Studio instance")
             || text.contains("previously active Studio has disconnected")
             || text.contains("no active Studio") {
@@ -269,14 +270,51 @@ impl McpRuntime {
         Ok(())
     }
 
-    async fn call_tool(&mut self, name: &str, args: serde_json::Value) -> anyhow::Result<String> {
+    async fn call_tool(&mut self, name: &str, args: serde_json::Value) -> anyhow::Result<McpOutput> {
         self.ensure().await?;
         let result = self.request("tools/call", serde_json::json!({"name":name, "arguments":args})).await?;
         let is_error = result.get("isError").and_then(|v| v.as_bool()).unwrap_or(false);
-        let text = result.get("content").and_then(|v| v.as_array()).map(|items| items.iter().filter_map(|item| item.get("text").and_then(|v| v.as_str())).collect::<Vec<_>>().join("\n")).unwrap_or_else(|| result.to_string());
+        let items = result.get("content").and_then(|v| v.as_array());
+        // Text blocks are concatenated as before. IMAGE blocks (an MCP server's
+        // screenshot: {type:"image", data:<base64>, mimeType:"image/png"}) carry
+        // NO "text" field, so the old text-only join silently dropped them and
+        // Studio's screen_capture looked like it had returned an empty result.
+        // They are collected here and shipped to the extension, which attaches
+        // them to the model's next message.
+        let mut images: Vec<serde_json::Value> = Vec::new();
+        let mut texts: Vec<&str> = Vec::new();
+        if let Some(items) = items {
+            for item in items {
+                if let Some(t) = item.get("text").and_then(|v| v.as_str()) { texts.push(t); }
+                let kind = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                let is_image = kind == "image" || item.get("data").is_some() && kind != "text";
+                if !is_image { continue; }
+                let data = item.get("data").and_then(|v| v.as_str()).unwrap_or("");
+                if data.is_empty() { continue; }
+                let mime = item.get("mimeType").and_then(|v| v.as_str())
+                    .or_else(|| item.get("mime_type").and_then(|v| v.as_str()))
+                    .unwrap_or("image/png");
+                images.push(serde_json::json!({"mimeType": mime, "data": data}));
+            }
+        }
+        let text = if texts.is_empty() && items.is_some() {
+            // No text block at all: keep the old raw-JSON fallback so a server
+            // with an unusual shape still shows SOMETHING to the model.
+            if images.is_empty() { result.to_string() } else { String::new() }
+        } else {
+            texts.join("\n")
+        };
         if is_error { anyhow::bail!("{text}"); }
-        Ok(text)
+        Ok(McpOutput { text, images })
     }
+}
+
+/// Result of one MCP tool call: text output plus any image blocks the server
+/// returned. Serialised into the extension's `tool_result` frame.
+#[derive(Clone, Debug)]
+struct McpOutput {
+    text: String,
+    images: Vec<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -598,7 +636,7 @@ async fn roblox_tools(state: &AppState) -> anyhow::Result<Vec<serde_json::Value>
     }
 }
 
-async fn roblox_tool(state: &AppState, name: &str, args: serde_json::Value) -> anyhow::Result<String> {
+async fn roblox_tool(state: &AppState, name: &str, args: serde_json::Value) -> anyhow::Result<McpOutput> {
     let _busy = InFlight::enter(&state.mcp_in_flight);
     let mut mcp = state.roblox_mcp.lock().await;
     match mcp.call_tool(name, args.clone()).await {
@@ -788,13 +826,25 @@ async fn handle_legacy_ws(ws_stream: tokio_tungstenite::WebSocketStream<tokio::n
                         let eng = engine.clone();
                         let tx = out_tx.clone();
                         tokio::spawn(async move {
-                            let outcome = match eng.as_str() {
-                                "local" => { workspace::dispatch(&state2.workspace, &name, args).await.map_err(anyhow::Error::msg) }
+                            let outcome: Result<McpOutput, anyhow::Error> = match eng.as_str() {
+                                "local" => workspace::dispatch(&state2.workspace, &name, args).await
+                                    .map(|text| McpOutput { text, images: Vec::new() })
+                                    .map_err(anyhow::Error::msg),
                                 "roblox" => roblox_tool(&state2, &name, args).await,
                                 _ => Err(anyhow::anyhow!("unknown engine")),
                             };
                             let response = match outcome {
-                                Ok(text) => serde_json::json!({"type":"tool_result","id":id,"ok":true,"text":text}),
+                                Ok(out) => {
+                                    let mut frame = serde_json::json!({"type":"tool_result","id":id,"ok":true,"text":out.text});
+                                    // Image blocks (Studio screenshots) ride along as
+                                    // [{mimeType, data}] — the extension attaches them to
+                                    // the model's next message. Omitted entirely when empty
+                                    // so text-only results keep their exact old shape.
+                                    if !out.images.is_empty() {
+                                        frame["images"] = serde_json::Value::Array(out.images);
+                                    }
+                                    frame
+                                }
                                 Err(error) => serde_json::json!({"type":"tool_result","id":id,"ok":false,"kind":"execution","error":error.to_string()}),
                             };
                             let _ = tx.send(response.to_string());

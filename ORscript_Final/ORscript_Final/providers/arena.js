@@ -604,11 +604,17 @@ const RSProvider = (() => {
     // preview from a prior failed set so it can't block a genuinely new capture.
     if (images && images.length && images !== _attachedImages) {
       if (hasPendingAttachment()) { diag("arena.tas.clearStale", { pending: pendingCount() }); clearAttachments(); }
+      let ok = false;
       try {
-        const ok = await attachImages(images);
+        ok = await attachImages(images);
         if (ok) _attachedImages = images;
         diag("arena.tas.attached", { imgId: images.__rsId, ok, pendingAfter: pendingCount() });
       } catch (e) { diag("arena.tas.attachErr", { msg: String(e && e.message || e) }); }
+      if (!ok) {
+        // Retry once, then refuse to send a message whose picture never arrived.
+        try { ok = await attachImages(images); if (ok) _attachedImages = images; } catch { ok = false; }
+      }
+      if (!ok && !hasPendingAttachment()) { throw new Error("OR_IMAGE_ATTACH_FAILED: the screenshot did not reach this chat's composer, so nothing was sent (the picture IS the message). Retry, or use attach_feedback {action:\"copy\"} and paste it with Ctrl+V."); }
       // Staging the file re-disables send for ~0.4s while Arena ingests it.
       await waitFor(sendReady, 6000);
     } else {

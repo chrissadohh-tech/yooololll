@@ -74,12 +74,11 @@
     script_lint: "script_analysis",
     lint_script: "script_analysis",
     lint_scripts: "script_analysis",
-    screenshot: "or_screenshot",
-    take_screenshot: "or_screenshot",
-    screenshot_send: "or_screenshot",
-    send_screenshot: "or_screenshot",
-    capture_screenshot: "or_screenshot",
-    or_screen_shot: "or_screenshot",
+    // There are THREE screenshot commands, separate on purpose: ViewportScreenshotRoblox
+    // (inside Studio), ViewportScreenshotBlender (inside Blender) and ViewportScreenshot
+    // (overall). The old spellings - or_screenshot, screenshot, take_screenshot,
+    // send_screenshot, capture_screenshot, or_screen_shot - are gone: one command with a
+    // target table is how "which command do I call?" became a question.
     debug_run: "or_debug",
     debug_console: "or_debug",
     auto_debug: "or_debug",
@@ -93,6 +92,18 @@
     list_developer_products: "developer_product_list",
     devproduct_list: "developer_product_list",
   };
+  // The three screenshot commands, exactly as asked for: case-insensitive and tolerant of
+  // underscores (viewport_screenshot_roblox is the same command as ViewportScreenshotRoblox,
+  // because it is the same intent spelled differently). This normalizer is the ONLY spelling
+  // tolerance in the surface - no command has a second name.
+  const normToolName = (n) => String(n || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+  function viewportShotKind(name) {
+    const k = normToolName(name);
+    if (k === "viewportscreenshotroblox") return "roblox";
+    if (k === "viewportscreenshotblender") return "blender";
+    if (k === "viewportscreenshot") return "any";
+    return "";
+  }
   function remapToolName(n) {
     const raw = String(n || "");
     const key = raw.replace(/-/g, "_").toLowerCase();
@@ -346,7 +357,11 @@
       // never chrome-extension://), so freezes left no fingerprint.
       const file = String((e && e.filename) || "");
       if (file && !file.includes("chrome-extension://")) return;
-      _report("uncaught.error", { msg: e && e.message, line: e && e.lineno, file: e && e.filename });
+      // Keep the first frames of the stack: that is the "which function, which line"
+      // the user would otherwise have to copy out of DevTools by hand. or_report prints it.
+      const st = String((e && e.error && e.error.stack) || "");
+      _report("uncaught.error", { msg: e && e.message, line: e && e.lineno, file: e && e.filename,
+        at: st.split("\n").slice(1, 4).map((x) => x.trim()).filter(Boolean).join(" | ").slice(0, 300) });
     }, true);
     window.addEventListener("unhandledrejection", (e) => {
       const r = e && e.reason;
@@ -568,6 +583,11 @@
     // upcoming submitAndGetBase/typeAndSend call to attach as the LAST step
     // before sending (see the comment in runTool's r.images branch).
     pendingImages: null,
+    // Ring buffer of the last few captures (newest first) so attach_feedback
+    // can re-send a screenshot that has already scrolled away, and the popup's
+    // Copy / Attach buttons always have something to work with.
+    recentImages: [],
+    lastShot: null,
     // BARE names of tools observed to return images at least once this session.
     // For the KNOWN Roblox vision tool (screen_capture) toolCategory already
     // gives the "screen" chip optimistically at run time; a custom MCP tool's
@@ -1341,6 +1361,52 @@
     if (VISION_TOOLS.has(bare) && !P.supportsVision) return true;
     return false;
   };
+  // ── Names that USED to be commands. They must ANSWER, never fall through. ──
+  // Deleting a command is only half the fix: a model that memorised the old
+  // spelling keeps calling it, the name stops matching any handler below, and the
+  // call gets forwarded to the worker - where a capture sits until a timeout
+  // expires (that is the "it just loops" report). NOTHING in here is an alias:
+  // no name on this list runs anything or takes a picture, each one just says
+  // where the one real command and its three targets are.
+  const SANCTIONED_PICTURE_NAMES = new Set([
+    // the surface the user asked for (normalized: case and underscores removed)
+    "viewportscreenshotroblox", "viewportscreenshotblender", "viewportscreenshot",
+    "shottest",
+    // real worker/MCP tools that RETURN a picture - they are not OR commands
+    // and must keep working
+    "screencapture", "getviewportscreenshot", "blenderscreenshot",
+    // attach_feedback aliases: they re-send an existing picture, they never
+    // capture one, so they are a different job and stay
+    "attachscreenshot", "attachlastscreenshot", "copyscreenshot", "pastescreenshot",
+  ]);
+  function removedPictureReply(name) {
+    let bare = "";
+    // Normalized (case AND underscores removed) so one list can hold both the worker-tool
+    // spellings (screen_capture) and the command spellings (ViewportScreenshotRoblox).
+    try { bare = normToolName(name); } catch { return ""; }
+    if (!bare || SANCTIONED_PICTURE_NAMES.has(bare)) return "";
+    // A self-test spelling of this family must land on the shot_test answer, not
+    // fall through to the worker and stall.
+    const testish = /(shot|screen)/.test(bare) && /test|selftest|probe|check/.test(bare);
+    const shotish = testish || /screenshot|screencap|capturescreen|screengrab/.test(bare);
+    const focusish = /focusstudio|studiofocus|bringstudio|studiotofront|foregroundstudio/.test(bare);
+    if (!shotish && !focusish) return "";
+    const head = "ERROR: '" + name + "' is not a command. There are exactly three screenshot commands:"
+      + " ViewportScreenshotRoblox {} (inside Roblox Studio - Studio must be running),"
+      + " ViewportScreenshotBlender {} (inside Blender - Blender must be running and connected), and"
+      + " ViewportScreenshot {} (overall: Studio, else Blender, else the whole screen)."
+      + " This call did NOT take a picture.";
+    if (testish) {
+      return head + " To prove the capture path works on this machine, call shot_test {} - it needs no Studio"
+        + " open and takes no picture of your work.";
+    }
+    if (focusish) {
+      return head + " Which window is in front never matters any more, so there is nothing to bring to the"
+        + " front - call ViewportScreenshotRoblox {} and Studio only has to be OPEN.";
+    }
+    return head + " Use one of those and do not retry another spelling.";
+  }
+
 
   // ── Learned image tools (reload-proof "screen" chip) ──────────────────────
   // The known Roblox vision tool (screen_capture) is themed "screen" by name via
@@ -1779,6 +1845,12 @@
       let lines = [];
       try { lines = JSON.parse(raw); } catch { lines = []; }
       if (!Array.isArray(lines) || !lines.length) return feedback;
+      // BENIGN lines are not "errors to fix". Studio emits these constantly (a
+      // missing plugin icon, an asset image that failed to load) and reporting
+      // them sent the model off fixing things that are not broken - the live
+      // "[AUTO DEBUG] Unable to load plugin icon: rbxassetid://153352536" case.
+      const BENIGN = /unable to load plugin icon|failed to load (image|asset|texture|decal)|rbxassetid:\/\/\d+.*(failed|unable)|http 403 \(forbidden\).*rbxasset|image failed to load|asset.*not (found|approved)|cannot load plugin/i;
+      lines = lines.filter((ln) => !BENIGN.test(String(ln)));
       A._debugSigs = A._debugSigs || new Set();
       const fresh = [];
       for (const ln of lines) {
@@ -1873,6 +1945,391 @@
     return "Output of 'developer_product_list':\n" + String(r.text || JSON.stringify(r.products || r, null, 2)).slice(0, 4000);
   }
 
+  // ── Image attach plumbing (the screenshot commands / attach_feedback) ──
+  // NOTE: this block MUST stay at closure scope. It was once inserted inside
+  // runTool() (2-space indent made it look top-level), which put
+  // RECENT_IMAGES_MAX in the temporal dead zone for the screenshot branches
+  // declared earlier in the same body - every screenshot died with "Cannot
+  // access 'RECENT_IMAGES_MAX' before initialization" before capturing, and the
+  // popup's Copy / Use-as-feedback buttons could not see these helpers at all.
+  // A static parse cannot see scope (node --check passes on a TDZ error) and greps
+  // only proved the text existed somewhere, so the guard is test-shots.js: it loads
+  // THIS file with the real background.js behind a fake DOM and calls every
+  // screenshot/attach command. With this block inside runTool it reports
+  // "Cannot access 'RECENT_IMAGES_MAX' before initialization" - the exact failure
+  // the user hit - and with it here all 47 checks pass.
+  // One place that turns a tool's base64 images into (a) a remembered recent
+  // capture, (b) a real Blob/File, (c) a clipboard item, and (d) a composer
+  // attachment. Every provider's attachImages() already accepts {mimeType,data}
+  // payloads, so nothing here is provider-specific.
+  const RECENT_IMAGES_MAX = 8;
+  function rememberImages(images, source) {
+    if (!images || !images.length) return;
+    const at = Date.now();
+    for (const img of images) {
+      if (!img || !img.data) continue;
+      A.recentImages.unshift({ mimeType: img.mimeType || "image/png", data: img.data, at, source: source || "capture" });
+    }
+    if (A.recentImages.length > RECENT_IMAGES_MAX) A.recentImages.length = RECENT_IMAGES_MAX;
+    A.lastShot = A.recentImages[0] || null;
+  }
+  function imageToBlob(img) {
+    const mime = (img && img.mimeType) || "image/png";
+    const bin = atob(String((img && img.data) || ""));
+    const arr = new Uint8Array(bin.length);
+    for (let j = 0; j < bin.length; j++) arr[j] = bin.charCodeAt(j);
+    return new Blob([arr], { type: mime });
+  }
+  // Chrome's async clipboard only accepts image/png, so a jpeg/webp capture is
+  // re-encoded through a canvas (which also gives us the pixel size we report).
+  async function imageToPngBlob(img) {
+    const blob = imageToBlob(img);
+    const mime = (img && img.mimeType) || "";
+    if (mime.includes("png")) {
+      try {
+        const bmp = await createImageBitmap(blob);
+        return { blob, width: bmp.width, height: bmp.height };
+      } catch { return { blob, width: 0, height: 0 }; }
+    }
+    try {
+      const bmp = await createImageBitmap(blob);
+      const c = document.createElement("canvas");
+      c.width = bmp.width; c.height = bmp.height;
+      c.getContext("2d").drawImage(bmp, 0, 0);
+      const png = await new Promise((res) => { try { c.toBlob((b) => res(b), "image/png"); } catch { res(null); } });
+      return { blob: png || blob, width: bmp.width, height: bmp.height };
+    } catch {
+      return { blob, width: 0, height: 0 };
+    }
+  }
+  async function copyImageToClipboard(img) {
+    if (!navigator.clipboard || typeof ClipboardItem === "undefined") {
+      return { ok: false, error: "this browser exposes no image clipboard API" };
+    }
+    try {
+      const { blob } = await imageToPngBlob(img);
+      await navigator.clipboard.write([new ClipboardItem({ [blob.type || "image/png"]: blob })]);
+      return { ok: true };
+    } catch (e) {
+      // Chrome demands the tab be focused (and may want a real user gesture) —
+      // report it plainly instead of pretending the copy happened.
+      return { ok: false, error: String((e && e.message) || e).slice(0, 140) };
+    }
+  }
+  const kb = (b64) => Math.round((String(b64 || "").length * 3) / 4 / 102.4) / 10;
+
+  // Shared capture routine: used by the three screenshot commands AND attach_feedback so both
+  // agree on what "studio", "tab" and "blender" mean.
+  async function captureShots(target, opts) {
+    const o = opts || {};
+    const shots = [];
+    const notes = [];
+    // Where can an MCP tool write a file? If its OWN schema advertises a path argument,
+    // asking it to save the picture turns an "image blocks only" server into a file we can
+    // read back as TEXT - which works even on an agent build that drops image blocks.
+    // Nothing is guessed: only a string property whose name says path/file/filename.
+    const pathPropFor = (tool) => {
+      try {
+        const list = Array.isArray(A.toolList) ? A.toolList : [];
+        const t = list.find((x) => bareToolName(x && (x.name || x.id)) === tool);
+        const props = (t && t.inputSchema && t.inputSchema.properties) || {};
+        for (const k of Object.keys(props)) {
+          const spec = props[k] || {};
+          if (String(spec.type || "") !== "string") continue;
+          if (/^(save_?path|file_?path|output_?path|out_?path|filename|file|path)$/i.test(k)) return k;
+        }
+      } catch {}
+      return "";
+    };
+    const workspaceDir = () => {
+      const r = A.bridge && (A.bridge.local_root || A.bridge.workspace_root || A.bridge.root);
+      return String(r || "").replace(/[\\/]+$/, "");
+    };
+    const takeMcpAnswer = (r, label, tool) => {
+      if (r && r.ok && r.images && r.images.length) {
+        shots.push(...r.images);
+        // Say WHERE the picture came from: "image(s)" alone cannot tell the user whether it
+        // arrived as an MCP image block or was rescued from text.
+        notes.push(label + ": " + r.images.length + " image(s)" + (r.image_source ? " - " + r.image_source : ""));
+        return true;
+      }
+      if (r && !r.ok) notes.push(label + ": " + String(r.error || "failed").slice(0, 160));
+      else if (r && r.ok && r.image_error) notes.push(label + ": " + String(r.image_error).slice(0, 400));
+      // The MCP answered, reported nothing wrong, and handed over no picture. That is the
+      // OLD-AGENT signature (image blocks dropped before the extension can see them), and
+      // it must never read as "captured nothing" - name it, with the fix.
+      else if (r && r.ok && /screenshot|capture|shot/i.test(String(tool || "")))
+        notes.push(label + ": the " + tool + " call returned no image data - this or-agent.exe drops image blocks " +
+          "(rebuild it, or keep using the window route below, which reads the file back as text)");
+      return false;
+    };
+    const tryMcp = async (toolName, label) => {
+      try {
+        // connectWait: a screenshot is not worth a 20s wait for a socket that is not
+        // there. Short wait, so trying is always cheap and we never skip a route that
+        // would have worked (the status frame can predate the connection).
+        const r = await bg({ type: "call_tool", name: toolName, arguments: {}, timeout: 20000, connectWait: 3000 });
+        // The MCP demands the arguments its own schema declares required - for Studio's
+        // capture that is a capture_id AND the CONNECTED studio_id (an invented one is
+        // refused by name). The worker fills them, and this says so in plain words
+        // instead of leaving behind a parameter error the user cannot act on.
+        if (r && r.filled_args && r.filled_args.length) notes.push(label + ": filled the argument(s) the tool requires (" + r.filled_args.join(", ") + ") and sent them");
+        if (r && r.required_arg_missing) notes.push(label + ": the tool still insists on '" + r.required_arg_missing + "' after the value OR sent (its schema needs a real one here)");
+        if (r && r.studio_id_stale) notes.push(label + ": no Roblox Studio is connected to the MCP right now - the studio_id the server answers with has gone stale, so open Studio and take the picture again");
+        if (takeMcpAnswer(r, label, toolName)) return true;
+        // ONE bounded retry, and only when the tool's own schema offers a place to write
+        // the picture. This is the last chance for a server whose only answer is an image
+        // block on an agent build that drops them.
+        // The schema is what makes this retry honest, so FETCH the tool list if it is not
+        // in hand yet - skipping here would silently lose the only chance a
+        // text-blind server has of delivering its picture.
+        if (!(A.toolList && A.toolList.length)) { try { await ensureTools(true); } catch {} }
+        if (!workspaceDir()) { try { const st = await bg({ type: "status" }); if (st) A.bridge = Object.assign({}, A.bridge || {}, st); } catch {} }
+        const key = pathPropFor(toolName);
+        const dir = workspaceDir();
+        if (key && dir) {
+          const file = dir + "/or_mcp_shot.png";
+          notes.push(label + ": asked the MCP to save the picture to " + file + " (its schema lists " + key + ")");
+          const r2 = await bg({ type: "call_tool", name: toolName, arguments: { [key]: file }, timeout: 20000, connectWait: 3000 });
+          if (takeMcpAnswer(r2, label + " (saved file)", toolName)) return true;
+        } else if (r && r.ok) {
+          notes.push(label + ": the tool answered with text that named no picture");
+        }
+      } catch (e) {
+        notes.push(label + ": " + String((e && e.message) || e).slice(0, 160));
+      }
+      return false;
+    };
+    // `only` is the guard each user command carries: "studio" may photograph Roblox Studio
+    // and NOTHING else, "blender" may photograph Blender and nothing else, and an empty
+    // `only` (the overall ViewportScreenshot) takes whatever is best - Studio, then Blender,
+    // then the whole screen as its last resort. A command that names an app must never
+    // quietly hand back a picture of something else.
+    const only = String(o.only || "").toLowerCase();
+    const modeStudio = !only || only === "studio";
+    const modeBlend = !only || only === "blender";
+    const wantStudio = modeStudio && (only ? true : target === "auto" || target === "studio" || target === "roblox" || target === "viewport");
+    const wantBlend = modeBlend && (only ? true : target === "auto" || target === "blender" || target === "blender_window");
+    // The WINDOW route photographs Studio itself, so it belongs to the Studio command only:
+    // it still delivers a picture when the MCP hands the image over as data blocks an older
+    // agent drops, and the !shots.length gate keeps it a FALLBACK, never a replacement.
+    // Target "auto" IS here on purpose, and the ordering is what makes the overall command
+    // useful: Studio's own MCP first, then Blender, THEN this window route, and only then the
+    // whole screen. A desktop grab is the worst of the four, so it stays last.
+    const wantWindow = modeStudio && (only ? true : target === "auto" || target === "window" || target === "studio_window" ||
+      target === "studio" || target === "roblox" || target === "viewport");
+    // Whole-screen: the desktop itself, all monitors. No Studio window involved (it can
+    // even be closed), so it is not part of the Studio-window fallback below. Only the
+    // explicit whole-PC route asks for it directly; the overall command uses it LAST.
+    const wantScreen = !only && (target === "desktop" || target === "screen" || target === "pc" ||
+      target === "monitor" || target === "fullscreen" || target === "whole" || target === "os");
+    // The tab route is never chosen by a command: it photographs whatever page is in FRONT,
+    // which is not what any of the three commands promises. Tests reach it through _route.
+    const wantTab = !only && (target === "tab" || target === "chat" || target === "page" || target === "self");
+    // Which servers does the bridge say are alive? Attempting a tool on a server
+    // that is NOT there burns the whole timeout (the 11s stall the user saw) and
+    // then reports a generic failure - so check first and say what is missing.
+    const serverUp = (id) => {
+      try {
+        const list = (A.bridge && A.bridge.servers) || [];
+        if (!list.length) return null;              // unknown: try anyway
+        const srv = list.find((x) => x && x.id === id);
+        return srv ? srv.alive !== false : null;
+      } catch { return null; }
+    };
+    // Is ANY agent-side connection live? A status refresh runs every 5s, so this is
+    // normally known. If it is not known yet, ask ONCE (a local, ~ms round-trip)
+    // rather than burning a 20s bridge-connect wait on a screenshot request.
+    let bridgeUp = !!(A.bridge && (A.bridge.connected || A.bridge.local_connected || (Array.isArray(A.bridge.servers) && A.bridge.servers.length)));
+    // "Unknown" (no status yet) must TRY - a screenshot request is worth one attempt -
+    // but a state that definitely says nothing is connected should not sit through a
+    // bridge-connect wait first. Declared HERE, above every reader: a late declaration
+    // is the temporal-dead-zone crash this file already suffered once.
+    let definitelyDown = false;
+    // Refresh when our view is missing OR says "nothing is connected". The panel learns
+    // this from the worker's broadcasts, and a broadcast that has not arrived yet (worker
+    // just woke up, panel opened a moment ago) must not be allowed to skip Studio's own
+    // capture and hand the job to the window route. One local round-trip settles it.
+    if (!bridgeUp) {
+      try {
+        const st = await bg({ type: "status" });
+        if (st) { A.bridge = st; bridgeUp = !!(st.connected || st.local_connected || (Array.isArray(st.servers) && st.servers.length)); }
+      } catch {}
+    }
+    definitelyDown = !!A.bridge && !bridgeUp;
+    // Held back until we know nothing worked: the agent routes below can still
+    // succeed (a live local engine answers on its own socket even when the bridge
+    // frame says otherwise), and a stale "nothing is connected" note next to a
+    // good picture would be worse than no note.
+    const noConnNote = !definitelyDown ? "" : ("no local connection: or-agent.exe / the bridge is not connected, so no Studio or Blender capture can be taken" +
+      (A.bridge ? "" : " (bridge state unknown - the worker did not answer)") + " - start it with Start-OR-Agent.cmd, then retry");
+    const roster = Array.isArray(A.toolList) ? A.toolList : [];
+    const hasTool = (t) => !roster.length || roster.some((x) => bareToolName(x && (x.name || x.id)) === t);
+    const studioUp = serverUp("roblox") !== false && serverUp("studio") !== false;
+    // The whole desktop, every monitor, captured by studio_shot.ps1 -WholeScreen. Needs the
+    // agent (and PowerShell), but NOT Studio, not the MCP, and not any particular window in
+    // front. Used by the explicit whole-PC route AND as the overall command's last resort,
+    // which is why it is a function instead of an inline block.
+    const screenGrab = async (label) => {
+      try {
+        const r = await bg({ type: "studio_window_shot", whole_screen: true, max_width: o.maxWidth || 1600 });
+        if (r && r.ok && r.images && r.images.length) {
+          shots.push(...r.images);
+          notes.push(label + ": " + (r.text || "captured"));
+          return true;
+        }
+notes.push(label + ": " + String((r && r.error) || "capture failed").slice(0, 320) +
+          (r && r.hint ? " [" + String(r.hint).slice(0, 400) + "]" : ""));
+      } catch (e) {
+        notes.push(label + ": " + String((e && e.message) || e).slice(0, 200));
+      }
+      return false;
+    };
+    if (wantScreen) await screenGrab("whole screen");
+    if (wantStudio) {
+      // BLENDER PARITY, and the fix for "why does the window route win?":
+      // Blender is judged by the agent's OWN probe (A.bridge.blender) and then simply
+      // ASKED. Studio used to be skipped on cached snapshots (server list / tool list),
+      // so a stale or empty cache silently handed the job to the window route - even
+      // when Studio's own MCP could have taken the shot. Now Studio is asked whenever
+      // anything is connected, and the call's own failure is the answer. That keeps the
+      // capture inside Studio, independent of which window is in front.
+      const before = shots.length;
+      if (!bridgeUp) notes.push(noConnNote || "studio: nothing is connected to reach the Roblox MCP with - skipped the call (start the agent, then retry)");
+      else await tryMcp("screen_capture", "studio");
+      if (shots.length === before && !studioUp) notes.push("studio: the Roblox MCP is not alive right now (the bridge reports the roblox server down)");
+      else if (shots.length === before && !hasTool("screen_capture")) notes.push("studio: the MCP listed no screen_capture tool - if the picture still failed, run list_commands / restart_mcp");
+    }
+    if (wantBlend && !shots.length) {
+      // A.bridge.blender is set from the agent's own probe, so it already implies the
+      // agent is reachable; gating this on the aggregate bridge flag only added a way
+      // to skip a working Blender when that flag was stale.
+      if (A.bridge && A.bridge.blender) await tryMcp("get_viewport_screenshot", "blender");
+      else notes.push("blender: not connected - skipped (Connect Blender in the OR panel first)");
+    }
+    // OR's OWN MCP CLIENT - ZeroScript's method, and the one that survives an antivirus
+    // that blocks .ps1 files. A small Python program written into the workspace launches
+    // Roblox's signed StudioMCP.exe, speaks JSON-RPC to it, looks the CONNECTED studio id
+    // up and calls Studio's own capture tool; the picture is written to disk and read back
+    // as text, so nothing has to travel through the agent's image handling (no rebuild).
+    // It sits AFTER Blender and BEFORE the PowerShell window route: a broken .ps1 can no
+    // longer be the only thing standing between the user and a Studio picture.
+    if (wantStudio && !shots.length) {
+      try {
+        const r = await bg({ type: "studio_mcp_shot", max_width: o.maxWidth });
+        if (r && r.ok && r.images && r.images.length) {
+          shots.push(...r.images);
+          notes.push("studio (OR's own MCP client): " + String(r.text || "captured").slice(0, 240) +
+            (r.image_source ? " - " + String(r.image_source).slice(0, 160) : ""));
+        } else {
+          notes.push("studio (OR's own MCP client): " + String((r && r.error) || "capture failed").slice(0, 300) +
+            (r && r.hint ? " [" + String(r.hint).slice(0, 360) + "]" : ""));
+        }
+      } catch (e) {
+        notes.push("studio (OR's own MCP client): " + String((e && e.message) || e).slice(0, 200));
+      }
+    }
+
+    // OS-side fallback: photograph the Studio WINDOW itself (agent + PowerShell).
+    // Works while Studio is behind the browser, so it is a better fallback than a
+    // tab capture - and the only path that works when the picture must be of
+    // Studio rather than of this page.
+    if (wantWindow && !shots.length) {
+      try {
+        const r = await bg({ type: "studio_window_shot", focus: false, max_width: opts.maxWidth });
+        if (r && r.ok && r.images && r.images.length) {
+          shots.push(...r.images);
+          notes.push("studio window: " + (r.text || "captured"));
+        } else {
+          // The worker's `hint` carries the one thing the user cannot see for himself
+          // (the script produced NO result line, so security software, a group policy or
+          // a parse failure stopped it). Dropping it left a bare PowerShell wall.
+          notes.push("studio window: " + String((r && r.error) || "capture failed").slice(0, 300) +
+            (r && r.hint ? " [" + String(r.hint).slice(0, 400) + "]" : ""));
+        }
+      } catch (e) {
+        notes.push("studio window: " + String((e && e.message) || e).slice(0, 200));
+      }
+    }
+    // The overall command's LAST resort: the whole screen. Deliberately after Studio and
+    // Blender, so a running app is photographed properly instead of being one rectangle on
+    // a desktop grab.
+    if (!only && target === "auto" && !shots.length) await screenGrab("whole screen");
+    if (wantTab) {
+      // Chrome's tab capture photographs whatever is in FRONT, so say so BEFORE
+      // taking it - a shot of another tab is worse than no shot, because the
+      // model describes it as if it were the user's screen.
+      try {
+        const front = await bg({ type: "tab_front" });
+        if (front && front.ok && front.is_sender_tab === false) {
+          const what = front.title || front.url || "another tab";
+          notes.push("front tab is '" + String(what).slice(0, 80) + "', not this chat");
+          try { ui.toast("Capturing the tab in FRONT (" + String(what).slice(0, 40) + "), not this chat — bring this tab forward for a shot of the conversation.", 6000); } catch {}
+        }
+      } catch {}
+      try {
+        const r = await bg({ type: "capture_tab" });
+        if (r && r.ok && r.images && r.images.length) {
+          shots.push(...r.images);
+          // "this is the tab in FRONT, not this chat" - the model must not
+          // describe an unrelated screen as if it were Studio.
+          notes.push("tab: " + r.images.length + " image(s)" + (r.warning ? " - " + r.warning : ""));
+        } else if (r && !r.ok) notes.push("tab: " + String(r.error || "failed").slice(0, 320));
+      } catch (e) {
+        notes.push("tab: " + String((e && e.message) || e).slice(0, 160));
+      }
+    }
+    // Nothing worked: find out WHY in a way the model can act on. The single most
+    // common cause by far is an outdated or-agent.exe: it keeps only text blocks,
+    // so Studio's screenshot arrives as an empty string and every image path fails
+    // - including the file readback the Blender-style fallbacks depend on.
+    if (!shots.length) {
+      if (noConnNote) notes.push(noConnNote);
+      try {
+        const info = await bg({ type: "agent_info" });
+        if (info && info.has_base64 === false) {
+          const tunnel = info.has_read_file !== false && info.has_run_command !== false;
+          notes.push("AGENT IS ONE TOOL OLD: or-agent.exe lists " + info.tools + " tools and has no read_file_base64, so an MCP that answers with " +
+            "IMAGE BLOCKS has them dropped (a saved file path or inline base64 in the answer still comes through as text)" +
+            (tunnel
+              ? '. The WINDOW route still works without a rebuild: it writes the capture next to the agent and reads it back as base64 TEXT with read_file - and that route is picked automatically, because there is no window target to ask for. Rebuilding (cd agent && cargo build --release, copy target/release/or-agent.exe over the old one, restart it) only makes it faster and enables the MCP image path.'
+              : ", and this agent is too old to read the file back as text either (read_file/run_command missing), so rebuild it to get any screenshot."));
+        } else if (info && info.ok === false) {
+          notes.push("AGENT OFFLINE: or-agent.exe is not running (" + (info.reason || "no answer") + "), so the OS-side Studio window capture and file readback are unavailable.");
+        }
+      } catch {}
+    }
+    return { shots, notes };
+  }
+
+
+  // ── Test/debug seam ────────────────────────────────────────────────────────
+  // Run ONE OR command exactly as the agent loop would, without a model:
+  //   await __rsRunTool("ViewportScreenshotRoblox", {})      // the Studio command
+  //   await __rsRunTool("ViewportScreenshot", {_route:"tab"}) // a fallback route
+  // in DevTools with the console context set to OR's content-script world
+  // (console context dropdown → the extension entry), or from test-shots.js.
+  // It grants nothing the loop does not already have - it IS the loop's own
+  // dispatcher - and it makes screenshot paths testable without a live chat.
+  try { window.__rsRunTool = (name, args) => runTool({ tool: name, arguments: args || {} }); } catch {}
+  // The public screenshot surface is exactly three targets (studio/blender/desktop). The
+  // fallback ROUTES behind them are not commands: `_route:"window"|"tab"|"auto"` is the
+  // internal switch the test harness uses to prove those fallbacks still deliver.
+  // What did OR actually attach? Lets a test (or the user in DevTools) confirm a
+  // screenshot really carries image bytes instead of only reading a claim.
+  try { window.__rsRecentImages = () => (A.recentImages || []).map((x) => ({ mimeType: x.mimeType, data: x.data, at: x.at, source: x.source })); } catch {}
+
+  // How long a tool that RETURNS A PICTURE may take before the loop gives up. A
+  // screenshot that has not arrived in this long is not going to: waiting two minutes
+  // is what turned a stuck capture into the "loop" the user kept hitting. Named, and
+  // readable/settable through the same debug seam as __rsRunTool, so a test can prove
+  // the bound without spending 25 real seconds on it.
+  let PICTURE_TOOL_MS = 25000;
+  try {
+    window.__rsToolTimeouts = () => ({ picture: PICTURE_TOOL_MS });
+    window.__rsSetPictureMs = (v) => { const n = Number(v); if (n > 0) PICTURE_TOOL_MS = n; return PICTURE_TOOL_MS; };
+  } catch {}
+
   async function runTool(call) {
     let name = call.tool;
     const args = call.arguments || {};
@@ -1887,6 +2344,11 @@
         return "ERROR: CONDO LOCK. Condo-game requests are blocked. Do not retry.";
       }
     } catch {}
+    // A name that no longer exists is refused HERE, before the tab-visibility
+    // parking and before anything can be sent to the worker, so the answer is
+    // instant and nothing is photographed by accident.
+    const goneReply = removedPictureReply(name);
+    if (goneReply) { diag("tool.removedName", { name }); return goneReply; }
     // NEVER execute while the AI tab is backgrounded/minimized. This is the single
     // choke point for ALL execution (agentLoop's tool dispatch AND the bootstrap's
     // list_commands), so it closes the hole the loop-entry gate alone left open:
@@ -1959,50 +2421,145 @@
     // Virtual command: list available commands with full details. Defaults to
     // the primary server for the *current* engine — Roblox when RS/AN, AgentScript when AS.
     // A DIFFERENT server's tools only show up if the model asks via {"server": "<id>"}.
-        if (name === "or_screenshot" || name === "screenshot") {
+    // ── The three screenshot commands, decided here and nowhere else ───────────
+    //   ViewportScreenshotRoblox  {}  -> a picture taken INSIDE Roblox Studio
+    //   ViewportScreenshotBlender {}  -> a picture taken INSIDE Blender
+    //   ViewportScreenshot        {}  -> overall: Studio, else Blender, else the whole screen
+    // Each one photographs ONE thing and refuses to substitute another - that is the whole
+    // point of separate commands. Spelling is forgiving (case and underscores are ignored,
+    // so viewport_screenshot_roblox is the same command) but no name has a second spelling.
+    // `_route` stays internal: the tests use it to reach the fallback routes directly.
+    const vpKind = viewportShotKind(name);
+    if (vpKind) {
+      // Answer under the CANONICAL name whatever spelling was used, so the user and the
+      // model always see the same three command names.
+      const vpName = vpKind === "roblox" ? "ViewportScreenshotRoblox" : vpKind === "blender" ? "ViewportScreenshotBlender" : "ViewportScreenshot";
       if (!P.supportsVision) {
-        return "ERROR: this assistant cannot see images, so or_screenshot cannot send a shot back to you. Open a vision-capable chat (DeepSeek, Gemini, GLM, Qwen, Meta AI, Freebuff, Ox Alpha, Use AI) and call or_screenshot again.";
+        return "ERROR: this chat is image-blind, so " + vpName + " cannot send a shot back to you. DeepSeek's unified model CAN see images - this conversation is either pinned to the old text-only model or the image path is blocked.";
       }
-      const target = String(args.target || args.source || "auto").toLowerCase();
-      const shots = [];
-      const notes = [];
-      const tryMcp = async (toolName, label) => {
-        try {
-          const r = await bg({ type: "call_tool", name: toolName, arguments: args, timeout: 45000 });
-          if (r && r.ok && r.images && r.images.length) {
-            shots.push(...r.images);
-            notes.push(label + ": " + r.images.length + " image(s)");
-            return true;
-          }
-          if (r && !r.ok) notes.push(label + ": " + String(r.error || "failed").slice(0, 160));
-        } catch (e) {
-          notes.push(label + ": " + String(e && e.message || e).slice(0, 160));
-        }
-        return false;
-      };
-      const wantStudio = target === "auto" || target === "studio" || target === "roblox" || target === "viewport";
-      const wantBlend = target === "auto" || target === "blender";
-      const wantTab = target === "tab" || target === "chat" || target === "page" || target === "self";
-      if (wantStudio) await tryMcp("screen_capture", "studio");
-      if (wantBlend && !shots.length) await tryMcp("get_viewport_screenshot", "blender");
-      if (wantTab || (target === "auto" && !shots.length)) {
-        try {
-          const r = await bg({ type: "capture_tab" });
-          if (r && r.ok && r.images && r.images.length) {
-            shots.push(...r.images);
-            notes.push("tab: " + r.images.length + " image(s)");
-          } else if (r && !r.ok) notes.push("tab: " + String(r.error || "failed").slice(0, 160));
-        } catch (e) {
-          notes.push("tab: " + String(e && e.message || e).slice(0, 160));
-        }
-      }
+      const internalRoute = /^(window|tab|auto)$/.test(String(args._route || "")) ? String(args._route) : "";
+      // The guard each command carries: `only` is the ONE app it may photograph.
+      const only = internalRoute ? "" : (vpKind === "roblox" ? "studio" : vpKind === "blender" ? "blender" : "");
+      const target = internalRoute || (vpKind === "roblox" ? "studio" : vpKind === "blender" ? "blender" : "auto");
+      const { shots, notes } = await captureShots(target, { only, maxWidth: args.max_width });
       if (!shots.length) {
-        return "ERROR: or_screenshot captured nothing. " + (notes.join(" | ") || "Studio MCP screen_capture and tab capture both failed.") + " Connect Studio MCP or pass {\"target\":\"tab\"}.";
+        // Name the requirement instead of a generic failure: these commands are supposed to
+        // work only when their app is there, so "Studio is not running" must be the answer -
+        // never a picture of something else.
+        const need = vpKind === "roblox"
+          ? "Roblox Studio must be RUNNING to be photographed: the picture is taken inside Studio, and the Studio-window route is its own rescue. This command never photographs anything else - open Studio and retry, or use ViewportScreenshot {} for whatever is available."
+          : vpKind === "blender"
+            ? "Blender must be RUNNING and connected to be photographed (Menu → Connect Blender). This command never photographs anything else - connect Blender and retry, or use ViewportScreenshot {}."
+            : "Nothing could be photographed: Studio is not running, Blender is not connected, and the whole-screen grab failed too. Use a text command instead.";
+        return "ERROR: " + vpName + " captured nothing. " + (notes.join(" | ") || "no route answered") +
+          "\n" + need +
+          "\nAn out-of-date or-agent.exe drops image blocks, so an MCP capture arrives as text with no picture; the rescue route writes the PNG next to the agent and reads it back as text. Rebuild with: cd agent && cargo build --release." +
+          "\nRead the reasons above before retrying (do NOT retry blindly).";
       }
-      ui.showImages(shots, "or_screenshot");
+      rememberImages(shots, vpName + ":" + target);
+      ui.showImages(shots, vpName);
       A.pendingImages = shots;
+      // The clipboard is the ONE delivery route that cannot break: no site cooperation,
+      // no provider, no agent. Put the picture there too and say so, so that even if a
+      // chat site refuses the attachment the user presses Ctrl+V and has it anyway.
+      let copied = false;
+      try { copied = !!(await copyImageToClipboard(shots[0])).ok; } catch {}
       const caption = notes.join("; ") || (shots.length + " image(s) captured");
-      return "Output of 'or_screenshot':\n" + caption + "\n(The image is attached to THIS message — you can see it directly. Analyse it and continue.)";
+      return "Output of '" + vpName + "':\n" + caption +
+        "\n(The image is attached to THIS message — you can see it directly. Analyse it and continue.)" +
+        (copied ? "\nIt is also on your clipboard, so Ctrl+V drops it in by hand if a site ever refuses the attachment." : "");
+    }
+
+    // ── attach_feedback: copy / paste / RE-SEND a screenshot or file ────────
+    // Three jobs in one command, because they are the same image pipeline:
+    //   1. copy  - put the most recent capture on the system clipboard, so the
+    //              user can paste it into any app themselves;
+    //   2. paste - stage it in THIS chat's composer right now;
+    //   3. send  - carry it out with the next message (the tool result), which
+    //              is what "pasted in the AI and sent" means in practice.
+    // source:recent (default) re-uses the last capture, so a screenshot taken
+    // earlier in the conversation can be re-sent without re-taking it; pass
+    // path:"<workspace file>" to attach a file from disk instead.
+    if (name === "attach_feedback" || name === "attachfeedbackor" || name === "attach_feedback_or" || name === "attach_images" ||
+        name === "or_attach_feedback" || name === "attach_image" || name === "attach_screenshot" ||
+        name === "attach_last_screenshot" || name === "attach_recent_image" || name === "or_attach" ||
+        name === "attach_file" || name === "copy_screenshot" || name === "paste_screenshot") {
+      if (!P.supportsVision) {
+        return "ERROR: this chat is image-blind, so attaching one would be pointless. DeepSeek's unified model CAN see images - this conversation is either pinned to the old text-only Instant/Expert UI (start a NEW chat there) or you are on an image-blind model (ChatGPT, Ollama). Otherwise use Gemini, GLM, Qwen, Meta AI, Freebuff, Ox Alpha or Use AI.";
+      }
+      const wantPath = String(args.path || args.file || "").trim();
+      const idx = Math.max(0, Number(args.index) || 0);
+      const wantCopy = args.copy !== false && args.copy !== "false";
+      const wantSend = args.send !== false && args.send !== "false";
+      const wantPaste = wantSend ? args.paste === true : args.paste !== false; // "send" already implies the paste
+      let img = null;
+      let where = "";
+
+      if (wantPath) {
+        const r = await bg({ type: "local_read_base64", path: wantPath });
+        if (!r || !r.ok) {
+          return `ERROR: could not read '${wantPath}' to attach it: ${(r && r.error) || "unknown error"}. In Sandbox mode the path must be inside the AgentScript workspace; images work best, but any file type is accepted.`;
+        }
+        img = { mimeType: r.mimeType || "application/octet-stream", data: r.data };
+        where = r.path || wantPath;
+        rememberImages([img], "file:" + where);
+      } else {
+        const source = String(args.source || args.target || "recent").toLowerCase();
+        if (source && source !== "recent" && source !== "last") {
+          const { shots, notes } = await captureShots(source);
+          if (shots.length) { rememberImages(shots, "attach_feedback:" + source); where = "fresh " + source + " capture"; }
+          else if (!A.recentImages.length) {
+            return "ERROR: nothing to attach — the fresh capture failed (" + (notes.join(" | ") || "no image") + ") and no earlier capture is remembered.";
+          }
+          img = A.recentImages[0] || null;
+        } else {
+          img = A.recentImages[idx] || null;
+          where = "recent capture #" + (idx + 1);
+        }
+      }
+      if (!img || !img.data) {
+        return "ERROR: no image to attach yet. Take one first (ViewportScreenshotRoblox / ViewportScreenshotBlender / ViewportScreenshot), or pass a workspace file path.";
+      }
+      const ageS = img.at ? Math.max(0, Math.round((Date.now() - img.at) / 1000)) : null;
+      const sizeKb = kb(img.data);
+      const isImage = /^image\//.test(String(img.mimeType || ""));
+      const lines = [];
+
+      if (wantCopy && !isImage) {
+        lines.push("- Clipboard: skipped — only images can go on the clipboard; this is " + (img.mimeType || "a file") + " and was attached as-is.");
+      } else if (wantCopy) {
+        const c = await copyImageToClipboard(img);
+        lines.push(c.ok
+          ? "- Clipboard: COPIED (image/png) — the user can Ctrl+V it anywhere."
+          : `- Clipboard: NOT copied (${c.error}). The image is visible in OR's popup on the left; use its Copy button (a background copy needs the tab focused) or take a fresh shot with ViewportScreenshotRoblox / ViewportScreenshot.`);
+      }
+      if (wantSend) {
+        // The loop attaches pendingImages to the NEXT outgoing message, which is
+        // this tool's own result — i.e. it reaches the model in the same turn.
+        A.pendingImages = [img];
+        lines.push("- Composer: attached to THIS message (sending now, nothing to confirm).");
+      } else if (wantPaste) {
+        let staged = false;
+        try { staged = !!(await P.attachImages([img])); } catch (e) { staged = false; }
+        lines.push(staged
+          ? "- Composer: staged — the image is sitting in the chat input; the user just types and sends."
+          : "- Composer: could not stage the file automatically (this site refused the upload). The image is in OR's popup — the user can drag it in or paste it after Copy.");
+      } else {
+        lines.push("- Composer: not attached (send:false, paste:false).");
+      }
+      if (args.note) lines.push("- Note: " + String(args.note).slice(0, 300));
+      rememberImages([img], "attach_feedback");
+      // Same promise as the screenshot commands: the picture is on the clipboard as well, so the
+      // user is never stuck waiting on a site to accept it.
+      try { if (isImage) await copyImageToClipboard(img); } catch {}
+      // Only images get the picture popup; anything else would render as a
+      // broken <img>, so it is announced instead.
+      if (isImage) ui.showImages([img], "attach_feedback");
+      else try { ui.toast("Attached " + (img.mimeType || "file") + " to the message (" + sizeKb + " KB)", 5000); } catch {}
+      return "Output of 'attach_feedback':\n" +
+        `Attached 1 image (${img.mimeType || "image/png"}, ~${sizeKb} KB${ageS !== null ? ", captured " + ageS + "s ago" : ""}) from ${where || "the last capture"}.\n` +
+        lines.join("\n") +
+        "\n(The image is attached to THIS message — you can see it directly. Analyse it and continue.)";
     }
     if (name === "or_debug" || name === "debug_run" || name === "debug_console") {
       const code = [
@@ -2032,6 +2589,204 @@
       };
       const brief = briefs[role] || briefs.builder;
       return "Output of 'or_agent':\nROLE=" + role + "\n" + brief + "\nTASK: " + (task || "(continue the user's request)") + "\nReply as this agent only. ONE command.";
+    }
+    // ── attach_check: can OR put a picture (or a file) into THIS chat, right now? ──
+    // Answers "does this site accept attachments?" WITHOUT taking a screenshot: one tiny
+    // test picture goes through the provider's OWN upload path and is removed again.
+    // Nothing is typed and nothing is sent, so it is safe any time - and it turns "the
+    // picture never arrived" into a named reason instead of a guess.
+    if (/^(attach_check|attachment_check|attach_compat|attach_support|attach_test|provider_attach_check|attachment_support)$/.test(name)) {
+      const PROBE_PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8AAAwAB/AF+7E1mAAAAAElFTkSuQmCC";
+      const site = String((P && (P.displayName || P.id)) || "this site");
+      const fn = (f) => typeof (P && P[f]) === "function";
+      const json = { site: site, provider: String((P && P.id) || ""), attachImages: fn("attachImages"), clearAttachments: fn("clearAttachments") };
+      if (!fn("attachImages")) {
+        return "Output of 'attach_check':\nThis provider has NO attach path at all (attachImages is missing), so OR cannot put anything into the composer here.\n" +
+          "Pictures still appear in OR's popup (left side) with a Copy button, so they can be pasted by hand.\n" +
+          "OR_ATTACH_CHECK " + JSON.stringify(json);
+      }
+      const L = [];
+      let inputs = [];
+      try { inputs = Array.from(document.querySelectorAll('input[type="file"]')); } catch {}
+      const accepts = [];
+      let multiple = false;
+      inputs.forEach((i) => {
+        try {
+          const a = String(i.getAttribute("accept") || "").trim();
+          if (a) accepts.push(a);
+          if (i.multiple) multiple = true;
+        } catch {}
+      });
+      const acceptText = accepts.join(" ; ");
+      const docTokens = acceptText.split(/[,\s]+/).filter(Boolean).filter((t) => !/^image\//i.test(t) && t !== "*/*" && t !== "*");
+      const takesDocs = docTokens.length > 0;
+      json.accepts = accepts;
+      json.multiple = multiple;
+      json.files = takesDocs ? docTokens.slice(0, 8) : [];
+      let editor = null;
+      try { editor = P.getEditor ? P.getEditor() : null; } catch {}
+      const scope = (editor && editor.closest && editor.closest("form, div")) || document.body || document;
+      const countStaged = () => {
+        try { return scope.querySelectorAll('[class*="attach" i],[class*="preview" i],[class*="thumbnail" i],[class*="chip" i],[class*="file" i]').length; } catch { return 0; }
+      };
+      let textBefore = "";
+      try { textBefore = P.editorText ? String(P.editorText() || "") : ""; } catch {}
+      const before = countStaged();
+      let imgResult = null, imgErr = "";
+      try { imgResult = await P.attachImages([{ mimeType: "image/png", data: PROBE_PNG }]); }
+      catch (e) { imgErr = String((e && e.message) || e).slice(0, 160); }
+      const sawPreview = countStaged() > before;
+      const imagesOk = imgResult === true || sawPreview;
+      json.images = imagesOk;
+      let docResult = null;
+      if (takesDocs) {
+        try { docResult = await P.attachImages([{ mimeType: "text/plain", data: btoa("OR attachment probe - safe to ignore") }]); }
+        catch { docResult = false; }
+      }
+      json.documents = takesDocs ? (docResult === true || countStaged() > before) : false;
+      try { if (fn("clearAttachments")) await P.clearAttachments(); } catch {}
+      json.cleaned = countStaged() <= before;
+      let textAfter = "";
+      try { textAfter = P.editorText ? String(P.editorText() || "") : ""; } catch {}
+      json.textUntouched = textAfter === textBefore;
+
+      L.push("Attachment compatibility for " + site + (json.provider ? " (provider: " + json.provider + ")" : "") + ":");
+      L.push("Provider: " + (fn("attachImages") ? "attachImages OK" : "attachImages MISSING") + ", " +
+        (fn("clearAttachments") ? "clearAttachments OK" : "clearAttachments missing") + ", " +
+        (fn("ensureComposerReady") ? "ensureComposerReady OK" : "ensureComposerReady missing"));
+      L.push("Site picker: " + (inputs.length
+        ? inputs.length + " file input(s) - accepts: " + (acceptText || "(nothing declared)") + (multiple ? " (multiple files allowed)" : "")
+        : "no file input found - this site uploads by paste/drag only"));
+      L.push("Pictures: " + (imagesOk
+        ? "YES - a 1x1 test picture went through the site's own upload path" + (sawPreview ? " and a preview appeared" : " (the provider reported success)") + ", then it was removed again (nothing was sent)."
+        : "NO - " + (imgErr || "the site never showed a preview of the test picture") + ". OR now REFUSES to send a screenshot it cannot attach, so use the clipboard route: attach_feedback {copy:true} then Ctrl+V."));
+      L.push("Documents: " + (takesDocs
+        ? (json.documents ? "YES - " + docTokens.slice(0, 6).join(", ") + " (a .txt probe staged too)" : "the picker lists " + docTokens.slice(0, 6).join(", ") + ", but the .txt probe did not visibly stage - pictures are the safe bet")
+        : "the picker takes IMAGES only, so non-image files (pdf, txt...) will be refused by the site"));
+      L.push("Cleanup: " + (json.cleaned ? "composer left empty - no leftover probe" : "WARNING - something is still staged in the composer; remove it before sending") + (json.textUntouched ? "" : " (note: the composer text changed - check it)"));
+      if (P && P.supportsVision === false) L.push("Vision: this provider is marked as NOT seeing images - a picture would arrive but could not be read.");
+      L.push("Handy: shot_test {} proves capture + hand-over; agent_info {} names the agent build; or_report {} gathers everything for a bug report.");
+      L.push("Verdict: " + (imagesOk
+        ? "the screenshot commands and attach_feedback can deliver pictures in this chat."
+        : "attaching is broken here - captures still appear in OR's popup and on the clipboard, and nothing is sent pretending otherwise."));
+      const wantAll = args.all === true || args.matrix === true || args.providers === true || !imagesOk;
+      let matrix = [];
+      try { matrix = (RS && RS.PROVIDER_ATTACH_MATRIX) || []; } catch {}
+      if (wantAll && matrix.length) {
+        L.push("Other providers in this build (from each provider file, re-checked by the test suite):");
+        matrix.forEach((r) => {
+          const here = String(r.id) === String((P && P.id) || "");
+          L.push("    " + (here ? "-> " : "   ") + String(r.name || r.id).padEnd(12) + " images: " + (r.images ? "yes" : "NO ") + "   vision: " + (r.vision ? "yes" : "NO ") + (here ? "   (this page)" : ""));
+        });
+        L.push("    3 more files (chatgpt-cm, crax-net, qwen-net) are page taps, not chat providers, so they have no composer to attach to.");
+      }
+      L.push("OR_ATTACH_CHECK " + JSON.stringify(json));
+      try { ui.toast(imagesOk ? "Attachments work here (" + site + ")." : "Attachments do NOT work here - see the reply.", 6000); } catch {}
+      return "Output of 'attach_check':\n" + L.join("\n");
+    }
+    // ── or_report: the ONE thing to run when something is wrong ───────────────
+    // The user got tired of describing a bug a different way every time. This gathers
+    // everything a fix needs - build, engine, provider, vision, bridge, the agent build,
+    // attachment capability, the last capture, every captured page error and the tail of
+    // the diag trail - into one block they can paste unchanged.
+    if (/^(or_report|bug_report|or_bug_report|support_bundle|or_diagnostics|diagnostics|or_diag)$/.test(name)) {
+      const j = { at: new Date().toISOString() };
+      const L = ["OR diagnostic report - paste this WHOLE block, it has everything needed."];
+      const line = (k, v) => "- " + k + ": " + v;
+      let ver = "";
+      try { ver = String(chrome.runtime.getManifest().version); } catch {}
+      j.version = ver;
+      let eng = "";
+      try { eng = window.__rsEngine ? String(window.__rsEngine() || "") : ""; } catch {}
+      j.engine = eng;
+      j.provider = String((P && P.id) || "");
+      j.provider_name = String((P && P.displayName) || "");
+      j.vision = (P && P.supportsVision) !== false;
+      j.url = location.hostname + location.pathname;
+      L.push(line("Build", "OR " + (ver || "?") + " - engine: " + (j.engine || "?") + " - provider: " + (j.provider_name || j.provider || "?") + " - vision: " + (j.vision ? "yes" : "NO")));
+      L.push(line("Page", j.url));
+      const b = A.bridge || {};
+      j.bridge = { connected: !!b.connected, mcpAlive: !!b.mcpAlive, studio: !!b.studio, local_connected: !!b.local_connected, tools: Array.isArray(b.tools) ? b.tools.length : null, servers: (b.servers || []).map((x) => x.id + ":" + (x.alive ? "up" : "down")) };
+      L.push(line("Bridge", JSON.stringify(j.bridge)));
+      try {
+        const info = await bg({ type: "agent_info" });
+        j.agent = info ? { tools: info.tools, has_base64: info.has_base64, has_read_file: info.has_read_file, has_run_command: info.has_run_command, workspace: info.workspace_root } : null;
+        L.push(line("Agent", info && info.ok !== false
+          ? info.tools + " tools, read_file_base64: " + (info.has_base64 ? "yes (one-call hand-over)" : "MISSING (base64 text tunnel - screenshots still work)")
+          : "NOT RUNNING or did not answer"));
+      } catch (e) { L.push(line("Agent", "check failed: " + String((e && e.message) || e))); }
+      try {
+        let inputs = [];
+        try { inputs = Array.from(document.querySelectorAll('input[type="file"]')); } catch {}
+        const accepts = inputs.map((i) => String(i.getAttribute("accept") || "").trim()).filter(Boolean);
+        j.attach = { attachImages: typeof P.attachImages === "function", clearAttachments: typeof P.clearAttachments === "function", file_inputs: inputs.length, accepts: accepts };
+        L.push(line("Attachments", (j.attach.attachImages ? "attachImages present" : "attachImages MISSING") + ", file inputs: " + inputs.length + (accepts.length ? " (accepts " + accepts.join(" ; ") + ")" : "") + " - attach_check {} runs the live picture/document test"));
+      } catch (e) { L.push(line("Attachments", "check failed: " + String((e && e.message) || e))); }
+      try {
+        const img = (A.recentImages || [])[0];
+        j.last_capture = img ? { at: img.at, source: img.source, mime: img.mimeType, kb: Math.round(String(img.data || "").length * 3 / 4 / 1024) } : null;
+        L.push(line("Last capture", img ? (img.source || "capture") + ", " + (img.mimeType || "?") + ", ~" + j.last_capture.kb + " KB, " + Math.round((Date.now() - (img.at || Date.now())) / 1000) + "s ago" : "none in this page session"));
+      } catch {}
+      const all = (typeof _diag !== "undefined" && Array.isArray(_diag)) ? _diag : [];
+      const errs = all.filter((e) => /error|crash|reject|fail|blocked/i.test(String(e.event)) || (e.data && (e.data.err || e.data.error || e.data.msg))).slice(-12);
+      j.errors = errs.map((e) => ({ iso: e.iso, event: e.event, detail: String((e.data && (e.data.err || e.data.error || e.data.msg || "")) || "").slice(0, 200), at: String((e.data && e.data.at) || "").slice(0, 140) }));
+      L.push(line("Errors (" + errs.length + ")", errs.length ? "" : "none captured since this page loaded"));
+      errs.forEach((e) => {
+        const d = (e.data || {});
+        const what = String(d.err || d.error || d.msg || "").slice(0, 240);
+        const where = String(d.at || "").slice(0, 240);
+        L.push("    [" + e.iso + "] " + e.event + ": " + what + (d.line ? " (line " + d.line + ")" : "") + (where ? "\n          at " + where : ""));
+      });
+      const tail = all.slice(-14);
+      j.diag_tail = tail.map((e) => ({ iso: e.iso, event: e.event, data: e.data }));
+      L.push(line("Diag tail (" + tail.length + " of " + all.length + ")", ""));
+      tail.forEach((e) => L.push("    [" + e.iso + "] " + e.event + (e.data ? " " + JSON.stringify(e.data).slice(0, 140) : "")));
+      try { L.push(line("Running", "agent: " + !!A.running + ", stop: " + !!A.stop)); } catch {}
+      L.push("OR_REPORT " + JSON.stringify(j));
+      L.push("Tip: if the UI itself looks wrong, ViewportScreenshot {} shows me the screen.");
+      try { ui.toast("Report ready - copy the reply block.", 5000); } catch {}
+      return "Output of 'or_report':\n" + L.join("\n");
+    }
+    // ── shot_test: does the screenshot machinery work on THIS machine, right now?
+    // Runs before the user ever opens Studio: the capture script builds a tiny test
+    // picture, writes the base64 twin, and the extension pulls it back through the
+    // same hand-over a real screenshot uses and verifies the checksum. If this says
+    // OK, the screenshot machinery has everything it needs except an open Studio.
+    if (name === "shot_test") {
+      let r = null;
+      try { r = await bg({ type: "shot_test" }); } catch (e) { r = { ok: false, error: String((e && e.message) || e) }; }
+      if (r && r.ok) {
+        ui.toast("Screenshot machinery OK — the picture reached OR and passed its checksum.", 6000);
+        return "Output of 'shot_test':\n" + String(r.text || "OK") +
+          "\nNext: open Roblox Studio and call ViewportScreenshotRoblox {} - Studio only has to be open (no window, no focus).";
+      }
+      return "Output of 'shot_test':\nSCREENSHOT PATH BROKEN: " + String((r && r.error) || "the check did not answer") +
+        "\nSteps that DID pass: " + (((r && r.steps) || []).join("; ") || "none") +
+        "\nThis is a setup problem, not a Studio problem - the test needs no Studio window. Fix the reason above, then run shot_test again.";
+    }
+    // ── agent_info: "which or-agent.exe am I talking to, and can a screenshot
+    // really arrive?" One command that answers the question the screenshot errors
+    // dance around, WITHOUT taking a capture first.
+    if (name === "agent_info" || name === "or_agent_info" || name === "agent_status") {
+      let info = null;
+      try { info = await bg({ type: "agent_info" }); } catch (e) { info = { ok: false, reason: String((e && e.message) || e) }; }
+      if (!info || info.ok === false && info.tools == null) {
+        return "Output of 'agent_info':\nAGENT OFFLINE: " + ((info && info.reason) || "or-agent.exe did not answer") +
+          "\nStart it with Start-OR-Agent.cmd (or the exe in the repo root). Until then: no window capture, no file readback, and no Studio/Blender images - " +
+          "no screenshot command can work until that is fixed; the whole-screen grab needs the agent too.";
+      }
+      const tunnel = info.has_read_file !== false && info.has_run_command !== false;
+      const lines = [
+        "Output of 'agent_info':",
+        "or-agent.exe is RUNNING with " + info.tools + " tools" + (info.workspace_root ? " (workspace: " + info.workspace_root + ")" : "") + ".",
+        info.has_base64
+          ? "Picture hand-over: FAST PATH - read_file_base64 is present, so any capture file can be read back in ONE call (MCP screen_capture and the Studio-window capture both work)."
+          : (tunnel
+            ? "Picture hand-over: TEXT TUNNEL - read_file_base64 is missing (this is the build you have), so a capture is written next to the agent and read back as BASE64 TEXT in chunks. Screenshots DO work: call ViewportScreenshotRoblox {} and the no-MCP fallback writes the picture next to the agent and reads it back as BASE64 TEXT - this build just cannot use the MCP's own image blocks."
+            : "Picture hand-over: NONE - this agent has neither read_file_base64 nor read_file/run_command, so no screenshot can reach the browser. Rebuild: cd agent && cargo build --release, copy target/release/or-agent.exe over the old one, restart it."),
+        info.has_base64 ? "Rebuild not needed." : (tunnel ? "Rebuilding is optional - it only makes the hand-over faster and enables the MCP image path." : "Rebuilding is required."),
+      ];
+      return lines.join("\n");
     }
     if (name === "or_status" || name === "status") {
       let extra = false, plan = false, lvl = "default", wm = "balanced", perm = "sandbox", autoDbg = true, multi = false;
@@ -2137,18 +2892,25 @@
         const paramLines = [compact.length ?  `    ${compact.join(", ")}` : "", ...detailed].filter(Boolean).join("\n");
         // Tested usage note for the error-prone commands - kept full-length
         // (these are validated fixes for real bugs, not filler).
-        const note = RS.TOOL_NOTES[bareToolName(t.name)];
+        let note = RS.TOOL_NOTES[bareToolName(t.name)];
+        if (!note) {
+          // The three screenshot commands are written PascalCase; a model (or a roster) that
+          // echoes viewport_screenshot_roblox must still get the note for it.
+          const norm = (x) => String(x || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+          const k = Object.keys(RS.TOOL_NOTES).find((x) => norm(x) === norm(bareToolName(t.name)));
+          if (k) note = RS.TOOL_NOTES[k];
+        }
         const noteStr = note ?  `\n    ⚠ ${note}` : "";
         return `${t.name}: ${(t.description || "").split("\n")[0]}${paramLines ?  "\n" + paramLines : ""}${noteStr}`;
       });
       const animLines = requested === "roblox" ? RSAnim.describeCommands() : [];
       const skillLines = (requested === "roblox" && typeof RobloxScriptSkills !== "undefined") ? RobloxScriptSkills.describeCommands() : [];
       const agentLines = (requested === "local" && typeof AgentScriptSkills !== "undefined") ? AgentScriptSkills.describeCommands() : [];
-      const webLines = [`— OR Status: or_status {} — live engine, work mode, extra thinking, bridge, blender. Call this if you are unsure which mode you are in.`, `— Web Tools (bridge-level, no Studio needed): web_fetch {url?, query?, max_chars?} — fetch a URL, OR pass query to search the web then fetch the top result; web_search {query, limit?} — DuckDuckGo titles+URLs`, `— Screenshot: or_screenshot {target?: auto|studio|tab|blender} — take a screenshot of Studio, this chat tab, or Blender and attach it to your next message so you can see it. Aliases: screenshot, take_screenshot, send_screenshot.`, `— Debugger: or_debug {} — Studio LogService errors/warnings. Automatic Debugger (Settings) appends new errors after mutating commands.`, `— Multi-Agent: or_agent {role: planner|builder|reviewer|debugger, task?} — hand off to a specialist. Enable Multi-Agent in Settings.`, `— Developer Products: developer_product_create {name, price, description?, reward?} — create a real Roblox Developer Product on this published universe (sign into roblox.com in Chrome). developer_product_list {} lists them. Aliases: create_developer_product, create_dev_product.`];
+      const webLines = [`— OR Status: or_status {} — live engine, work mode, extra thinking, bridge, blender. Call this if you are unsure which mode you are in.`, `— Web Tools (bridge-level, no Studio needed): web_fetch {url?, query?, max_chars?} — fetch a URL, OR pass query to search the web then fetch the top result; web_search {query, limit?} — DuckDuckGo titles+URLs`, `— Attachment check: attach_check {} — does THIS chat site accept attachments? Stages a 1x1 test picture through the page's own upload path, reports whether pictures AND documents are accepted (from the file picker), removes it again and sends nothing. Aliases: attachment_check, attach_compat, attach_support, attach_test. `, `— Bug report: or_report {} — ONE command when anything is broken: build, engine, provider, bridge, agent build, attachments, the last capture, every captured page error (with function and line) and the diag tail, in one paste-ready block. Run this BEFORE asking the user to describe anything. Aliases: bug_report, support_bundle, or_diagnostics. `, `— Screenshot MACHINERY check (a diagnostic - it takes no picture of Studio): shot_test {} — proves the capture + hand-over works on this machine WITHOUT Studio being open (writes a test picture, reads it back, verifies the checksum). Run this first if a screenshot ever fails.`, `— Screenshot (Roblox Studio): ViewportScreenshotRoblox {} — a picture taken INSIDE Roblox Studio. Needs Studio RUNNING (its own MCP; the Studio-window route is its rescue) and never photographs anything else. The picture is attached to your next message.`, `— Screenshot (Blender): ViewportScreenshotBlender {} — a picture taken INSIDE Blender. Needs Blender RUNNING and connected (Menu → Connect Blender) and never photographs anything else.`, `— Screenshot (overall): ViewportScreenshot {} — Studio if it is running, else Blender, else the whole screen (all monitors). Use this when you simply need a picture of whatever is available. There is no or_screenshot / screenshot / take_screenshot / send_screenshot / screen_capture command - they do not exist, so never call them.`, `— Attach images: attach_feedback {index?, path?, source?, copy?, paste?, send?} — re-send the most recent screenshot (or any workspace file via path) as an attachment on this message and copy it to the clipboard so the user can paste it. Aliases: attachfeedbackor, attach_image, attach_images, attach_file, attach_screenshot, attach_last_screenshot, attach_recent_image, copy_screenshot, paste_screenshot.`, `— Agent check: agent_info {} — is or-agent.exe running, which build is it, and can a screenshot actually reach you (one-call file readback vs the base64 text tunnel vs nothing, plus the one thing to do about it). Aliases: or_agent_info, agent_status. `, `— Debugger: or_debug {} — Studio LogService errors/warnings. Automatic Debugger (Settings) appends new errors after mutating commands.`, `— Multi-Agent: or_agent {role: planner|builder|reviewer|debugger, task?} — hand off to a specialist. Enable Multi-Agent in Settings.`, `— Developer Products: developer_product_create {name, price, description?, reward?} — create a real Roblox Developer Product on this published universe (sign into roblox.com in Chrome). developer_product_list {} lists them. Aliases: create_developer_product, create_dev_product.`];
       const virtualCount = animLines.length + skillLines.length + agentLines.length + webLines.length;
       return `Output of '${name}':\n${requested} commands (${scoped.length}${virtualCount ?  ` + ${virtualCount} OR virtual tools` : ""}):\n\n${lines.join("\n\n")}${animLines.length ?  "\n\n" + animLines.join("\n\n") : ""}${skillLines.length ?  "\n\n" + skillLines.join("\n\n") : ""}${agentLines.length ?  "\n\n" + agentLines.join("\n\n") : ""}\n\n${webLines.join("\n")}`;
     }
-    // ── Virtual animation tools ──────────────────────────────────────────
+  // ── Virtual animation tools ──────────────────────────────────────────
     // Create/edit Roblox animation KEYFRAME DATA (KeyframeSequence/Keyframe/
     // Pose, per-bone transforms) via execute_luau + the RSAnim Luau library.
     // The catalogue above (list_commands) advertises them; the Roblox MCP
@@ -2227,12 +2989,22 @@
           return `ERROR: '${bareName}' returned an image, but this assistant cannot see images. Do NOT call it again.`;
         }
         if (r.images && r.images.length) {
+          rememberImages(r.images, name);
           ui.showImages(r.images, name);
           A.pendingImages = r.images;
           const caption = r.text && r.text.trim() ? r.text.trim() : `${r.images.length} image(s) captured.`;
           return `Output of '${name}':\n${caption}\n(The image is attached to THIS message - you can see it directly. Analyse it and continue.)`;
         }
-        const textOut = r.text && r.text.length ? r.text : "(tool returned an empty result)";
+        // An EMPTY tool result is almost always the bridge dropping something the
+        // server did return - an MCP image block (Studio/Blender captures) is the
+        // classic case, because it carries no "text" field. Say exactly that,
+        // instead of "(tool returned an empty result)", which invites a retry loop.
+        const textOut = (r.text && r.text.length)
+          ? r.text
+          : ("EMPTY RESULT from '" + bareName + "': the server returned no text" +
+             (/capture|screenshot|image|shot|screenshot/i.test(bareName)
+               ? " - it looks like an image-only answer. If this is a Studio/Blender capture, the running or-agent.exe is outdated: it keeps text blocks only, so the picture is discarded (rebuild it: cd agent && cargo build --release). Rebuild it to take the MCP image path; until then ViewportScreenshot {} still works (the whole-screen grab comes back as TEXT), or use a text command."
+               : " - the command may not exist on the connected server (check list_commands) or it returned nothing by design. Do NOT repeat it unchanged; try a different command."));
         const autoStudio = bareName === "blender_export_fbx" || bareName === "export_blender_fbx";
         if (autoStudio) {
           const imported = await runAssetBridgeImport({ source: "blender", asset: r.filepath || args.filepath || args.path || "scene", objects: args.objects, dest: args.dest, scale: args.scale });
@@ -2268,7 +3040,8 @@
         return last;
       }
     }
-    const timeout = name === "execute_luau" ? 20000 : 120000;
+    const isPictureTool = /screenshot|screen_capture|viewport|capture_frame/i.test(String(name || ""));
+    const timeout = isPictureTool ? PICTURE_TOOL_MS : (name === "execute_luau" ? 20000 : 120000);
     // Hard watchdog: even if the background worker never answers, the loop
     // gets a definitive result and continues.
     const hardCap = new Promise((res) =>
@@ -2324,6 +3097,7 @@
       if (r.images && r.images.length) {
         // Show the capture in a left-hand OR popup (from the in-memory
         // base64 - simple and reliable on every site; no DOM-embedded preview).
+        rememberImages(r.images, name);
         ui.showImages(r.images, name);
         // Do NOT attach the image here: submitAndGetBase/typeAndSend types the
         // feedback text into the editor LATER, and on providers whose editor is
@@ -2356,7 +3130,7 @@
     }
     if (r.kind === "disconnected") return RS.FEEDBACK.bridgeOffline;
     if (r.kind === "timeout") {
-      return `ERROR: tool '${name}' timed out after ${name === "execute_luau" ? 20 : 120}s.\n${r.error}\nTry a shorter/simpler call or check that Roblox Studio is open and responsive.`;
+      return `ERROR: tool '${name}' timed out after ${Math.round(timeout / 1000)}s.\n${r.error}\nTry a shorter/simpler call or check that Roblox Studio is open and responsive.`;
     }
     if (name === "execute_luau") {
       const err = r.error || "";
@@ -2487,6 +3261,11 @@
       return;
     }
     A.running = true;
+    // A NEW TURN resets the repeat guard: the user may have fixed whatever was
+    // wrong (rebuilt the agent, connected Blender, brought a tab forward), and
+    // blocking their retry would be wrong. The guard only stops the model from
+    // spinning inside ONE turn.
+    A.repeatGuard = { sig: "", count: 0, blocked: 0 };
     A.resumeArmed = false; // loop now owns the turn; drop the regenerate grace
     A.stop = false;
     A.stopping = false; // clean slate: never inherit a stale "Stopping…" from a
@@ -2680,7 +3459,42 @@
           rememberExecuted(res.item);
           diag("tool.start", { name: call.tool });
           try { ui.trackCard(call.tool, "run", "executing\u2026", category); } catch {}
-          let feedback = await runTool(call);
+          // ── Repeat guard ────────────────────────────────────────────────
+          // The model can get stuck re-issuing the same failing call (the live
+          // "the screenshot just loops" report: identical args, an error every
+          // time, a fresh 10-40s wait each round). Two identical calls are
+          // allowed (a transient bridge hiccup is real); the THIRD is refused
+          // outright with what to do instead, so the turn moves on.
+          let feedback;
+          {
+            const sig = String(call.tool) + "|" + JSON.stringify(call.arguments || {});
+            A.repeatGuard = A.repeatGuard || { sig: "", count: 0, blocked: 0 };
+            if (A.repeatGuard.sig === sig) A.repeatGuard.count++;
+            else { A.repeatGuard.sig = sig; A.repeatGuard.count = 1; }
+            if (A.repeatGuard.count >= 3) {
+              diag("tool.repeatBlocked", { name: call.tool, count: A.repeatGuard.count });
+              feedback = "ERROR: '" + call.tool + "' has now been called " + A.repeatGuard.count +
+                " times with IDENTICAL arguments and it failed every time. OR is refusing to run it again - repeating cannot change the outcome.\n" +
+                "What to do instead:\n" +
+                "- Change the arguments if you were guessing (a different target/name/path).\n" +
+                "- Fix the cause the earlier error named (read it again; it lists the exact reason per target).\n" +
+                "- Or stop using this command and get the information another way: inspect_instance, get_studio_state, script_analysis, or_debug, list_commands.\n" +
+                "- If it genuinely needs the user to act (rebuild or-agent.exe, connect Blender, bring a tab to the front), SAY that in one sentence and finish the turn instead of retrying.";
+            } else {
+              try { feedback = await runTool(call); }
+              catch (e) {
+                // An exception used to escape into the loop and lose the result
+                // entirely ("empty result" with nothing to act on).
+                diag("tool.throw", { name: call.tool, msg: String((e && e.message) || e).slice(0, 200) });
+                feedback = "ERROR: '" + call.tool + "' threw inside OR: " + String((e && e.message) || e).slice(0, 300) +
+                  "\nThis is an OR bug, not a Studio problem. Do not retry the same call; use a different command.";
+              }
+              if (!String(feedback == null ? "" : feedback).trim()) {
+                feedback = "EMPTY RESULT from '" + call.tool + "' (no text, no image). Do not repeat it unchanged - " +
+                  "the bridge or the MCP server answered with nothing. Try a different command or check list_commands.";
+              }
+            }
+          }
           // Persistent environment header (see asStateTag) — appended, never
           // prefixed, so feedbackIsError()'s startsWith("ERROR") stays intact.
           { const _tag = asStateTag(); if (_tag && !feedback.includes("[SYSTEM_STATE:")) feedback += "\n" + _tag; }
@@ -4991,7 +5805,10 @@
           // so the flow would silently build from nothing.
           const st = menuEl.querySelector("#rs-i2m-status");
           if (st) { st.textContent = "This site can't read images"; setTimeout(() => { st.textContent = ""; }, 2600); }
-          toast("This chat can't see images — open DeepSeek, Gemini, Kimi, GLM, Qwen, or Meta.");
+          // Names the REASON, not a removed UI: DeepSeek's unified model sees
+          // images everywhere, so a refusal there means this conversation is one
+          // of the old text-only ones (or the model genuinely has no vision).
+          toast("This chat is image-blind — on DeepSeek start a NEW chat; otherwise try Gemini, GLM, Qwen, Meta, Kimi or Freebuff.");
           return;
         }
         const tpl = RS.buildImageToModelPrompt("", activeEngine());
@@ -6054,7 +6871,18 @@ function renderCards(panel) {
     //  • session active   → live dot, "Agent active · N tools" (no action)
     //  • fresh blank chat → "Standby…" (or a bridge/Studio warning), action = Start
     //  • existing chat    → "No agent in this chat" (informs only, no action)
+    // renderBar touches a dozen nodes and runs on every status tick. A page missing one
+    // of them (or a Chrome change that drops a node) used to take the whole status update
+    // down with "Cannot read properties of null (reading 'classList')" - the error the
+    // user pasted from renderBar -> setStatus. The work keeps its own name for the tests;
+    // this wrapper records the failure instead of throwing it at the console.
     function renderBar() {
+      try { renderBarUnsafe(); }
+      catch (e) {
+        try { diag("renderBar.crash", { err: String((e && e.message) || e), at: String((e && e.stack) || "").split("\n")[1] || "" }); } catch {}
+      }
+    }
+    function renderBarUnsafe() {
       if (!bar) return;
       // Persona badge: only visible when a specialist persona is active.
       
@@ -7160,6 +7988,33 @@ function renderCards(panel) {
         body.appendChild(el);
       }
       wrap.appendChild(body);
+      // Manual fallbacks for attach_feedback: copying to the system clipboard
+      // needs a user gesture on some builds, and pasting into the composer by
+      // hand is the escape hatch when a site refuses the synthetic upload.
+      const bar = document.createElement("div");
+      bar.className = "rs-shot-bar";
+      const mk = (label, title, fn) => {
+        const b = document.createElement("button");
+        b.className = "rs-shot-btn";
+        b.type = "button";
+        b.textContent = label;
+        b.title = title;
+        b.addEventListener("click", fn);
+        return b;
+      };
+      bar.appendChild(mk("Copy", "Copy to the system clipboard (guaranteed by the click gesture)", async (e) => {
+        e.target.textContent = "…";
+        const r = await copyImageToClipboard(images[0]);
+        e.target.textContent = r.ok ? "Copied ✓" : "Copy ✗";
+        e.target.title = r.ok ? "Paste it anywhere with Ctrl+V" : r.error;
+        if (r.ok) ui.toast("Screenshot copied — paste it into the AI chat with Ctrl+V", 6000);
+      }));
+      bar.appendChild(mk("Use as feedback", "Attach this shot to the next message OR sends to the AI", () => {
+        A.pendingImages = images.slice();
+        rememberImages(images, "popup");
+        ui.toast("Latest capture will be attached to the next message.", 4000);
+      }));
+      wrap.appendChild(bar);
       root.appendChild(wrap);
     }
 

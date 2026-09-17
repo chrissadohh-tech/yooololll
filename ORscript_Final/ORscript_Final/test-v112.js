@@ -68,9 +68,16 @@ ok("manifest at 1.12.0 or newer", maj12 > 1 || min12 >= 12);
 
 // ── DeepSeek 2026 UI ────────────────────────────────────────────────────────
 ok("deepseek send button has fallbacks", dsSrc.includes("getSendBtn") && dsSrc.includes("contenteditable"));
-ok("deepseek start does not require Expert radios", dsSrc.includes("!state.expertFound && !state.visionFound"));
+// 2026-09: DeepSeek unified Instant/Expert/Vision into one model and deleted the
+// picker. Start is model-tab agnostic (readiness is the EDITOR, never a radio), a
+// legacy user-chosen Vision tab is still respected, and when no picker exists the
+// session starts without waiting for one.
+ok("deepseek start does not require Expert radios",
+  dsSrc.includes("const ready = !!getEditor()") && !/ready\s*=\s*[^;]*expertFound/.test(dsSrc));
+ok("deepseek start respects a legacy user-chosen Vision tab", dsSrc.includes("if (!isVisionSelected())") && dsSrc.includes("const isVisionSelected ="));
+ok("deepseek start does not wait for a deleted picker", dsSrc.includes("const legacyPicker"));
 ok("deepseek user detect survives hashed-class churn", dsSrc.includes("data-message-author-role") && dsSrc.includes("leftGap"));
-ok("deepseek stamps 2026-09 UI beacon", dsSrc.includes("2026-09_new-ui"));
+ok("deepseek stamps 2026-09 UI beacon", /2026-09_(new-ui|unified-model)/.test(dsSrc));
 
 // ── v1.12.1 hotfix: the "site crashes after starting agent" freeze ──────────
 // (v1.12.2 removed the worker entirely - the degrade assertions became moot.)

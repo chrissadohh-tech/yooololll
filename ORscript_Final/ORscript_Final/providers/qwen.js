@@ -661,7 +661,18 @@ const RSProvider = (() => {
       // site's binding between the pending upload and the message being sent).
       // Guard: submitAndGetBase RETRIES typeAndSend up to 4x; only attach if
       // nothing is staged yet, else each retry pastes ANOTHER duplicate copy.
-      if (images && images.length && !hasPendingAttachment()) { try { await attachImages(images); } catch {} }
+      if (images && images.length && !hasPendingAttachment()) {
+        // The picture IS the point of this message. Sending the text alone would tell the
+        // model to look at an image it cannot see, so stop rather than pretend - the caller's
+        // "message was not sent" path reports it, and the user can retry or paste manually.
+        let orAttached = false;
+        for (let orTry = 0; orTry < 2 && !orAttached; orTry++) {
+          try { orAttached = (await attachImages(images)) !== false; } catch { orAttached = false; }
+        }
+        if (!orAttached) {
+          throw new Error("OR_IMAGE_ATTACH_FAILED: the screenshot did not reach this chat's composer, so nothing was sent (the picture IS the message). Retry, or use attach_feedback {action:\"copy\"} and paste it with Ctrl+V.");
+        }
+      }
       await waitFor(() => !!sendButton(), 2000);
       const btn = sendButton();
       if (btn) { btn.click(); return; }
@@ -872,8 +883,10 @@ const RSProvider = (() => {
   // vision capabilities)." The catch: the description is in the DOM only while the
   // dropdown is OPEN - collapsed, only the model NAME (`.model-selector-text`)
   // shows. So we scan every open dropdown, cache name→capability (persisted to
-  // localStorage so it survives reloads), seed the models already confirmed, and
-  // DEFAULT-DENY any model we have never seen a description for.
+  // localStorage so it survives reloads) and seed the models already confirmed.
+  // Anything we have NO data for (unknown model, or an unreadable selector) is
+  // ALLOWED - see currentModelSupportsVision for why deny-by-default was the
+  // same trap DeepSeek's removed model picker sprang on us.
   const MODEL_VIS_LS = "rsQwenModelVision2"; // bumped: old key may hold a stale Max-Preview=false
   const modelVis = new Map([
     // Seed. Some of these are USER-CONFIRMED, not derivable from the description:
@@ -936,11 +949,32 @@ const RSProvider = (() => {
       diag("model.caps", { current: currentModelName(), known: modelVis.size });
     }
   }
+  // Last DEFINITE answer, used when the selector cannot be read at all.
+  let _modelVisionLatch = true;
+  let _unreadableLogged = false;
+  let _unknownLogged = "";
   function currentModelSupportsVision() {
     const nm = currentModelName();
-    if (!nm) return false;                 // selector unreadable → conservative
-    if (modelVis.has(nm)) return !!modelVis.get(nm);
-    return false;                          // unseen model → deny until confirmed
+    if (!nm) {
+      // MARKUP CHURN MUST NOT MEAN "TEXT-ONLY". The selector class is a hashed
+      // Qwen build artefact: when it changes (or Qwen unifies its picker the way
+      // DeepSeek did in 2026-09), the old `return false` here reported every chat
+      // as image-blind - which blocks screen_capture / attach_feedback with a
+      // confusing "this chat is image-blind" AND drops the tools from the roster,
+      // on multimodal models that read images perfectly. Keep the last definite
+      // answer, else assume YES: a wrong yes costs one attach the model ignores,
+      // a wrong no kills the whole image feature. Logged once per state change.
+      if (!_unreadableLogged) { _unreadableLogged = true; diag("model.selector_unreadable", { assume: _modelVisionLatch }); }
+      return _modelVisionLatch;
+    }
+    _unreadableLogged = false;
+    if (modelVis.has(nm)) { _modelVisionLatch = !!modelVis.get(nm); return _modelVisionLatch; }
+    // A model we have never seen described: allow, so a newly shipped Qwen model
+    // is not blocked on the day it appears. Opening the selector teaches the real
+    // answer (scanModelCaps) and a text-only model flips to false from then on -
+    // the models we KNOW are text-only are still denied (seed + persisted cache).
+    if (_unknownLogged !== nm) { _unknownLogged = nm; diag("model.unknown_allow", { model: nm }); }
+    return true;
   }
   let _modelCapObs = null;
   function startModelCapWatch() {

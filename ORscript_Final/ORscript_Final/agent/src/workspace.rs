@@ -413,6 +413,73 @@ pub async fn tool_read_file(ws: &Workspace, args: &serde_json::Value) -> Result<
     Ok(clip(&format!("{header}\n{}{footer}", chunk.join("\n")), MAX_TEXT_CHARS))
 }
 
+// ── binary → base64 (for images that must reach the browser) ───────────────
+// The Roblox/Blender MCP servers write their captures to DISK (a PNG path),
+// and a Chrome extension cannot read a local path - the only channel is the
+// bridge. So this returns the bytes as base64 (hand-rolled: the crate has no
+// base64 dependency, and adding one would churn Cargo.lock for 25 lines).
+// SECURITY NOTE: 4/3 expansion - the cap is deliberately much tighter than
+// MAX_READ_BYTES so a big file cannot wedge the websocket.
+pub const MAX_B64_BYTES: u64 = 12 * 1024 * 1024;
+
+const B64_ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+fn base64_encode(data: &[u8]) -> String {
+    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(B64_ALPHABET[((n >> 18) & 0x3f) as usize] as char);
+        out.push(B64_ALPHABET[((n >> 12) & 0x3f) as usize] as char);
+        out.push(if chunk.len() > 1 { B64_ALPHABET[((n >> 6) & 0x3f) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { B64_ALPHABET[(n & 0x3f) as usize] as char } else { '=' });
+    }
+    out
+}
+
+/// Content type for the image/asset extensions the bridge can hand back.
+fn mime_for(path: &Path) -> &'static str {
+    match path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase().as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        "bmp" => "image/bmp",
+        "svg" => "image/svg+xml",
+        "pdf" => "application/pdf",
+        "json" => "application/json",
+        "txt" | "md" | "log" => "text/plain",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Read ANY file (text or binary) as base64 + mime. Used by the extension to
+/// turn a screenshot written by Studio/Blender into an attachment it can put
+/// in the chat composer, and to push a workspace file into the AI as an
+/// attachment (OR's attach_feedback / or_attach).
+pub async fn tool_read_file_base64(ws: &Workspace, args: &serde_json::Value) -> Result<String, String> {
+    let p = ws.resolve_path(arg_str(args, "path")?.as_str(), true)?;
+    require_file(ws, &p)?;
+    let size = tokio::fs::metadata(&p).await.map_err(|e| e.to_string())?.len();
+    if size > MAX_B64_BYTES {
+        return Err(format!(
+            "'{}' is {} - too large to attach (base64 limit {}, the wire format inflates it by ~33%).",
+            ws.display(&p), human_size(size as f64), human_size(MAX_B64_BYTES as f64)
+        ));
+    }
+    let data = tokio::fs::read(&p).await.map_err(|e| e.to_string())?;
+    let mime = mime_for(&p);
+    let payload = serde_json::json!({
+        "path": ws.display(&p),
+        "mimeType": mime,
+        "bytes": data.len(),
+        "data": base64_encode(&data),
+    });
+    Ok(payload.to_string())
+}
+
 pub async fn tool_write_file(ws: &Workspace, args: &serde_json::Value) -> Result<String, String> {
     let rel = arg_str(args, "path")?;
     let content = args.get("content").ok_or("'content' is required (use \"\" for an empty file)")?
@@ -890,6 +957,7 @@ pub async fn dispatch(ws: &Workspace, name: &str, args: serde_json::Value) -> Re
         "list_directory" => tool_list_directory(ws, a).await,
         "tree" => tool_tree(ws, a).await,
         "read_file" => tool_read_file(ws, a).await,
+        "read_file_base64" => tool_read_file_base64(ws, a).await,
         "write_file" => tool_write_file(ws, a).await,
         "edit_file" => tool_edit_file(ws, a).await,
         "create_folder" => tool_create_folder(ws, a).await,
@@ -906,8 +974,9 @@ pub async fn dispatch(ws: &Workspace, name: &str, args: serde_json::Value) -> Re
         "download_file" => tool_download_file(ws, a).await,
         other => Err(format!(
             "unknown tool '{other}'. Available AgentScript tools: workspace_info, list_directory, tree, \
-read_file, write_file, edit_file, create_folder, delete_path, move_path, search_files, grep_files, \
+read_file, read_file_base64, write_file, edit_file, create_folder, delete_path, move_path, search_files, grep_files, \
 run_command, file_info, env_info, process_list, process_kill (FULL mode), open_path, download_file. \
+Read any file as base64 (attachments/images) with read_file_base64 {{path}}. \
 Call list_commands for full parameter details."
         )),
     }
@@ -926,6 +995,7 @@ pub fn catalog() -> Vec<serde_json::Value> {
         serde_json::json!({"name": "tree", "description": "Recursive directory tree. Generated folders (.git, node_modules, __pycache__, dist...) are skipped.", "inputSchema": schema(serde_json::json!({"path": {"type": "string"}, "depth": {"type": "integer"}}), &[])}),
         serde_json::json!({"name": "read_file", "description": "Read a text file. Returns numbered lines as 'LINE | content'. Always read before editing so your old_string matches byte-for-byte.", "inputSchema": schema(serde_json::json!({"path": {"type": "string"}, "offset": {"type": "integer"}, "limit": {"type": "integer"}}), &["path"])}),
         serde_json::json!({"name": "write_file", "description": "Create a file or OVERWRITE an existing one with complete new content. Parent folders are created automatically. Prefer edit_file for partial changes.", "inputSchema": schema(serde_json::json!({"path": {"type": "string"}, "content": {"type": "string"}}), &["path", "content"])}),
+        serde_json::json!({"name": "read_file_base64", "description": "Read ANY file (text or binary) as base64 + mimeType. The way to hand an image or a screenshot file to the AI as an attachment. Returns {path, mimeType, bytes, data}.", "inputSchema": schema(serde_json::json!({"path": {"type": "string"}}), &["path"])}),
         serde_json::json!({"name": "edit_file", "description": "Exact-match string replacement inside a file. Replaces the FIRST match, or every match with replace_all:true. Fails loudly when old_string is missing or ambiguous.", "inputSchema": schema(serde_json::json!({"path": {"type": "string"}, "old_string": {"type": "string"}, "new_string": {"type": "string"}, "replace_all": {"type": "boolean"}}), &["path", "old_string", "new_string"])}),
         serde_json::json!({"name": "create_folder", "description": "Create a folder (and missing parents).", "inputSchema": schema(serde_json::json!({"path": {"type": "string"}}), &["path"])}),
         serde_json::json!({"name": "delete_path", "description": "Permanently DELETE a file or folder (folders recursive). Confirm scope with the user before deleting anything broad.", "inputSchema": schema(serde_json::json!({"path": {"type": "string"}}), &["path"])}),
@@ -1047,6 +1117,33 @@ mod tests {
         // unknown tools self-correct instead of dead-ending the model
         let u = dispatch(&ws, "nope_not_real", serde_json::json!({})).await.unwrap_err();
         assert!(u.contains("Available AgentScript tools") && u.contains("list_commands"), "{u}");
+        let _ = std::fs::remove_dir_all(&ws.canon_root);
+    }
+
+    #[tokio::test]
+    async fn base64_read_encodes_binary_files() {
+        let ws = temp_ws("b64");
+        // A real (tiny) PNG signature + a non-UTF8 byte: this is exactly the
+        // shape read_file refuses ("looks like a BINARY file") and that the
+        // screenshot path has to survive.
+        let png: Vec<u8> = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0xFF, 0x7F];
+        tokio::fs::write(ws.canon_root.join("shot.png"), &png).await.unwrap();
+        let out = tool_read_file_base64(&ws, &serde_json::json!({"path": "shot.png"})).await.unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["mimeType"], "image/png");
+        assert_eq!(v["bytes"].as_u64().unwrap(), png.len() as u64);
+        assert_eq!(v["data"], base64_encode(&png));
+        // RFC 4648 vectors: padding + remaining-byte cases must be exact.
+        assert_eq!(base64_encode(b"Man"), "TWFu");
+        assert_eq!(base64_encode(b"Ma"), "TWE=");
+        assert_eq!(base64_encode(b"M"), "TQ==");
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(&[0xFF, 0xFE, 0xFD, 0xFC]), "//79/A==");
+        // A folder is rejected, and a missing file says so.
+        assert!(tool_read_file_base64(&ws, &serde_json::json!({"path": "nope.png"})).await.is_err());
+        // The unknown-tool hint advertises the new tool so a model can recover.
+        let u = dispatch(&ws, "nope_not_real", serde_json::json!({})).await.unwrap_err();
+        assert!(u.contains("read_file_base64"), "{u}");
         let _ = std::fs::remove_dir_all(&ws.canon_root);
     }
 

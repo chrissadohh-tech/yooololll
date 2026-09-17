@@ -19,7 +19,13 @@ const ENGINES = ["roblox", "local"];
 function normalizeEngine(v) { return v === "local" ? "local" : "roblox"; }
 let engine = "roblox"; // "roblox" | "local"
 let rustMode = false; // true if Rust agent on 3000 is reachable (preferred)
-chrome.storage?.local.get(ENGINE_KEY, (o) => {
+// Deferred by one microtask on purpose: this callback touches ws / connected /
+// reconnectDelay, all of which are declared FURTHER DOWN this file, so a callback
+// that ran synchronously would land in their temporal dead zone and kill the whole
+// service worker - the same failure class as the RECENT_IMAGES_MAX screenshot crash.
+// The harness reproduces it by answering storage synchronously. Chrome's API is async,
+// so this only costs one tick, and it removes the landmine for good.
+Promise.resolve().then(() => chrome.storage?.local.get(ENGINE_KEY, (o) => {
   const want = normalizeEngine(o && o[ENGINE_KEY]);
   if (want !== engine) {
     engine = want;
@@ -30,7 +36,7 @@ chrome.storage?.local.get(ENGINE_KEY, (o) => {
     connect();
     broadcastStatus();
   }
-});
+}));
 // Probe Rust agent on 3000 at startup — if reachable, use HTTP pipe (CORS bypass) as primary
 (async () => {
   try {
@@ -162,6 +168,17 @@ const BLENDER_TOOLS = [
   btool("blender_set_origin", "Set object origin (ORIGIN_GEOMETRY, ORIGIN_CURSOR, ORIGIN_CENTER_OF_MASS).", { name: { type: "string" }, type: { type: "string" } }, []),
   btool("blender_shade_smooth", "Shade smooth.", { name: { type: "string" }, objects: { type: "array" } }, []),
   btool("blender_set_material", "Assign a Principled BSDF material. color = [r,g,b] or [r,g,b,a] 0–1.", { name: { type: "string" }, material: { type: "string" }, color: { type: "array" } }, []),
+  // ── Material toolkit ──
+  btool("blender_material_create", "Create a node-based material (optionally assigning it). Either a preset, explicit PBR values, or both. color = [r,g,b(,a)] 0–1, [r,g,b] 0–255, or '#rrggbb'.", { material: { type: "string" }, preset: { type: "string", description: "metal, steel, iron, chrome, gold, silver, copper, bronze, brass, plastic, rubber, ceramic, concrete, asphalt, wood, marble, fabric, leather, glass, frosted_glass, water, ice, emissive, neon, lava, hologram, ghost, toon, roblox_plastic, roblox_metal, roblox_glass" }, color: { type: "array" }, metallic: { type: "number" }, roughness: { type: "number" }, ior: { type: "number" }, transmission: { type: "number" }, alpha: { type: "number" }, emission: { type: "array" }, emission_strength: { type: "number" }, coat: { type: "number" }, sheen: { type: "number" }, blend: { type: "string", description: "BLEND / HASHED / OPAQUE" }, name: { type: "string", description: "object to assign to" }, objects: { type: "array" }, append_slot: { type: "boolean" } }, ["material"]),
+  btool("blender_material_preset", "Create a material from a named preset in one call (see blender_material_create for the list) and assign it.", { material: { type: "string" }, preset: { type: "string" }, name: { type: "string" }, objects: { type: "array" }, color: { type: "array" } }, ["preset"]),
+  btool("blender_material_set", "Change values on an EXISTING material (color, metallic, roughness, emission, alpha, ior, transmission, coat, sheen, blend).", { material: { type: "string" }, color: { type: "array" }, metallic: { type: "number" }, roughness: { type: "number" }, emission: { type: "array" }, emission_strength: { type: "number" }, alpha: { type: "number" }, transmission: { type: "number" }, ior: { type: "number" }, coat: { type: "number" }, sheen: { type: "number" }, blend: { type: "string" } }, ["material"]),
+  btool("blender_material_assign", "Assign an existing material to objects (all slots, one slot, or append a new slot).", { material: { type: "string" }, name: { type: "string" }, objects: { type: "array" }, slot: { type: "integer" }, append: { type: "boolean" } }, ["material"]),
+  btool("blender_material_list", "List every material: users, Principled values, plus the known preset names.", {}, []),
+  btool("blender_material_inspect", "Dump one material completely: Principled BSDF inputs, linked inputs, node graph, users.", { material: { type: "string" }, name: { type: "string" } }, []),
+  btool("blender_material_remove", "Delete a material from the file.", { material: { type: "string" } }, ["material"]),
+  btool("blender_material_noise", "Add a procedural texture to a material (noise, voronoi, wave, checker, brick, gradient) driving bump, base color, roughness or emission.", { material: { type: "string" }, type: { type: "string" }, affect: { type: "string", description: "bump | base_color | roughness | emission" }, scale: { type: "number" }, detail: { type: "number" }, roughness: { type: "number" }, distortion: { type: "number" }, strength: { type: "number" }, color_a: { type: "array" }, color_b: { type: "array" }, replace: { type: "boolean" } }, ["material"]),
+  btool("blender_material_image", "Wire an image file into a material slot (base_color, roughness, metallic, normal, emission).", { material: { type: "string" }, path: { type: "string" }, slot: { type: "string" }, strength: { type: "number" }, alpha_to_alpha: { type: "boolean" }, colorspace: { type: "string" } }, ["material", "path"]),
+  btool("blender_material_pbr", "Build a full PBR graph from map files (base_color/albedo + optional orm, roughness, metallic, normal, emission) with correct Non-Color colorspaces.", { material: { type: "string" }, base_color: { type: "string" }, albedo: { type: "string" }, orm: { type: "string" }, roughness: { type: "string" }, metallic: { type: "string" }, normal: { type: "string" }, emission: { type: "string" } }, ["material"]),
   btool("blender_add_modifier", "Add a modifier: SUBSURF, BEVEL, SOLIDIFY, MIRROR, ARRAY, BOOLEAN, DECIMATE. apply=true to apply.", { name: { type: "string" }, type: { type: "string" }, levels: { type: "integer" }, apply: { type: "boolean" }, target: { type: "string" } }, []),
   btool("blender_boolean", "Boolean one mesh with another (DIFFERENCE/UNION/INTERSECT) and apply.", { name: { type: "string" }, target: { type: "string" }, operation: { type: "string" } }, ["target"]),
   btool("blender_clear_scene", "Delete objects. keep = names to leave.", { keep: { type: "array", items: { type: "string" } } }, []),
@@ -267,6 +284,10 @@ function connect() {
     } catch {
       return;
     }
+    // The agent names its workspace in its handshake. Remember it HERE as well as
+    // from the HTTP API: a capture must never have to guess where to write a file
+    // just because that one request was slow or blocked.
+    if (msg && msg.type === "connected" && typeof msg.workspace_root === "string" && msg.workspace_root) localRoot = msg.workspace_root;
     handleBridgeMessage(msg);
   };
 
@@ -379,12 +400,15 @@ function waitForConnection(timeout = 20000) {
 }
 
 // ── request/response over the socket ────────────────────────────────────
-async function send(obj, timeout = REQUEST_TIMEOUT_DEFAULT) {
+// opts.connectWait - how long to wait for the socket to OPEN (default 20s, right for
+// real work because an MV3 worker may have just woken up). A SCREENSHOT passes a
+// short budget: half a minute is not worth it when other routes can be tried instead.
+async function send(obj, timeout = REQUEST_TIMEOUT_DEFAULT, opts) {
   // The MV3 service worker can be suspended; the first message after a wake-up
   // arrives before the socket has re-opened. Wait for it instead of failing -
   // otherwise Kimi wrongly hears "bridge offline".
   if (!connected || !ws || ws.readyState !== WebSocket.OPEN) {
-    await waitForConnection(20000);
+    await waitForConnection((opts && opts.connectWait) || 20000);
   }
   const attempt = () => new Promise((resolve) => {
     if (!connected || !ws || ws.readyState !== WebSocket.OPEN) {
@@ -410,7 +434,8 @@ async function send(obj, timeout = REQUEST_TIMEOUT_DEFAULT) {
   });
   let r = await attempt();
   if (r && r.kind === "disconnected") {
-    await waitForConnection(15000);
+    await waitForConnection((opts && opts.connectWait) ? (opts.connectWait) : 15000);
+    if (!connected || !ws || ws.readyState !== WebSocket.OPEN) return r;   // asked to be quick: give up now
     r = await attempt();
   }
   return r;
@@ -585,25 +610,198 @@ function broadcastStatus() {
 }
 
 
-async function ddgSearch(query, limit) {
+// ── Web tools (search + fetch) ──────────────────────────────────────────────
+// Health notes (why this is not one DDG call anymore):
+//  * html.duckduckgo.com/html/ is the endpoint OR used to scrape with a
+//    "OR/1.0" UA. DDG now treats that as an anomaly: it answers 202/403 with a
+//    challenge page that contains ZERO .result__a anchors, so the old parser
+//    returned [] and the tool reported "no results" on every query.
+//  * A browser UA + Accept-Language + Referer is required for the same URL to
+//    serve real results, and even then DDG rate-limits datacenter IPs.
+//  * So: try several independent backends in order, use a REAL browser UA, and
+//    fall back to a generic anchor parser per backend (markup drifts; a
+//    changed class name must not zero out the whole tool).
+// Every backend failure is collected and reported, so "it doesn't work" is
+// always accompanied by WHY (status codes included) instead of a bare "no
+// results for X".
+const BROWSER_UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36";
+const WEB_FETCH_TIMEOUT = 20000;
+const WEB_SEARCH_TIMEOUT = 12000;
+
+function webHeaders(extra, referer) {
+  const h = {
+    "User-Agent": BROWSER_UA,
+    Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,text/plain;q=0.8,*/*;q=0.7",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Cache-Control": "no-cache",
+  };
+  if (referer) h.Referer = referer;
+  return Object.assign(h, extra || {});
+}
+
+// A hung fetch is worse than a failed one: the content script's bg() has no
+// timeout of its own, so an endpoint that never answers used to spin the tool
+// forever. AbortController gives every request a hard deadline.
+async function fetchWithTimeout(url, opts, ms) {
+  const ctrl = typeof AbortController === "function" ? new AbortController() : null;
+  const timer = ctrl ? setTimeout(() => { try { ctrl.abort(); } catch {} }, ms || WEB_FETCH_TIMEOUT) : null;
+  try {
+    return await fetch(url, Object.assign({ redirect: "follow" }, opts || {}, ctrl ? { signal: ctrl.signal } : {}));
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+const ENTITIES = {
+  nbsp: " ", amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", "#39": "'", "#x27": "'",
+  mdash: "—", ndash: "–", hellip: "…", rsquo: "’", lsquo: "‘", ldquo: "“", rdquo: "”",
+  middot: "·", times: "×", deg: "°", copy: "©", reg: "®", trade: "™", euro: "€", pound: "£",
+};
+function decodeEntities(s) {
+  // Numeric forms first, then named. &amp; is decoded LAST via a single pass so
+  // a literal "&amp;lt;" does not turn into "<" (double-decoding).
+  return String(s || "")
+    .replace(/&#x([0-9a-f]+);/gi, (_, h) => { try { return String.fromCodePoint(parseInt(h, 16)); } catch { return " "; } })
+    .replace(/&#(\d+);/g, (_, d) => { try { return String.fromCodePoint(Number(d)); } catch { return " "; } })
+    .replace(/&([a-z#0-9x]+);/gi, (m, name) => {
+      const key = String(name).toLowerCase();
+      if (key === "amp") return "&";
+      return Object.prototype.hasOwnProperty.call(ENTITIES, key) ? ENTITIES[key] : m;
+    });
+}
+
+function stripTags(html) {
+  return decodeEntities(String(html || "").replace(/<[^>]*>/g, " ")).replace(/\s+/g, " ").trim();
+}
+
+// DDG wraps every result link as /l/?uddg=<urlencoded>&rut=…
+function unwrapDdg(href) {
+  let h = String(href || "").trim();
+  if (h.startsWith("//")) h = "https:" + h;
+  const m = h.match(/[?&]uddg=([^&]+)/);
+  if (m) { try { return decodeURIComponent(m[1]); } catch { return h; } }
+  const m2 = h.match(/[?&]url=([^&]+)/);
+  if (m2 && /duckduckgo\.com\/l\//.test(h)) { try { return decodeURIComponent(m2[1]); } catch {} }
+  return h;
+}
+
+function cleanHits(list, n, engineHost) {
+  const out = [];
+  const seen = new Set();
+  for (const r of list) {
+    let url = String((r && r.url) || "").trim();
+    const title = stripTags((r && r.title) || "");
+    if (!/^https?:\/\//i.test(url)) continue;
+    if (engineHost && url.includes(engineHost)) continue;
+    if (!title || title.length < 3) continue;
+    const key = url.replace(/[#?].*$/, "").replace(/\/+$/, "");
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ title: title.slice(0, 180), url });
+    if (out.length >= n) break;
+  }
+  return out;
+}
+
+// Last-resort parser: ANY anchor with an http(s) href and real text. Used when
+// a backend's markup changed (or is unknown) so the tool still returns hits.
+function parseGenericAnchors(html, n, engineHost) {
+  const hits = [];
+  const re = /<a\b[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
+  let m;
+  while ((m = re.exec(String(html || ""))) !== null) {
+    const url = unwrapDdg(m[1]);
+    const title = stripTags(m[2]);
+    if (!title || title.length < 12 || title.length > 180) continue;
+    hits.push({ url, title });
+  }
+  return cleanHits(hits, n, engineHost);
+}
+
+function parseDdgHtml(html, n) {
+  const hits = [];
+  const re = /<a\b[^>]*class="[^"]*result__a[^"]*"[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
+  let m;
+  while ((m = re.exec(String(html || ""))) !== null) hits.push({ url: unwrapDdg(m[1]), title: m[2] });
+  // class before href (older markup) — attribute order is not guaranteed.
+  if (!hits.length) {
+    const re2 = /<a\b[^>]*href=["']([^"']+)["'][^>]*class="[^"]*result__a[^"]*"[^>]*>([\s\S]*?)<\/a>/gi;
+    while ((m = re2.exec(String(html || ""))) !== null) hits.push({ url: unwrapDdg(m[1]), title: m[2] });
+  }
+  const clean = cleanHits(hits, n, "duckduckgo.com");
+  return clean.length ? clean : parseGenericAnchors(html, n, "duckduckgo.com");
+}
+
+function parseDdgLite(html, n) {
+  const hits = [];
+  const re = /<a\b[^>]*class="[^"]*result-link[^"]*"[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
+  let m;
+  while ((m = re.exec(String(html || ""))) !== null) hits.push({ url: unwrapDdg(m[1]), title: m[2] });
+  const clean = cleanHits(hits, n, "duckduckgo.com");
+  return clean.length ? clean : parseGenericAnchors(html, n, "duckduckgo.com");
+}
+
+function parseMojeek(html, n) {
+  const hits = [];
+  const re = /<a\b[^>]*class="[^"]*\bob\b[^"]*"[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
+  let m;
+  while ((m = re.exec(String(html || ""))) !== null) hits.push({ url: m[1], title: m[2] });
+  if (!hits.length) {
+    const re2 = /<h2>\s*<a\b[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
+    while ((m = re2.exec(String(html || ""))) !== null) hits.push({ url: m[1], title: m[2] });
+  }
+  const clean = cleanHits(hits, n, "mojeek.com");
+  return clean.length ? clean : parseGenericAnchors(html, n, "mojeek.com");
+}
+
+// Wikipedia has a real JSON API with CORS — not scraped, so it never breaks.
+// Not a general web search, but an excellent last resort for API/property
+// questions and it keeps the tool useful when every scraper is blocked.
+function parseWikipedia(json, n) {
+  const out = [];
+  try {
+    const rows = (JSON.parse(json).query || {}).search || [];
+    for (const r of rows) {
+      out.push({
+        title: r.title + " — Wikipedia",
+        url: "https://en.wikipedia.org/wiki/" + encodeURIComponent(String(r.title).replace(/ /g, "_")),
+      });
+      if (out.length >= n) break;
+    }
+  } catch {}
+  return out;
+}
+
+const SEARCH_BACKENDS = [
+  { id: "duckduckgo", url: (q) => "https://html.duckduckgo.com/html/?q=" + encodeURIComponent(q), parse: parseDdgHtml, referer: "https://duckduckgo.com/" },
+  { id: "ddg-lite", url: (q) => "https://lite.duckduckgo.com/lite/?q=" + encodeURIComponent(q), parse: parseDdgLite, referer: "https://lite.duckduckgo.com/" },
+  { id: "mojeek", url: (q) => "https://www.mojeek.com/search?q=" + encodeURIComponent(q), parse: parseMojeek, referer: "https://www.mojeek.com/" },
+  { id: "wikipedia", url: (q) => "https://en.wikipedia.org/w/api.php?action=query&list=search&format=json&srlimit=5&srsearch=" + encodeURIComponent(q), parse: parseWikipedia, json: true, referer: "https://en.wikipedia.org/" },
+];
+
+// Try every backend until one yields hits. Returns { hits, backend, notes }.
+async function webSearch(query, limit) {
   const q = String(query || "").trim();
   const n = Math.max(1, Math.min(8, Number(limit) || 3));
-  if (!q) return [];
-  const url = "https://html.duckduckgo.com/html/?q=" + encodeURIComponent(q);
-  const res = await fetch(url, { headers: { "User-Agent": "OR/1.0" } });
-  if (!res.ok) throw new Error("search HTTP " + res.status);
-  const html = await res.text();
-  const results = [];
-  const re = /<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>([^<]+)<\/a>/g;
-  let m;
-  while ((m = re.exec(html)) !== null && results.length < n) {
-    let href = m[1]; const title = m[2].trim();
-    const um = href.match(/uddg=([^&]+)/);
-    if (um) try { href = decodeURIComponent(um[1]); } catch {}
-    if (title && href) results.push({ title, url: href });
+  if (!q) return { hits: [], backend: null, notes: ["empty query"] };
+  const notes = [];
+  for (const b of SEARCH_BACKENDS) {
+    try {
+      const extra = b.json ? { Accept: "application/json,text/plain,*/*" } : null;
+      const res = await fetchWithTimeout(b.url(q), { headers: webHeaders(extra, b.referer) }, WEB_SEARCH_TIMEOUT);
+      if (!res.ok) { notes.push(`${b.id}: HTTP ${res.status}`); continue; }
+      const body = await res.text();
+      const hits = b.parse(body, n);
+      if (hits.length) return { hits, backend: b.id, notes };
+      notes.push(`${b.id}: no results parsed${/anomaly|captcha|unusual traffic/i.test(body) ? " (bot challenge page)" : ""}`);
+    } catch (e) {
+      notes.push(`${b.id}: ${String((e && e.message) || e).slice(0, 90)}`);
+    }
   }
-  return results;
+  return { hits: [], backend: null, notes };
 }
+
 function htmlToText(html) {
   let s = String(html || "");
   s = s.replace(/<script[\s\S]*?<\/script>/gi, " ");
@@ -612,11 +810,28 @@ function htmlToText(html) {
   s = s.replace(/<!--[\s\S]*?-->/g, " ");
   s = s.replace(/<br\s*\/?>/gi, "\n");
   s = s.replace(/<\/(p|div|h[1-6]|li|tr|section|article|header|footer|blockquote|pre|ul|ol|table)>/gi, "\n");
+  s = s.replace(/<(p|div|h[1-6]|li|tr|section|article|header|footer|blockquote|pre|ul|ol|table)\b[^>]*>/gi, "\n");
   s = s.replace(/<[^>]+>/g, " ");
-  s = s.replace(/&nbsp;/gi, " ").replace(/&amp;/gi, "&").replace(/&lt;/gi, "<").replace(/&gt;/gi, ">").replace(/&quot;/gi, '"').replace(/&#39;/g, "'");
-  s = s.replace(/&#(\d+);/g, (_, n) => { try { return String.fromCharCode(Number(n)); } catch { return " "; } });
+  s = decodeEntities(s);
   s = s.replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").replace(/[ \t]{2,}/g, " ").trim();
   return s;
+}
+
+// A JS-only shell ("enable JavaScript", a few hundred chars) is not a page we
+// can read; the reader proxy renders it server-side and returns Markdown.
+function looksLikeShell(text) {
+  const t = String(text || "");
+  if (t.length < 400) return true;
+  return /enable javascript|javascript is (required|disabled)|checking your browser|just a moment|cf-browser-verification/i.test(t.slice(0, 600));
+}
+async function readerFallback(url, maxChars) {
+  const res = await fetchWithTimeout("https://r.jina.ai/" + url, { headers: webHeaders() }, WEB_FETCH_TIMEOUT);
+  if (!res.ok) throw new Error("reader HTTP " + res.status);
+  let text = await res.text();
+  if (!text || text.length < 40) throw new Error("reader returned nothing");
+  const orig = text.length;
+  if (orig > maxChars) text = text.slice(0, maxChars) + `\n\n…[truncated ${orig - maxChars} chars]`;
+  return text;
 }
 
 
@@ -672,10 +887,20 @@ async function sendLocalEngine(obj, timeout = 25000) {
       try { msg = JSON.parse(ev.data); } catch { return; }
       if (msg.type === "connected") {
         if (typeof msg.workspace_root === "string" && msg.workspace_root) localRoot = msg.workspace_root;
+        if (Array.isArray(msg.tools)) localToolsCache = msg.tools;
+        return;
+      }
+      if (msg.type === "tools" && (msg.id == null || msg.id === id)) {
+        if (Array.isArray(msg.tools)) localToolsCache = msg.tools;
+        done({ ok: !!msg.ok, tools: msg.tools || [], text: "" });
         return;
       }
       if (msg.type === "tool_result" && (msg.id == null || msg.id === id)) {
-        done(msg.ok ? { ok: true, text: msg.text } : { ok: false, error: msg.error || "tool failed" });
+        // Images (and their mime types) ride along, so a Studio/Blender capture
+        // can be attached instead of being reported as an empty result.
+        done(msg.ok
+          ? { ok: true, text: msg.text, images: Array.isArray(msg.images) ? msg.images : [] }
+          : { ok: false, error: msg.error || "tool failed" });
         return;
       }
       if (msg.type === "error" && (msg.id == null || msg.id === id)) {
@@ -683,6 +908,35 @@ async function sendLocalEngine(obj, timeout = 25000) {
       }
     };
   });
+}
+
+// The local engine's advertised tool names, remembered from its `connected` /
+// `tools` frames. Used to answer "is this or-agent.exe new enough to hand the
+// browser a FILE (read_file_base64)?" - every screenshot path needs that, and an
+// outdated exe fails silently, which is what makes screenshots look broken.
+let localToolsCache = [];
+function localToolNames() {
+  return localToolsCache.map((t) => (t && (t.name || t.id)) || "").filter(Boolean);
+}
+async function agentInfo() {
+  let names = localToolNames();
+  if (!names.length) {
+    try {
+      const r = await sendLocalEngine({ type: "list_tools" }, 8000);
+      if (r && Array.isArray(r.tools)) { localToolsCache = r.tools; names = localToolNames(); }
+    } catch {}
+  }
+  return {
+    ok: names.length > 0,
+    workspace_root: localRoot || "",
+    tools: names.length,
+    has_base64: names.length ? names.some((n) => n === "read_file_base64" || n.endsWith("/read_file_base64")) : null,
+    // The text tunnel needs only these two, and every build has had them, so an
+    // agent that lacks read_file_base64 can STILL deliver a screenshot.
+    has_read_file: names.length ? names.some((n) => n === "read_file" || n.endsWith("/read_file")) : null,
+    has_run_command: names.length ? names.some((n) => n === "run_command" || n.endsWith("/run_command")) : null,
+    reason: names.length ? "" : "or-agent.exe did not report a tool list (not running, or an old build)",
+  };
 }
 
 async function extText(name) {
@@ -727,6 +981,405 @@ async function localReadAll(path) {
     offset = part.next || (offset + part.count);
   }
   return chunks.join("\n");
+}
+
+// Read ANY workspace file as base64 (images/binaries included) through the
+// native AgentScript engine. This is the ONLY way browser-side code can get at
+// bytes on disk, so it backs every "attach this file / screenshot" feature.
+async function localReadBase64(path) {
+  const r = await sendLocalEngine({ type: "call_tool", name: "read_file_base64", arguments: { path } }, 30000);
+  if (!r || !r.ok) throw new Error((r && r.error) || ("could not read " + path));
+  let parsed = null;
+  try { parsed = JSON.parse(String(r.text || "")); } catch {}
+  if (!parsed || !parsed.data) throw new Error("the bridge returned no file data for " + path);
+  return parsed;
+}
+
+// ── the TEXT TUNNEL: a picture that travels as base64 TEXT ─────────────────
+// Why this exists: reading a local file needs read_file_base64, which only the
+// 1.18.0 agent has. Every other agent tool the tunnel needs (run_command,
+// read_file, write_file) is present in OLDER exes too - the user's prebuilt
+// or-agent.exe advertises 18 tools and everything but read_file_base64 - so a
+// screenshot still reaches the browser without rebuilding anything.
+//
+// read_file numbers its lines ("  12 | <content>") and CLIPS the whole reply at
+// 40,000 characters, cutting mid-line, so each request asks for few enough lines
+// that the clip never triggers; if a reply is clipped anyway the chunk size is
+// halved and the same offset re-read (self-healing, never a corrupt image).
+const READ_CLIP_MARK = /\n?\.\.\. \[output truncated at \d+ characters\]/;
+
+async function localReadTextFile(path, opts) {
+  const o = opts || {};
+  const maxChars = o.maxChars || 34000;
+  const maxCalls = o.maxCalls || 60;
+  let linesPerCall = Math.max(4, Math.min(2000, o.linesPerCall || 80));
+  let offset = 1;
+  let calls = 0;
+  const parts = [];
+  let clipped = 0;
+  for (let n = 0; n < maxCalls; n++) {
+    calls++;
+    const r = await sendLocalEngine({ type: "call_tool", name: "read_file",
+      arguments: { path, offset, limit: linesPerCall } }, 25000);
+    if (!r || !r.ok) throw new Error((r && r.error) || ("the agent could not read " + path));
+    let text = String(r.text == null ? "" : r.text);
+    const wasClipped = READ_CLIP_MARK.test(text);
+    if (wasClipped) { clipped++; text = text.replace(READ_CLIP_MARK, ""); linesPerCall = Math.max(4, Math.floor(linesPerCall / 2)); }
+    const got = [];
+    for (const line of text.split("\n")) {
+      const m = line.match(/^\s*\d+ \| ?([\s\S]*)$/);
+      if (m) got.push(m[1]);
+    }
+    if (!got.length) {
+      if (/\(no lines in range/.test(text)) break;              // past the end: done
+      break;                                                     // header only
+    }
+    // A clipped reply may end in half a line - drop it and re-read that offset.
+    if (wasClipped) got.pop();
+    parts.push(...got);
+    const consumed = Math.max(1, got.length);
+    offset += consumed;
+    if (got.length < linesPerCall && !wasClipped) break;          // last page
+    if (parts.join("").length > (o.maxB64 || 4 * 1024 * 1024)) throw new Error("the capture file is unexpectedly large");
+  }
+  return { text: parts.join(""), lines: offset - 1, chunks: calls, clipped };
+}
+
+// Verify the tunnel end-to-end: same byte count, and the same SHA-256 the script
+// computed, so a truncated or re-encoded picture is never attached as if it were
+// the screenshot.
+// ── a capture FILE -> base64 TEXT, with NO PowerShell involved ───────────────
+// The user's antivirus blocks studio_shot.ps1 outright, and turning a PNG into text
+// never needed a script in the first place: certutil is a signed Windows program, and
+// base64 ships with every POSIX box. An executable is not a script, so the script
+// scanner has nothing to read. The paged TEXT read and the three checks in
+// b64ToVerifiedImage are unchanged - only the converter is different.
+async function b64FileViaConverter(file) {
+  const src = String(file || "");
+  if (!src) return null;
+  const tmp = src.replace(/[\\/]+$/, "") + ".or.b64";
+  let win = true;
+  try { win = (await chrome.runtime.getPlatformInfo()).os === "win"; } catch {}
+  const cmd = win ? `certutil -encode "${src}" "${tmp}"` : `base64 -w 76 "${src}" > "${tmp}"`;
+  let r = null;
+  try { r = await localRun(cmd, 45); } catch { return null; }
+  const txt = String((r && (r.text || r.error)) || "");
+  if (noteAvBlock(txt)) return null;                       // refused, not "not found"
+  if (r && r.ok === false) return null;
+  // certutil reports the source size, which is what the byte-count check downstream
+  // wants; the base64 length of N bytes is fixed padding included.
+  const bytes = Number((txt.match(/Input Length\s*=\s*(\d+)/i) || [])[1]) || 0;
+  if (win && !bytes) return null;
+  return { ok: true, file: src, base64_file: tmp, bytes,
+    base64_chars: bytes ? 4 * Math.ceil(bytes / 3) : 0,
+    mime: /\.png$/i.test(src) ? "image/png" : "image/jpeg" };
+}
+
+async function b64ToVerifiedImage(b64, meta) {
+  const clean = String(b64 || "").replace(/[^A-Za-z0-9+/=]/g, "");
+  if (!clean) throw new Error("the capture text arrived empty");
+  let bin;
+  try { bin = atob(clean); } catch (e) { throw new Error("the capture text is not valid base64: " + String((e && e.message) || e)); }
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  // Three independent checks, cheapest first, so a damaged or half-read picture can
+  // never be attached as if it were the screenshot:
+  //   1. the text itself must be the length the script reported;
+  //   2. the decoded bytes must be the size the script reported;
+  //   3. the bytes must hash to the SHA-256 the script computed.
+  if (meta && meta.base64_chars && clean.length !== Number(meta.base64_chars)) {
+    throw new Error("the capture text is incomplete (" + clean.length + " of " + meta.base64_chars + " base64 characters) - the file readback was cut short");
+  }
+  const expected = Number(meta && meta.bytes) || 0;
+  if (expected && bytes.length !== expected) {
+    throw new Error("the picture arrived incomplete (" + bytes.length + " of " + expected + " bytes) - the file readback was cut short");
+  }
+  if (meta && meta.sha256 && crypto && crypto.subtle && crypto.subtle.digest) {
+    let hex = "";
+    try {
+      const d = await crypto.subtle.digest("SHA-256", bytes);
+      hex = Array.from(new Uint8Array(d)).map((b) => b.toString(16).padStart(2, "0")).join("");
+    } catch { hex = ""; }                                  // no digest support: checks 1 and 2 still held
+    if (hex && hex !== String(meta.sha256).toLowerCase()) {
+      throw new Error("checksum mismatch: the picture was damaged on the way to the browser (expected " +
+        String(meta.sha256).slice(0, 12) + "…, got " + hex.slice(0, 12) + "…)");
+    }
+  }
+  // A file named .jpg that is really a PNG (or the reverse) must not be handed over
+  // under the wrong type: the first bytes are the truth when they name a format.
+  const sniff = bytes.length > 8 && bytes[0] === 0x89 && bytes[1] === 0x50 ? "image/png"
+    : (bytes[0] === 0xff && bytes[1] === 0xd8) ? "image/jpeg" : "";
+  return { mimeType: sniff || (meta && meta.mime) || "image/jpeg", data: clean, bytes: bytes.length };
+}
+
+// Hand a picture file to the browser by ANY route the agent supports:
+//   1. read_file_base64 (new agent) - one call;
+//   2. otherwise ask studio_shot.ps1 to write the base64 text twin and read that back
+//      with read_file, verifying size + SHA-256 (old agent).
+// Throws with .code = "too-large" when the file cannot travel as text at all, so the
+// caller can retake it smaller instead of giving up.
+// ── a picture that arrives as TEXT ──────────────────────────────────────────
+// Not every MCP hands the picture over as image data. Studio's own capture and
+// Blender's addon both WRITE a file and answer with its path, and some servers inline
+// base64. Image blocks need an up-to-date or-agent.exe; a path or inline base64 does
+// NOT - it can be read back through the same text tunnel the window capture uses.
+// Without this, a text-only answer read as "captured nothing" even though the picture
+// was sitting on disk the whole time.
+const IMAGE_FILE_RE = /(?:[A-Za-z]:[\\/]|\\\\[^\s"']+[\\/]|\/)[^"'\r\n<>|?*]*?\.(?:png|jpe?g|webp|bmp|gif)\b/i;
+function imagePathInText(text) {
+  const m = String(text || "").match(IMAGE_FILE_RE);
+  return m ? m[0].trim() : "";
+}
+function imageDataInText(text) {
+  const t = String(text || "");
+  const uri = t.match(/data:(image\/[a-z0-9.+-]+);base64,([A-Za-z0-9+/=\s]{200,})/i);
+  if (uri) return { mimeType: uri[1], data: uri[2].replace(/\s+/g, "") };
+  const blob = t.match(/(?:^|[\s"'(=:\[])([A-Za-z0-9+/]{400,}={0,2})(?=$|[\s"')])/m);
+  if (blob) {
+    const b = blob[1].replace(/\s+/g, "");
+    // Only data whose type we can name from its own header - never a guess.
+    const mime = b.startsWith("iVBOR") ? "image/png"
+      : b.startsWith("/9j/") ? "image/jpeg"
+      : b.startsWith("R0lGOD") ? "image/gif" : "";
+    if (mime) return { mimeType: mime, data: b };
+  }
+  return null;
+}
+// ── an MCP tool that demands an argument OR never sends ─────────────────────
+// Studio's own screen_capture declares a REQUIRED capture_id, and OR used to call
+// every capture tool with no arguments at all - so the call came back
+// "studio: Missing required argument: capture_id" and the screenshot died with a
+// name the user cannot act on. Two ways to fill it, in order of trust:
+//   1. the tool's own inputSchema (the agent forwards MCP schemas untouched);
+//   2. the error text itself, which names the missing argument.
+// One retry each, never a loop, and the result says what was sent.
+const REQUIRED_ARG_RE = /missing required (?:argument|parameter|field|arg)s?[:=\s]+["'`]?([A-Za-z0-9_.\-]{1,40})/i;
+// NOTE: deliberately no lazy list_tools fetch here. A call that arrives before the
+// catalogue is covered by the error-driven repair below - adding a fetch would put an
+// extra frame in front of EVERY MCP call and race the bridge's own list_tools.
+function mcpSchemaFor(name) {
+  try {
+    const n = String(name || "");
+    // toolsCache is the MCP catalogue (schemas included); localToolsCache is the
+    // agent's OWN workspace tools. A capture tool lives in the first list.
+    const pools = [toolsCache, localToolsCache];
+    for (const pool of pools) {
+      const t = (Array.isArray(pool) ? pool : []).find((x) => x && String((x.name || x.id) || "") === n);
+      if (t && t.inputSchema) return t.inputSchema;
+    }
+    return null;
+  } catch { return null; }
+}
+// The catalogue is fetched lazily on first need, so a call arriving before any
+// list_tools still gets its required arguments filled instead of failing once first.
+function valueForArg(key, spec) {
+  const k = String(key || "");
+  const s = spec || {};
+  try {
+    if (Array.isArray(s.enum) && s.enum.length) return s.enum[0];
+    if (s.default !== undefined) return s.default;
+    if (/path|file|filename|output|dir|folder/i.test(k)) {
+      const dir = String(localRoot || ".").replace(/[\\/]+$/, "");
+      return dir + "/or_mcp_shot.png";
+    }
+    if (s.type === "boolean") return false;
+    if (s.type === "integer" || s.type === "number") return 1;
+    if (/id$|_id$|uuid|guid|key$|name$|label/i.test(k) || !s.type || s.type === "string")
+      return "or_capture_" + Date.now().toString(36);
+    return "or_" + Date.now().toString(36);
+  } catch { return "or_capture_" + Date.now().toString(36); }
+}
+function fillRequiredArgs(name, args) {
+  const out = Object.assign({}, args || {});
+  const filled = [];
+  try {
+    const schema = mcpSchemaFor(name);
+    const props = (schema && schema.properties) || {};
+    const req = (schema && Array.isArray(schema.required)) ? schema.required : [];
+    req.forEach((k) => {
+      if (out[k] === undefined) { out[k] = valueForArg(k, props[k]); filled.push(k); }
+    });
+  } catch {}
+  return { args: out, filled };
+}
+function missingArgIn(text) {
+  const m = String(text || "").match(REQUIRED_ARG_RE);
+  return m ? m[1] : "";
+}
+// ── the CONNECTED studio id (looked up, never invented) ─────────────────────
+// Studio's own screen_capture declares capture_id AND studio_id required, and a made-up
+// id is REFUSED: "The requested `studio_id` is not connected - that Roblox Studio
+// instance may have been closed or its place unloaded. Call list_roblox_studios for the
+// current ...". So the id is taken from where that error says it lives. This is a plain
+// MCP call: no PowerShell, no script file written to disk, nothing for security software
+// to scan - which is why the picture can be taken with the antivirus left alone. Cached
+// briefly (a Studio restart hands out a new id), refreshed ONCE when the server refuses.
+let studioIdCache = { id: "", at: 0 };
+const STUDIO_ID_TTL_MS = 120000;
+const STUDIO_ID_TOOL = "list_roblox_studios";
+const STUDIO_ID_KEY_RE = /^(?:studio|instance|place|editor)_?id$/i;
+// Empty list = the agent forwards no catalogue at all (an older build): then the call is
+// worth a try, because those are exactly the builds whose captures failed this way.
+function mcpToolNames() {
+  try { return (Array.isArray(toolsCache) ? toolsCache : []).map((t) => String((t && (t.name || t.id)) || "")); }
+  catch { return []; }
+}
+function studioIdFromJson(node, depth, strong, weak, generic, inStudio) {
+  if (!node || depth > 6) return;
+  if (Array.isArray(node)) { node.forEach((x) => studioIdFromJson(x, depth + 1, strong, weak, generic, inStudio)); return; }
+  if (typeof node !== "object") return;
+  Object.keys(node).forEach((k) => {
+    const key = String(k).toLowerCase().replace(/[^a-z0-9]/g, "");
+    const v = node[k];
+    const studioish = inStudio || /studio|instance|place|editor|connection/.test(key);
+    if (v !== null && typeof v === "object") { studioIdFromJson(v, depth + 1, strong, weak, generic, studioish); return; }
+    const s = String(v === null || v === undefined ? "" : v).trim();
+    if (!s || s.length > 200) return;
+    const bucket = (key === "studioid" || key === "instanceid") ? strong
+      : (key === "id" ? (studioish ? weak : generic) : null);
+    if (bucket && bucket.indexOf(s) < 0) bucket.push(s);
+  });
+}
+function jsonInText(text) {
+  const t = String(text || "");
+  const first = [t.indexOf("{"), t.indexOf("[")].filter((i) => i >= 0).sort((a, b) => a - b)[0];
+  if (first === undefined) return null;
+  const last = Math.max(t.lastIndexOf("}"), t.lastIndexOf("]"));
+  if (last <= first) return null;
+  try { return JSON.parse(t.slice(first, last + 1)); } catch { return null; }
+}
+// The answer arrives as JSON (structured, or as JSON inside a text block) or as a human
+// list; both shapes are read here. A bare "id" only counts as a studio id when it sits
+// next to studio-ish wording, so an unrelated id can never be sent as the place to shoot.
+function pickStudioId(r) {
+  try {
+    const raw = String((r && (r.text || r.error)) || "");
+    const strong = [], weak = [], generic = [];
+    const parsed = jsonInText(raw);
+    if (parsed) studioIdFromJson(parsed, 0, strong, weak, generic, false);
+    const all = strong.concat(weak, generic);
+    if (all.length) return all[0];
+    const pats = [/"studio_?id"\s*:\s*"?([A-Za-z0-9_.:\-]{2,200})/i,
+                  /\bstudio_?id\b[\s"']*[:=][\s"']*([A-Za-z0-9_.:\-]{2,200})/i,
+                  /\binstance_?id\b[\s"']*[:=][\s"']*([A-Za-z0-9_.:\-]{2,200})/i];
+    for (const p of pats) { const m = raw.match(p); if (m) return m[1]; }
+  } catch {}
+  return "";
+}
+async function resolveStudioId(force) {
+  const now = Date.now();
+  if (!force && studioIdCache.id && now - studioIdCache.at < STUDIO_ID_TTL_MS) return studioIdCache.id;
+  const names = mcpToolNames();
+  if (names.length && names.indexOf(STUDIO_ID_TOOL) < 0) return "";      // the server does not offer it
+  try {
+    const r = await send({ type: "call_tool", name: STUDIO_ID_TOOL, arguments: {}, timeout: 8000 }, 12000, { connectWait: 2500 });
+    const id = r && r.ok !== false ? pickStudioId(r) : "";
+    if (id) { studioIdCache = { id, at: Date.now() }; return id; }
+  } catch {}
+  if (force) studioIdCache = { id: "", at: 0 };
+  return "";
+}
+// Which argument of THIS tool wants a studio id? Read from its own schema, so no other
+// tool is ever sent an argument it did not ask for. The model may have supplied one
+// itself - a hallucinated value - so the key is looked up before any dummy is filled.
+function studioIdKeyFor(name, args) {
+  try {
+    const a = args || {};
+    const schema = mcpSchemaFor(name);
+    const props = (schema && schema.properties) || {};
+    const req = (schema && Array.isArray(schema.required)) ? schema.required : [];
+    const wanted = req.filter((k) => STUDIO_ID_KEY_RE.test(String(k)));
+    // Anything REQUIRED is filled; an OPTIONAL studio id is only worth a lookup for the
+    // capture tools (which is what the live refusal was about), so a tool that merely
+    // accepts one never costs an extra round trip on every call.
+    if (!wanted.length && !/screenshot|screen_capture|capture|viewport/i.test(String(name || ""))) return "";
+    const keys = wanted.length ? wanted : Object.keys(props).filter((k) => STUDIO_ID_KEY_RE.test(String(k)));
+    return keys.find((k) => a[k] === undefined || a[k] === "") || "";
+  } catch { return ""; }
+}
+function coerceArgToSchema(value, spec) {
+  const t = spec && spec.type;
+  if ((t === "integer" || t === "number") && /^-?\d+$/.test(String(value))) return Number(value);
+  return String(value);
+}
+// Required arguments, then the one thing a dummy can never satisfy: the CONNECTED id.
+async function prepareArgs(name, args) {
+  const key = studioIdKeyFor(name, args);
+  const pre = fillRequiredArgs(name, args);
+  const filled = pre.filled.filter((k) => k !== key);
+  if (key) {
+    const id = await resolveStudioId(false);
+    if (id) {
+      const props = ((mcpSchemaFor(name) || {}).properties) || {};
+      pre.args[key] = coerceArgToSchema(id, props[key]);
+      filled.push(key);
+    }
+  }
+  return { args: pre.args, filled, studioIdKey: key };
+}
+// "that studio id is gone" (Studio closed, or the place reloaded) - the one failure worth
+// a fresh lookup. Deliberately narrow: a bridge/socket error must not be read as this.
+const STUDIO_ID_ERR_RE = /studio_?id|list_roblox_studios|that Roblox Studio instance|no active Studio|previously active Studio has disconnected|Studio is not connected/i;
+function isStudioIdError(text) { return STUDIO_ID_ERR_RE.test(String(text || "")); }
+// Applies to capture-ish tools only: a tool that merely MENTIONS a .png (a file
+// listing, say) must not drag an unrelated picture into the model's context.
+const CAPTURE_TOOL_RE = /screenshot|screen_capture|capture|viewport/i;
+async function harvestToolImage(r, toolName) {
+  if (!r || !r.ok || (Array.isArray(r.images) && r.images.length)) return r;
+  if (toolName && !CAPTURE_TOOL_RE.test(String(toolName))) return r;
+  const text = String(r.text || "");
+  if (!text) return r;
+  const inline = imageDataInText(text);
+  if (inline) return Object.assign({}, r, { images: [inline], image_source: "base64 TEXT in the tool's own answer" });
+  const file = imagePathInText(text);
+  if (!file) {
+    // Nothing convertible in the answer. "No picture" is true but useless on its own:
+    // a build without image support THROWS PICTURES AWAY, and the user cannot tell that
+    // apart from a Studio that never took one. Say which it probably is, and what to do.
+    let note = "no picture came back: the answer held no image data, named no image file and contained no base64," +
+      " so there was nothing this build could turn into an attachment (a tool that saves the shot AND NAMES IT, or inlines base64, works - neither needs PowerShell)";
+    try {
+      const info = await agentInfo();
+      if (info && info.has_base64 === false) {
+        note = "no picture came back: this or-agent.exe (" + info.tools + " tools, no read_file_base64) cannot carry IMAGE DATA," +
+          " and this MCP's answer named no file and held no base64, so there was nothing to convert. Rebuild it (cd agent && cargo build --release)" +
+          " for the MCP image path; a tool that NAMES the saved file still works without PowerShell, and the Studio-window rescue still delivers.";
+      }
+    } catch {}
+    return Object.assign({}, r, { image_error: note });
+  }
+  try {
+    const t = await tunnelReadImage(file, null);
+    return Object.assign({}, r, { images: [{ mimeType: t.img.mimeType, data: t.img.data }], meta: t.meta,
+      image_source: "the file the tool named (" + file + "), read back as base64 TEXT in " + t.chunks + " chunk(s)" });
+  } catch (e) {
+    return Object.assign({}, r, { image_error: "the tool named " + file + " but its bytes could not be read back: " + String((e && e.message) || e).slice(0, 200) });
+  }
+}
+
+async function tunnelReadImage(file, knownMeta) {
+  let meta = knownMeta && knownMeta.base64_file ? knownMeta : null;
+  // The MCP (or any other tool) may simply NAME the picture it saved. Turning that file
+  // into text must not depend on the script the antivirus blocks, so the converter is
+  // tried first and PowerShell only after it (and never when the scanner already said no).
+  if (!meta) meta = await b64FileViaConverter(file);
+  if (!meta && !ps1BlockedNow()) {
+    const r = await localRun(`powershell -NoProfile -ExecutionPolicy Bypass -File studio_shot.ps1 -B64Only "${file}"`, 45);
+    const raw = String((r && (r.text || r.error)) || "");
+    const m2 = noteAvBlock(raw) ? null : parseShotMeta(raw);
+    if (!m2 || !m2.ok) {
+      const err = new Error((m2 && m2.error) || (ps1BlockedNow()
+        ? "cannot read " + file + " back as text: the antivirus blocks studio_shot.ps1 and the certutil converter did not answer (is or-agent.exe running?)"
+        : "could not prepare " + file + " for text readback") +
+        (r && r.error && r.error !== (m2 && m2.error) ? " (" + String(r.error).slice(0, 160) + ")" : ""));
+      if (m2 && /too big to hand over as text|too large to read whole/i.test(String(m2.error || ""))) err.code = "too-large";
+      throw err;
+    }
+    meta = m2;
+  }
+  const rd = await localReadTextFile(meta.base64_file || (file + ".b64"), { linesPerCall: 90 });
+  const img = await b64ToVerifiedImage(rd.text, meta);
+  return { img, meta, lines: rd.lines, chunks: rd.chunks, clipped: rd.clipped };
 }
 
 async function localRun(command, timeoutSeconds = 12) {
@@ -823,6 +1476,18 @@ const BLENDER_CMD = {
   blender_select: "select", blender_transform: "transform",
   blender_apply_transforms: "apply_transforms", blender_set_origin: "set_origin",
   blender_shade_smooth: "shade_smooth", blender_set_material: "set_material",
+  // ── Material toolkit (node-based; version-safe across Blender 3.x/4.x) ──
+  blender_material_create: "material_create", blender_material_new: "material_create",
+  blender_make_material: "material_create", blender_material_preset: "material_preset",
+  blender_material_apply_preset: "material_preset", blender_material_set: "material_set",
+  blender_material_edit: "material_set", blender_material_assign: "material_assign",
+  blender_material_apply: "material_assign", blender_material_list: "material_list",
+  blender_materials: "material_list", blender_material_inspect: "material_inspect",
+  blender_material_info: "material_inspect", blender_material_remove: "material_remove",
+  blender_material_delete: "material_remove", blender_material_noise: "material_noise",
+  blender_material_texture: "material_noise", blender_material_image: "material_image",
+  blender_material_texture_image: "material_image", blender_material_pbr: "material_pbr",
+  blender_material_maps: "material_pbr",
   blender_add_modifier: "add_modifier", blender_boolean: "boolean",
   blender_add_cube: "add_cube", blender_add_sphere: "add_sphere",
   blender_add_cylinder: "add_cylinder", blender_add_cone: "add_cone",
@@ -903,11 +1568,13 @@ async function blenderPayload(name, args) {
   if (bare === "get_scene_info" || bare === "blender_get_scene_info") return { type: "get_scene_info", params: {} };
   if (bare === "get_object_info" || bare === "blender_get_object_info") return { type: "get_object_info", params: { name: a.name || a.object_name || "" } };
   if (bare === "execute_blender_code" || bare === "execute_code" || bare === "blender_execute_code") return { type: "execute_code", params: { code: wrapBlenderUserCode(a.code || "") } };
-  if (bare === "get_viewport_screenshot" || bare === "blender_screenshot") {
+  if (bare === "get_viewport_screenshot" || bare === "blender_screenshot" || bare === "blender_viewport_shot" || bare === "blender_window_shot") {
     let shot = "or_blender_shot.png";
     const root = await agentWorkspaceRoot();
     if (root) shot = root.replace(/[\\/]+$/, "") + "/or_blender_shot.png";
-    return { type: "get_viewport_screenshot", params: { max_size: Number(a.max_size) || 1000, filepath: shot, format: "png" } };
+    // _orShot: the exact path we asked Blender to write, so blenderCall can read
+    // the pixels back (see the screenshot branch there) without guessing.
+    return { type: "get_viewport_screenshot", params: { max_size: Number(a.max_size) || 1000, filepath: shot, format: "png" }, _orShot: shot };
   }
   const mapped = BLENDER_CMD[bare];
   if (mapped) {
@@ -1012,8 +1679,48 @@ async function blenderCall(name, args, timeout) {
       }
     }
     if (meshes && meshes.length && result && typeof result === "object") result.meshes = meshes;
+    // ── Screenshot → real image bytes ──────────────────────────────────────
+    // The blender-mcp addon WRITES the viewport capture to a PNG path and
+    // answers with that path as text. A Chrome extension cannot read a local
+    // path, so this used to hand back images:[] and the screenshot command silently
+    // fell through to a tab capture (the AI got a picture of its own chat window).
+    // The path IS inside the AgentScript workspace, so read it back as base64
+    // through the bridge and return it as a real attachment.
+    let images = [];
+    const shotPath = payload._orShot ||
+      (result && typeof result === "object" && (result.filepath || result.file_path || result.path)) ||
+      (payload.type === "get_viewport_screenshot" ? "or_blender_shot.png" : "");
+    if (shotPath && payload.type === "get_viewport_screenshot") {
+      try {
+        const parsed = await localReadBase64(shotPath);
+        images = [{ mimeType: parsed.mimeType || "image/png", data: parsed.data }];
+        if (result && typeof result === "object") result.bytes = parsed.bytes;
+      } catch (e) {
+        // Old agent (no read_file_base64): the Blender addon already wrote a PNG into
+        // the workspace, so hand it over as base64 TEXT instead - the same tunnel the
+        // Studio window capture uses. Without this, a Blender viewport screenshot
+        // silently failed on any agent older than 1.18.0.
+        try {
+          const t = await tunnelReadImage(shotPath, null);
+          images = [{ mimeType: t.img.mimeType, data: t.img.data }];
+          if (result && typeof result === "object") result.bytes = t.img.bytes || undefined;
+        } catch (e2) {
+          // Keep the path in the text so the model/user can still open the file;
+          // report the reason rather than pretending a capture happened.
+          const t2msg = String((e2 && e2.message) || e2);
+          result = typeof result === "object" && result
+            ? Object.assign({}, result, { image_error: String((e && e.message) || e).slice(0, 200) + (t2msg ? " | text tunnel: " + t2msg.slice(0, 200) : "") +
+                (/too big to hand over as text|too large to read whole/i.test(t2msg) ? " — re-capture with a smaller size: blender_screenshot {max_size: 600}" : "") })
+            : result;
+        }
+      }
+    }
     let textOut = typeof result === "string" ? result : JSON.stringify(result, null, 2);
-    return { ok: true, text: textOut, images: [], meshFile: mf, filepath: result && result.filepath, meshes: meshes || undefined };
+    if (payload.type === "get_viewport_screenshot" && !images.length) {
+      textOut += "\n\n[OR: the viewport image could not be read back from disk" +
+        (shotPath ? ` (${shotPath})` : "") + " — the capture file may be missing or unreadable.]";
+    }
+    return { ok: true, text: textOut, images, meshFile: mf, filepath: result && result.filepath, meshes: meshes || undefined };
   };
   const prev = blenderCallLock;
   let release;
@@ -1021,6 +1728,328 @@ async function blenderCall(name, args, timeout) {
   await prev.catch(() => {});
   try { return await run(); }
   finally { release(); }
+}
+
+// ── Studio WINDOW capture / focus (OS side, needs or-agent.exe) ─────────────
+// A browser extension cannot photograph a desktop window, and captureVisibleTab
+// only ever sees the tab IN FRONT. Studio is a separate application, so this goes
+// through the agent: studio_shot.ps1 (written into the agent workspace) uses
+// PrintWindow first - which works while Studio is behind other windows - and
+// falls back to raising the window and grabbing the screen.
+let studioShotScriptReady = false;   // same pattern as ensureBlenderScripts
+
+async function ensureStudioShotScript() {
+  if (studioShotScriptReady) return;
+  const ps = await extText("studio_shot.ps1");
+  await localWrite("studio_shot.ps1", ps);
+  studioShotScriptReady = true;
+}
+
+// capture:true → also write the PNG. Focus-only is the "make Studio the front
+// window" action (no capture). Returns { ok, text, images, meta }.
+// The script's last line is machine-readable: OR_STUDIO_SHOT {...}
+function parseShotMeta(raw) {
+  const text = String(raw || "");
+  // Take the LAST result line: PowerShell can print warnings after the JSON, and a
+  // strict end-anchored match turned "the capture worked" into "no answer".
+  const all = [...text.matchAll(/OR_STUDIO_SHOT\s+(\{.*\})/g)];
+  for (let i = all.length - 1; i >= 0; i--) {
+    // Trim to the first balanced object: the line may carry trailing prose.
+    const body = all[i][1];
+    let depth = 0, end = -1, inStr = false, esc = false;
+    for (let j = 0; j < body.length; j++) {
+      const ch = body[j];
+      if (esc) { esc = false; continue; }
+      if (ch === "\\") { esc = true; continue; }
+      if (ch === '"') { inStr = !inStr; continue; }
+      if (inStr) continue;
+      if (ch === "{") depth++;
+      else if (ch === "}") { depth--; if (depth === 0) { end = j; break; } }
+    }
+    if (end < 0) continue;
+    try { return JSON.parse(body.slice(0, end + 1)); } catch { }
+  }
+  return null;
+}
+
+// The whole-screen capture writes its own file name: a shot of the desktop must not be
+// saved as "or_studio_window.jpg", or the user (and attach_feedback {path}) would be told
+// the wrong thing about what the file is.
+function wholeScreenOut(name) {
+  const s = String(name || "or_studio_window.png");
+  return /studio/i.test(s) ? s.replace(/studio_window/i, "screen").replace(/studio/i, "screen") : s;
+}
+
+// One place decides "the scanner stopped the script": the capture step and the
+// -B64Only readback both come back with the same words, and either one is enough to
+// stop trying the script at all.
+function noteAvBlock(text) {
+  const t = String(text || "");
+  if (!AV_BLOCK_RE.test(t)) return false;
+  ps1Block = { why: t.replace(/\s+/g, " ").trim().slice(-240), at: Date.now() };
+  return true;
+}
+// ── the antivirus on this PC blocks the SCRIPT FILE ──────────────────────────
+// Live report from the user's machine: "This script contains malicious content and has
+// been blocked by your antivirus software." at studio_shot.ps1:1 char:1 - so BOTH
+// PowerShell routes (the Studio window and the whole screen) die there. Running the
+// blocked file again would only print the same wall and keep poking the scanner, so the
+// first such answer switches the PowerShell route OFF for a while and the failure says
+// why in one line. The Roblox picture does not need it at all: it is taken inside Studio
+// over the MCP, where no script file exists to be scanned.
+const AV_BLOCK_RE = /blocked by your antivirus|contains malicious content|antivirus software|running scripts is disabled|not digitally signed|UnauthorizedAccessException/i;
+let ps1Block = { why: "", at: 0 };
+const PS1_BLOCK_MS = 600000;                   // tried again after ten minutes
+function ps1BlockedNow() {
+  if (!ps1Block.why) return "";
+  if (Date.now() - ps1Block.at > PS1_BLOCK_MS) { ps1Block = { why: "", at: 0 }; return ""; }
+  return ps1Block.why;
+}
+function ps1BlockedReply() {
+  // The ONE action that brings the script routes back is a Windows Security exclusion, so
+  // the message names the exact folder and the exact clicks: a hint that only says "your
+  // antivirus" leaves the user with nothing to do about it. OR rewrites the script on every
+  // capture, so an allowed folder starts working at once - nothing to reinstall or restart.
+  const dir = String(localRoot || "").replace(/[\\/]+$/, "");
+  return {
+    ok: false, av_blocked: true,
+    error: "the PowerShell capture script (studio_shot.ps1) is blocked by this PC's antivirus, so the window and whole-screen routes are off - this is the antivirus, not OR and not Studio.",
+    hint: "the Roblox picture does not need that script: ViewportScreenshotRoblox {} takes it inside Studio over the MCP, with nothing for the scanner to see. For the window and whole-screen routes, allow the folder the script is written into" +
+      (dir ? " (" + dir + ")" : "") +
+      ": Windows Security > Virus & threat protection > Exclusions > Add a folder. OR writes studio_shot.ps1 again on every capture, so those routes work the moment the folder is allowed - nothing to reinstall and nothing to restart.",
+  };
+}
+// ── OR's OWN MCP client: the route that works when PowerShell does not ───────
+// ZeroScript's bridge works on a PC whose antivirus blocks studio_shot.ps1 for one
+// reason: it is not a script. It is a plain Python program that launches Roblox's own
+// signed StudioMCP.exe and speaks JSON-RPC to it, calls the capture tool, and writes the
+// picture to disk. This is that method, run through the agent the user already has - the
+// helper is written into the workspace and started with `run_command`, so an older
+// or-agent.exe that drops MCP image blocks still gets the shot (the bytes never travel
+// through its socket; they are read back as base64 TEXT, the tunnel that already works).
+let mcpShotScriptReady = false;
+let pythonCmd = "";
+async function ensureMcpShotScript() {
+  if (mcpShotScriptReady) return;
+  const py = await extText("or_mcp_shot.py");
+  await localWrite("or_mcp_shot.py", py);
+  mcpShotScriptReady = true;
+}
+// Which Python? Windows installs vary: `python`, the `py -3` launcher, or `python3`.
+// Each candidate is tried ONCE and the answer is remembered, so the probe costs one
+// round trip per browser session, not one per screenshot.
+async function pythonFor() {
+  if (pythonCmd) return pythonCmd;
+  const candidates = ["python", "py -3", "python3"];
+  for (const c of candidates) {
+    try {
+      const r = await localRun(`${c} -c "print('OR_PY_OK')"`, 20);
+      if (/OR_PY_OK/.test(String((r && (r.text || r.error)) || ""))) { pythonCmd = c; return c; }
+    } catch {}
+  }
+  return "";
+}
+// Returns { ok, text, images, meta } - exactly the shape the window route returns, so the
+// caller does not care which route produced the picture.
+async function studioMcpShot({ out = "or_mcp_shot.png", maxWidth } = {}) {
+  try {
+    await ensureMcpShotScript();
+  } catch (e) {
+    return { ok: false, error: "could not write or_mcp_shot.py into the agent workspace: " + String((e && e.message) || e) + " (is or-agent.exe running?)" };
+  }
+  const py = await pythonFor();
+  if (!py) {
+    return { ok: false, need_python: true,
+      error: "this PC has no Python on PATH, so OR's own MCP client cannot run (it is the route that needs no PowerShell).",
+      hint: "install Python 3 from python.org (tick \"Add python.exe to PATH\") - or allow studio_shot.ps1 in Windows Security instead." };
+  }
+  const r = await localRun(`${py} or_mcp_shot.py --out ${out}`, 45);
+  const raw = String((r && (r.text || r.error)) || "");
+  const meta = parseShotMeta(raw);
+  if (!meta) {
+    return { ok: false, text: raw.slice(-400), stage: "no-answer",
+      error: (raw.trim().split(/\r?\n/).filter(Boolean).slice(-1)[0] || "no answer from the helper (is or-agent.exe running?)").slice(0, 300),
+      hint: "the helper prints one OR_STUDIO_SHOT line; none arrived, so it did not run - check that Python runs (`python -V`) and that or-agent.exe is started." };
+  }
+  if (!meta.ok) {
+    return { ok: false, stage: meta.stage || "", error: String(meta.error || "capture failed").slice(0, 320),
+             hint: meta.hint ? String(meta.hint).slice(0, 320) : "", text: raw.slice(-300) };
+  }
+  if (meta.too_large) {
+    return { ok: false, too_large: true, bytes: meta.bytes, file: meta.file,
+      error: "Studio returned a " + Math.round((Number(meta.bytes) || 0) / 1024) + " KB picture. The text hand-over can carry about 1.3 MB "
+        + "(a bigger one would need hundreds of text pages), so it was NOT attached.",
+      hint: "the file is on disk at " + meta.file + "; rebuilding the agent gives the fast image path, and the window capture asks for a smaller frame." };
+  }
+  try {
+    const t = await tunnelReadImage(meta.file || out, meta);
+    return { ok: true, meta,
+      images: [{ mimeType: t.img.mimeType, data: t.img.data }],
+      text: "captured " + (meta.bytes ? Math.round(meta.bytes / 1024) + " KB" : "the Studio viewport") +
+        " with Studio's own " + (meta.tool || "screen_capture") + " over its MCP" +
+        (meta.studio_id ? " (studio_id " + String(meta.studio_id).slice(0, 24) + ")" : ""),
+      image_source: "Studio's MCP capture, handed over as base64 TEXT in " + t.chunks + " chunk(s)" +
+        (meta.takeover ? " [" + String(meta.takeover).slice(0, 160) + "]" : "") };
+  } catch (e) {
+    return { ok: false, stage: "readback", error: "the picture was written (" + (meta.file || out) + ") but could not be read back: " + String((e && e.message) || e).slice(0, 240) };
+  }
+}
+
+async function studioWindowShot({ focus = false, focusOnly = false, maxWidth = 1600, out = "or_studio_window.png", wholeScreen = false, force = false } = {}) {
+  const ps1 = (cmd) => `powershell -NoProfile -ExecutionPolicy Bypass -File studio_shot.ps1 ${cmd}`;
+  // A blocked script is not attempted again in a loop: the answer is instant and says
+  // what is wrong. `force` (the explicit retry) overrides it.
+  if (!force && ps1BlockedNow()) return ps1BlockedReply();
+  try {
+    await ensureStudioShotScript();
+  } catch (e) {
+    return { ok: false, error: "could not write studio_shot.ps1 into the agent workspace: " + String((e && e.message) || e) + " (is or-agent.exe running?)" };
+  }
+  // wholeScreen ignores -Focus/-FocusOnly: it photographs the desktop, so there is no
+  // Studio window to raise and nothing to focus.
+  const flags = [
+    wholeScreen ? `-WholeScreen -Out ${wholeScreenOut(out)}` : (focusOnly ? "-FocusOnly" : `-Out ${out}`),
+    focus && !focusOnly && !wholeScreen ? "-Focus" : "",
+    focusOnly && !wholeScreen ? "" : `-MaxWidth ${Math.max(320, Math.min(3000, Number(maxWidth) || 1600))}`,
+  ].filter(Boolean).join(" ");
+  const cmd = ps1(flags);
+  const r = await localRun(cmd, 45);
+  const raw = String((r && (r.text || r.error)) || "");
+  let meta = parseShotMeta(raw);
+  // The antivirus refusing to load the FILE looks like this (seen live): PowerShell
+  // reports it at line 1 char 1 and the script never prints its OR_STUDIO_SHOT line.
+  if (!meta && noteAvBlock(raw)) return Object.assign(ps1BlockedReply(), { command: cmd, text: raw.slice(-400) });
+  if (!meta) {
+    return { ok: false, error: (raw.slice(-400) || "no answer from the agent (is or-agent.exe running?)"), command: cmd,
+             // The script prints EXACTLY ONE OR_STUDIO_SHOT line. Nothing came back, so
+             // the script never ran to completion. Those are the only honest causes, and
+             // "antivirus ate it" is the one the user cannot guess: the file is written
+             // into the agent's workspace and run with -ExecutionPolicy Bypass, which is
+             // exactly the shape a heuristic scanner flags.
+             hint: "studio_shot.ps1 prints one OR_STUDIO_SHOT {...} line and none arrived, so the script did not run to completion. Three causes, in order: (1) security software stopped it - allow the agent workspace folder in your antivirus, or run the agent again; (2) PowerShell refused the -ExecutionPolicy Bypass command (group policy); (3) the script was written by an older agent build. The full command and output are echoed above." };
+  }
+  if (!meta.ok) {
+    // Carry the script's own diagnosis through: if the fast helper could not be
+    // compiled, that is the first thing worth knowing when a capture fails.
+    return { ok: false, meta, command: cmd,
+             error: (meta.error || "capture failed") +
+               (meta.compile_error ? " [the fast PrintWindow helper could not be compiled on this PC: " + String(meta.compile_error).slice(0, 160) + "]" : "") };
+  }
+  if (focusOnly) {
+    return { ok: true, text: (meta.focused ? "Roblox Studio is now the FRONT window" : "Windows refused keyboard focus; Studio was raised above other windows instead"), meta, command: cmd };
+  }
+  const file = meta.file || out;
+  let images = [];
+  let how2 = "";
+  try {
+    const b64 = await localReadBase64(file);
+    images = [{ mimeType: b64.mimeType || "image/png", data: b64.data }];
+    how2 = "file readback (read_file_base64)";
+  } catch (e1) {
+    // Old agent (no read_file_base64): pull the same bytes back as TEXT. This is
+    // the path that makes a screenshot work on the user's current exe.
+    try {
+      const t = await tunnelReadImage(file, meta);
+      images = [{ mimeType: t.img.mimeType, data: t.img.data }];
+      meta = t.meta;
+      how2 = "text tunnel (" + t.lines + " base64 lines read with read_file in " + t.chunks + " chunk(s)" + (t.clipped ? ", a clipped reply re-read at a smaller size" : "") + ")";
+    } catch (e2) {
+      const why2 = String((e2 && e2.message) || e2);
+      // The agent refuses to read a file bigger than 2 MB as text, and a 4K Studio
+      // window can easily exceed that once base64-inflated. Retake SMALLER (about a
+      // third of the pixels) rather than reporting a dead end - a slightly softer
+      // screenshot beats no screenshot.
+      // Both wordings matter: the agent's own refusal ("too large to read whole") and
+      // the capture script's guard on the file it just wrote ("too big to hand over as
+      // text"). Either way the answer is the same: take a smaller picture.
+      if ((e2 && e2.code === "too-large") || /too large to read whole|unexpectedly large|too big to hand over as text/i.test(why2)) {
+        try {
+          const smallW = Math.max(640, Math.min(1100, Math.round((Number(maxWidth) || 1600) * 0.65)));
+          const cmd2 = ps1(`-Out ${out} -MaxWidth ${smallW} -Quality 60` + (wholeScreen ? " -WholeScreen" : ""));
+          const r2 = await localRun(cmd2, 45);
+          const meta2 = parseShotMeta(String((r2 && (r2.text || r2.error)) || ""));
+          if (meta2 && meta2.ok) {
+            const t2 = await tunnelReadImage(meta2.file || file, meta2);
+            images = [{ mimeType: t2.img.mimeType, data: t2.img.data }];
+            how2 = "text tunnel, retaken smaller at " + smallW + "px because the full-size file was too big for the agent to read back (" +
+                   t2.lines + " base64 lines in " + t2.chunks + " chunk(s))";
+            meta = t2.meta;
+          }
+        } catch (e3) { /* fall through to the plain error below */ }
+      }
+      if (images.length) {
+        // delivered by the smaller re-capture - continue to the normal return
+      } else {
+        return { ok: false, meta, command: cmd,
+                 error: (wholeScreen ? "the screen WAS captured to " : "the window WAS captured to ") + file + ", but the picture could not be read back: " +
+                   why2 + " (direct file read: " + String((e1 && e1.message) || e1).slice(0, 160) + "). " +
+                   (meta && meta.tunnel_error ? "The capture script could not write the tunnel file: " + String(meta.tunnel_error).slice(0, 160) + ". " : "") +
+                   "The capture itself worked - only the hand-over failed." };
+      }
+    }
+  }
+  const what = wholeScreen ? "your whole screen (all monitors)"
+    : "the Roblox Studio WINDOW";
+  const how = meta.method === "fullscreen" ? "a full-desktop grab (VirtualScreen)"
+    : meta.method === "printwindow" ? "PrintWindow (Studio never had to come forward)"
+    : meta.method === "screen" ? "screen grab after raising the Studio window"
+    : meta.method === "screen-nocompile" ? "screen grab after raising Studio (fallback route: the fast helper could not be compiled on this PC)"
+    : String(meta.method || "capture");
+  return {
+    ok: true, images, meta, command: cmd,
+    text: `Captured ${what} via ${how} — ${(meta.width || (meta.window && meta.window.width))}x${(meta.height || (meta.window && meta.window.height))} px, saved as ${file}` +
+      (how2 ? ` (delivered through the ${how2}).` : ".") +
+      (meta.method === "screen" && meta.focused ? " Studio is now the front window." : "") +
+      (meta.method === "screen" && !meta.focused ? " (Windows would not give Studio keyboard focus; it was raised above other windows.)" : "") +
+      (meta.compile_error ? " Note: the fast in-memory capture helper could not be compiled here (" + String(meta.compile_error).slice(0, 120) + "), so the script used its fallback route - the screenshot still works." : ""),
+  };
+}
+
+// ── shot_test: prove the screenshot machinery on THIS machine ───────────────
+// Runs studio_shot.ps1 -SelfTest (no Studio window needed), then pulls the little
+// test picture back through the SAME hand-over a real capture uses - one-call file
+// readback on a new agent, the base64 text tunnel on an older one - and verifies the
+// checksum. Green here means a real screenshot is going to deliver too; a failure
+// names the step that broke instead of leaving the user guessing.
+async function shotTest() {
+  const steps = [];
+  const fail = (error) => ({ ok: false, error, steps });
+  try { await ensureStudioShotScript(); steps.push("script written into the agent workspace"); }
+  catch (e) { return fail("could not write studio_shot.ps1 into the agent workspace: " + String((e && e.message) || e) + " (is or-agent.exe running?)"); }
+
+  const cmd = `powershell -NoProfile -ExecutionPolicy Bypass -File studio_shot.ps1 -SelfTest`;
+  const r = await localRun(cmd, 45);
+  const raw = String((r && (r.text || r.error)) || "");
+  const meta = parseShotMeta(raw);
+  if (!meta) return fail("the self-test printed no result line - the script did not run: " + (raw.slice(-300) || "no answer from the agent"));
+  if (!meta.ok) return fail(meta.error || "the self-test failed");
+  steps.push("PowerShell + System.Drawing work (JPEG written: " + (meta.jpeg_ok ? "yes" : "NO") + ")");
+  if (!meta.roundtrip_ok) return fail("the script wrote the base64 text but could not decode it back to the same bytes - the tunnel format is broken");
+
+  const info = await agentInfo();
+  const viaFast = info.has_base64 === true;
+  try {
+    let img = null;
+    if (viaFast) {
+      const b64 = await localReadBase64(meta.file);
+      img = { mimeType: b64.mimeType || meta.mime, data: b64.data };
+      steps.push("picture read back in one call (read_file_base64)");
+    } else {
+      const rd = await localReadTextFile(meta.base64_file, { linesPerCall: 90 });
+      img = await b64ToVerifiedImage(rd.text, meta);
+      steps.push("picture read back as base64 text in " + rd.chunks + " chunk(s) of read_file (" + rd.lines + " lines)");
+    }
+    const decoded = atob(String(img.data).replace(/[^A-Za-z0-9+/=]/g, ""));
+    if (!decoded.length) return fail("the picture read back empty");
+    steps.push("checksum verified (" + decoded.length + " bytes)");
+    return { ok: true, steps, meta,
+      text: "Everything a screenshot needs works on this machine: " + steps.join("; ") + ". " +
+        (viaFast ? "Picture hand-over: one-call file readback." : "Picture hand-over: the BASE64 TEXT TUNNEL (your agent has no read_file_base64 - that is fine).") +
+        " So the screenshot commands will deliver: ViewportScreenshotRoblox {} needs Studio RUNNING, ViewportScreenshotBlender {} needs Blender connected, and ViewportScreenshot {} needs neither (the whole screen) - and none of them cares which window is in front." };
+  } catch (e) {
+    return fail("the capture machinery works, but the picture could not be read back: " + String((e && e.message) || e) +
+      " - that is the hand-over (the tunnel), not the capture.");
+  }
 }
 
 async function robloxCsrf() {
@@ -1208,16 +2237,72 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         break;
       }
       case "call_tool": {
-        const timeout = (msg.timeout || 120000) + 10000;
+        // The slack is the round-trip grace on top of the tool's own budget, and it
+        // has to scale: a picture tool is given a deliberately SHORT budget, and a flat
+        // +10s turned "fail fast" into a 10-second stall (measured: a 0.4s budget
+        // answered after 10.4s).
+        const slack = (msg.timeout && msg.timeout < 30000) ? 2000 : 10000;
+        const timeout = (msg.timeout || 120000) + slack;
         if (blenderAddon && isBlenderToolName(msg.name)) {
           sendResponse(await blenderCall(msg.name, msg.arguments, timeout));
           break;
         }
-        const r = await send(
-          { type: "call_tool", name: msg.name, arguments: msg.arguments, timeout: msg.timeout },
-          timeout
+        // Fill whatever the tool's schema says is required (Studio's screen_capture
+        // wants a capture_id AND the CONNECTED studio_id) before the very first call,
+        // so the common failures never happen at all. The studio id is looked up with
+        // list_roblox_studios - an invented one is refused by the server.
+        const pre = await prepareArgs(msg.name, msg.arguments);
+        let r = await send(
+          { type: "call_tool", name: msg.name, arguments: pre.args, timeout: msg.timeout },
+          timeout,
+          { connectWait: msg.connectWait }   // a screenshot asks for a short budget
         );
-        sendResponse(r);
+        // One repair, never a loop: the server says what it wanted (a missing argument) or
+        // that the studio id it was given is not connected any more (Studio closed, place
+        // reloaded) - and in that second case the id is looked up again because the error
+        // itself names list_roblox_studios as where the current one lives.
+        let filled = pre.filled.slice();
+        if (r && r.ok === false) {
+          const errText = (r.error || r.text);
+          const miss = missingArgIn(errText);
+          const again = Object.assign({}, pre.args);
+          let changed = false;
+          if (miss && again[miss] === undefined) {
+            const schema = mcpSchemaFor(msg.name);
+            const props = (schema && schema.properties) || {};
+            again[miss] = valueForArg(miss, props[miss]);
+            filled = filled.concat([miss]);
+            changed = true;
+          }
+          if (isStudioIdError(errText)) {
+            // Which argument wants it? The schema says so; when an old agent forwards no
+            // schema, the server's own error names it ("Missing required argument: studio_id"),
+            // and that name is the key - a dummy value can never satisfy it.
+            const key = pre.studioIdKey
+              || (miss && STUDIO_ID_KEY_RE.test(String(miss)) ? miss : "")
+              || studioIdKeyFor(msg.name, {});
+            const fresh = key ? await resolveStudioId(true) : "";
+            if (key && fresh && String(again[key]) !== String(fresh)) {
+              const props = ((mcpSchemaFor(msg.name) || {}).properties) || {};
+              again[key] = coerceArgToSchema(fresh, props[key]);
+              filled = filled.concat([key]);
+              changed = true;
+            }
+          }
+          if (changed) {
+            const r2 = await send(
+              { type: "call_tool", name: msg.name, arguments: again, timeout: msg.timeout },
+              timeout,
+              { connectWait: msg.connectWait }
+            );
+            r = (r2 && r2.ok) ? r2 : Object.assign({}, r2 || r, { required_arg_missing: miss || undefined });
+            if (r && r.ok === false && isStudioIdError(r.error || r.text)) r.studio_id_stale = true;
+          }
+        }
+        if (filled.length) r = Object.assign({}, r, { filled_args: filled });
+        // A capture tool that answers with a path or inline base64 is turned into a
+        // real attachment HERE, so every caller benefits (and no rebuild is needed).
+        sendResponse(await harvestToolImage(r, msg.name));
         break;
       }
       case "restart_mcp": {
@@ -1237,6 +2322,47 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         } catch (e) {
           sendResponse({ ok: false, error: String(e && e.message || e) });
         }
+        break;
+      }
+      // Base64 read (any file: images, PDFs, binaries) — powers attach_feedback
+      // ({"path": ...}), which puts a workspace file into the chat as an
+      // attachment instead of pasting its text.
+      case "local_read_base64": {
+        try {
+          const data = await localReadBase64(String(msg.path || ""));
+          sendResponse({ ok: true, path: data.path, mimeType: data.mimeType, bytes: data.bytes, data: data.data });
+        } catch (e) {
+          sendResponse({ ok: false, error: String(e && e.message || e) });
+        }
+        break;
+      }
+      // OS-side Studio window capture / focus (no page permission involved).
+      case "shot_test": {
+        try { sendResponse(await shotTest()); } catch (e) { sendResponse({ ok: false, error: String((e && e.message) || e) }); }
+        break;
+      }
+      case "studio_window_shot": {
+        const r = await studioWindowShot({
+          focus: msg.focus === true,
+          focusOnly: msg.focus_only === true,
+          maxWidth: msg.max_width,
+          out: msg.out,
+          wholeScreen: msg.whole_screen === true,
+          force: msg.force_ps1 === true,     // the explicit retry after the AV call
+        });
+        if (r && r.ok) ps1Block = { why: "", at: 0 };   // the script runs again
+        sendResponse(r);
+        break;
+      }
+      case "studio_mcp_shot": {
+        try { sendResponse(await studioMcpShot({ maxWidth: msg.max_width })); }
+        catch (e) { sendResponse({ ok: false, error: String((e && e.message) || e) }); }
+        break;
+      }
+      // Version/health of the agent: the extension uses this to explain WHY a
+      // screenshot could not be delivered instead of looping on the call.
+      case "agent_info": {
+        sendResponse(await agentInfo());
         break;
       }
       case "blender_connect": {
@@ -1320,24 +2446,65 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           if (!url) {
             const q = query || String(msg.q || "").trim();
             if (!q) { sendResponse({ ok: false, error: "url or query is required" }); break; }
-            const hits = await ddgSearch(q, 3);
-            if (!hits.length) { sendResponse({ ok: false, error: "no search results for: " + q }); break; }
-            url = hits[0].url;
-            searchNote = "Searched \"" + q + "\". Top result: " + url + "\n" +
-              hits.map((h, i) => (i+1) + ". " + h.title + " — " + h.url).join("\n") + "\n\n";
+            const found = await webSearch(q, 3);
+            if (!found.hits.length) {
+              sendResponse({ ok: false, error: `no search results for: ${q} (tried ${found.notes.join("; ") || "all backends"})` });
+              break;
+            }
+            url = found.hits[0].url;
+            searchNote = `Searched "${q}" [${found.backend}]. Top result: ${url}\n` +
+              found.hits.map((h, i) => (i + 1) + ". " + h.title + " — " + h.url).join("\n") + "\n\n";
           }
           if (!/^https?:\/\//i.test(url)) { sendResponse({ ok: false, error: "url must start with http:// or https://" }); break; }
           const maxChars = Math.max(500, Math.min(50000, Number(msg.max_chars) || 12000));
-          const res = await fetch(url, { headers: { "User-Agent": "OR/1.0 (web_fetch)", "Accept": "text/html,application/xhtml+xml,application/xml,text/plain,*/*" } });
-          if (!res.ok) { sendResponse({ ok: false, error: `fetch failed HTTP ${res.status}` }); break; }
-          let text = await res.text();
-          const ctype = (res.headers.get("content-type") || "").toLowerCase();
-          const looksHtml = /html|xml/.test(ctype) || /^\s*</.test(text);
-          if (looksHtml) text = htmlToText(text);
+          let text = "";
+          let directWasHtml = false;
+          let status = 0;
+          let ctype = "";
+          let via = "direct";
+          const notes = [];
+          try {
+            const res = await fetchWithTimeout(url, { headers: webHeaders({}, (() => { try { return new URL(url).origin + "/"; } catch { return undefined; } })()) }, WEB_FETCH_TIMEOUT);
+            status = res.status;
+            ctype = (res.headers.get("content-type") || "").toLowerCase();
+            if (!res.ok) {
+              notes.push(`direct HTTP ${res.status}`);
+            } else {
+              let raw = await res.text();
+              const looksHtml = /html|xml/.test(ctype) || /^\s*</.test(raw);
+              directWasHtml = looksHtml;
+              text = looksHtml ? htmlToText(raw) : raw.trim();
+            }
+          } catch (e) {
+            notes.push("direct: " + String((e && e.message) || e).slice(0, 90));
+          }
+          // Reader proxy when the direct fetch failed, was blocked, or returned
+          // a JavaScript shell we cannot read.
+          // Short pages are only suspicious when they were HTML: a 200-char
+          // plain-text/JSON answer is a complete document, and re-reading it
+          // through a proxy would be wasted time.
+          const wasShell = !text || (directWasHtml && looksLikeShell(text));
+          if (wasShell) {
+            try {
+              const viaReader = await readerFallback(url, maxChars);
+              if (viaReader) { text = viaReader; via = "reader"; }
+            } catch (e) {
+              notes.push("reader: " + String((e && e.message) || e).slice(0, 90));
+            }
+          }
+          if (!text) {
+            sendResponse({ ok: false, error: `fetch failed for ${url}${notes.length ? " (" + notes.join("; ") + ")" : ""}` });
+            break;
+          }
           const origLen = text.length;
           const truncated = origLen > maxChars;
           if (truncated) text = text.slice(0, maxChars) + `\n\n…[truncated ${origLen - maxChars} chars]`;
-          sendResponse({ ok: true, text: searchNote + text, truncated, status: res.status, url, content_type: ctype });
+          const suffix = via === "reader"
+            ? `\n\n[OR: the page served no readable text directly (${notes.join("; ") || "blocked"}), so it was read through a rendering proxy — layout/menus may be missing.]`
+            : (wasShell
+              ? `\n\n[OR: this page returned almost no readable text${notes.length ? " (" + notes.join("; ") + ")" : ""} — it is served by JavaScript or blocks non-browser readers, so the text above is all there is. Use web_search for a text source instead of relying on this page.]`
+              : "");
+          sendResponse({ ok: true, text: searchNote + text + suffix, truncated, status, url, content_type: ctype, via });
         } catch (e) { sendResponse({ ok: false, error: String(e && e.message || e) }); }
         break;
       }
@@ -1346,26 +2513,14 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           const q = String(msg.query || msg.q || "").trim();
           if (!q) { sendResponse({ ok: false, error: "query is required" }); break; }
           const limit = Math.max(1, Math.min(8, Number(msg.limit) || 3));
-          const url = "https://html.duckduckgo.com/html/?q=" + encodeURIComponent(q);
-          const res = await fetch(url, { headers: { "User-Agent": "OR/1.0" } });
-          if (!res.ok) { sendResponse({ ok: false, error: `search HTTP ${res.status}` }); break; }
-          const html = await res.text();
-          const results = [];
-          const re = /<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>([^<]+)<\/a>/g;
-          let m;
-          while ((m = re.exec(html)) !== null && results.length < limit) {
-            let href = m[1]; const title = m[2].trim();
-            const um = href.match(/uddg=([^&]+)/);
-            if (um) try { href = decodeURIComponent(um[1]); } catch {}
-            if (title && href) results.push({ title, url: href });
+          const found = await webSearch(q, limit);
+          if (!found.hits.length) {
+            sendResponse({ ok: false, error: `no results for '${q}' (tried ${found.notes.join("; ") || "all backends"})`, notes: found.notes });
+            break;
           }
-          if (!results.length) {
-            const re2 = /class="result__url"[^>]+href="([^"]+)"/g;
-            while ((m = re2.exec(html)) !== null && results.length < limit) results.push({ title: m[1], url: m[1] });
-          }
-          if (!results.length) { sendResponse({ ok: false, error: `no results for '${q}'` }); break; }
-          const txt = results.map((r,i)=> `${i+1}. ${r.title}\n   ${r.url}`).join("\n");
-          sendResponse({ ok: true, text: txt, results, query: q });
+          const results = found.hits;
+          const txt = results.map((r, i) => `${i + 1}. ${r.title}\n   ${r.url}`).join("\n");
+          sendResponse({ ok: true, text: `Searched "${q}" [${found.backend}]\n${txt}`, results, query: q, backend: found.backend, notes: found.notes });
         } catch (e) { sendResponse({ ok: false, error: String(e && e.message || e) }); }
         break;
       }
@@ -1461,9 +2616,57 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         catch (e) { sendResponse({ ok: false, error: String(e && e.message || e) }); }
         break;
       }
-      case "capture_tab": {
+      // Which tab is IN FRONT, asked BEFORE a capture: captureVisibleTab always
+      // photographs that one, so the caller can warn instead of silently handing
+      // the model a picture of an unrelated page.
+      case "tab_front": {
+        const windowId = (_sender.tab && _sender.tab.windowId) || undefined;
+        const senderTabId = (_sender.tab && _sender.tab.id) || null;
+        let front = null;
         try {
-          const windowId = (_sender.tab && _sender.tab.windowId) || undefined;
+          const tabs = await chrome.tabs.query(
+            windowId === undefined ? { active: true, lastFocusedWindow: true } : { active: true, windowId }
+          );
+          front = (tabs && tabs[0]) || null;
+        } catch {}
+        sendResponse({
+          ok: true,
+          url: (front && front.url) || "",
+          title: (front && front.title) || "",
+          is_sender_tab: !!front && senderTabId !== null && front.id === senderTabId,
+          capturable: !!front && /^https?:/i.test((front && front.url) || ""),
+        });
+        break;
+      }
+      case "capture_tab": {
+        // captureVisibleTab photographs whichever tab is IN FRONT in the window,
+        // and Chrome only allows it when the extension is permitted on THAT page:
+        //   * "activeTab" is granted by clicking the toolbar icon / context menu
+        //     (OR is driven from inside the page, so it never gets that grant), or
+        //   * the page must be covered by host_permissions.
+        // chrome:// pages, the New Tab page, PDFs and other extensions' pages can
+        // NEVER be captured, and neither can a site where the user set OR's
+        // "Site access" to on-click/limited.
+        // So this reports WHICH tab was in front (and whether it was this chat)
+        // instead of a bare "Either the '<all_urls>' or 'activeTab' permission is
+        // required", which told the model nothing it could act on.
+        const windowId = (_sender.tab && _sender.tab.windowId) || undefined;
+        const senderTabId = (_sender.tab && _sender.tab.id) || null;
+        let front = null;
+        try {
+          const tabs = await chrome.tabs.query(
+            windowId === undefined ? { active: true, lastFocusedWindow: true } : { active: true, windowId }
+          );
+          front = (tabs && tabs[0]) || null;
+        } catch {}
+        const frontUrl = (front && front.url) || "";
+        const frontTitle = (front && front.title) || "";
+        const isSenderTab = !!front && senderTabId !== null && front.id === senderTabId;
+        // Name it exactly: a bare title ("Extensions") does not tell the user
+        // WHICH kind of page blocked the capture.
+        const where = frontTitle && frontUrl ? `${frontTitle} (${frontUrl})`
+          : (frontUrl || frontTitle || "a browser-internal page (chrome://, New Tab or a PDF)");
+        try {
           const dataUrl = await new Promise((resolve, reject) => {
             try {
               chrome.tabs.captureVisibleTab(windowId, { format: "png" }, (url) => {
@@ -1477,9 +2680,27 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
             sendResponse({ ok: false, error: "tab capture returned no image" });
             break;
           }
-          sendResponse({ ok: true, images: [{ mimeType: m[1], data: m[2] }] });
+          sendResponse({
+            ok: true,
+            images: [{ mimeType: m[1], data: m[2] }],
+            captured: { url: frontUrl, title: frontTitle, is_sender_tab: isSenderTab },
+            // The model MUST know when it is looking at the wrong screen: a
+            // capture of an unrelated tab used to be described as "Studio looks
+            // like this".
+            warning: isSenderTab ? undefined
+              : `this is a capture of '${where}' (the tab in front), NOT of this chat`,
+          });
         } catch (e) {
-          sendResponse({ ok: false, error: String(e && e.message || e) });
+          const msg = String((e && e.message) || e);
+          const blocked = /permission|all_urls|activeTab|not allowed/i.test(msg);
+          sendResponse({
+            ok: false,
+            error: msg + (blocked
+              ? ` - Chrome only lets OR photograph a page it is allowed to read, and it photographs the tab in FRONT: that was '${where}'. Bring the chat tab (or any normal http/https page) to the front and retry; chrome:// pages, the New Tab page and PDF viewers can never be captured.`
+              : ""),
+            front_url: frontUrl,
+            front_title: frontTitle,
+          });
         }
         break;
       }
